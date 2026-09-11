@@ -9,6 +9,7 @@ export function useAccount(kit: AccountKit) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    setLoading(true);   // a new kit means a fresh read — don't keep showing the old kit's settled state
     let cancelled = false;
     let eventSeen = false;
     kit.getSession()
@@ -26,7 +27,9 @@ export function useAccount(kit: AccountKit) {
   useEffect(() => {
     if (!userId) { setHandle(null); return; }
     let cancelled = false;
-    kit.getProfile().then(({ handle: h }) => { if (!cancelled) setHandle(h); });
+    kit.getProfile()
+      .then(({ handle: h }) => { if (!cancelled) setHandle(h); })
+      .catch((thrown: unknown) => { console.warn("[account-kit] getProfile rejected:", thrown); });   // kit contract says never; belt and braces — handle stays null
     return () => { cancelled = true; };
   }, [kit, userId]);
 

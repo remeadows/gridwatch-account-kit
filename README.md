@@ -9,7 +9,7 @@ Add to your `package.json`:
 ```json
 {
   "dependencies": {
-    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.1.1"
+    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.1.2"
   }
 }
 ```
@@ -29,5 +29,12 @@ mountAccountHeader(kit);
 ## Exports
 
 - **`.`** — Core utilities: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `PLAY_ALIASES`, `NEXUS_ORIGIN`, `HANDLE_RE`, `validateHandle`, `validateReturnPath`, `signInUrl`.
-- **`./react`** — React components for account management and sign-in flows.
+- **`./react`** — the `useAccount(kit)` React hook (same shape as the apps' former `useAuth`).
 - **`./header.css`** — Shared styles for the account header.
+
+### Return-path validation
+
+`validateReturnPath` checks the *entire raw value* passed in — including anything that would
+end up in the query string or fragment — for encoded traversal or separator tricks, before
+handing the decoded path to stricter same-origin and alias checks. A value that fails either
+check falls back to `/`.

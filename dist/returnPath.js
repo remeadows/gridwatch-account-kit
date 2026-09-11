@@ -1,4 +1,10 @@
 import { NEXUS_ORIGIN, PLAY_ALIASES } from "./config.js";
+// Scans the *whole raw value* — including anything that will end up in the query string or
+// fragment once parsed — for a backslash or a percent-encoded / \ . (spec §2.2). This is
+// deliberately broader than the decoded path check below: it catches encoded traversal or
+// separator tricks before `new URL()` ever gets a chance to normalize them away. It does not
+// collapse repeated slashes, so a value like "/play/match//x" is accepted as-is (documented in
+// tests/returnPath.test.ts) rather than treated as a traversal attempt.
 const RAW_FORBIDDEN = /\\|%2f|%5c|%2e/i; // backslash or encoded / \ .
 const SEGMENT_FORBIDDEN = /(^|\/)\.\.?(\/|$)/; // . or .. segment
 const CONSENT = /^\/oauth\/consent$/;

@@ -76,6 +76,27 @@ describe("createAccountKit", () => {
     expect(warn).toHaveBeenCalled();
   });
 
+  it("returns exactly null when the client reports an error alongside a session", async () => {
+    const sb = fakeSupabase(user);
+    sb.auth.getSession.mockResolvedValueOnce({ data: { session: user }, error: { message: "stale token" } } as never);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await createAccountKit({ returnPath: "/" }).getSession()).toBeNull();
+  });
+
+  it("signOut calls auth.signOut once and resolves", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    await expect(kit.signOut()).resolves.toBeUndefined();
+    expect(sb.auth.signOut).toHaveBeenCalledTimes(1);
+  });
+
+  it("saveHandle returns the error message when the error object has no code", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    sb.__upsert.mockResolvedValueOnce({ error: { message: "constraint violation" } } as never);
+    expect(await kit.saveHandle("rusty")).toBe("constraint violation");
+  });
+
   it("returns the provider error message instead of throwing", async () => {
     const sb = fakeSupabase(null);
     sb.auth.signInWithOtp.mockResolvedValueOnce({ error: { message: "rate limited" } } as never);
