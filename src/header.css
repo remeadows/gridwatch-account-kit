@@ -1,0 +1,23 @@
+:root { --gw-account-bar-height: 40px; }
+body.gw-has-account-bar { padding-top: var(--gw-account-bar-height); }
+.gw-account-bar {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 1000; height: var(--gw-account-bar-height);
+  display: flex; align-items: center; justify-content: space-between; padding: 0 12px; box-sizing: border-box;
+  background: var(--gw-bar-bg, #0b1020); color: var(--gw-bar-fg, #f8fbff);
+  font: 500 13px/1 system-ui, -apple-system, "Segoe UI", sans-serif; border-bottom: 1px solid var(--gw-bar-rim, #1f2a44);
+}
+.gw-account-bar a { color: inherit; text-decoration: none; }
+.gw-account-bar__brand { letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; }
+.gw-account-bar__actions { position: relative; display: flex; align-items: center; gap: 8px; }
+.gw-account-bar__signin, .gw-account-bar__chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px;
+  border: 1px solid var(--gw-bar-rim, #1f2a44); background: transparent; color: inherit; font: inherit; cursor: pointer;
+}
+.gw-account-bar__dot { width: 8px; height: 8px; border-radius: 50%; background: var(--gw-bar-live, #35e6ff); }
+.gw-account-bar__menu {
+  position: absolute; top: calc(100% + 6px); right: 0; min-width: 160px; display: flex; flex-direction: column;
+  background: var(--gw-bar-bg, #0b1020); border: 1px solid var(--gw-bar-rim, #1f2a44); border-radius: 8px; padding: 4px;
+}
+.gw-account-bar__menu[hidden] { display: none; }
+.gw-account-bar__item { text-align: left; padding: 8px 10px; background: transparent; color: inherit; border: 0; font: inherit; cursor: pointer; border-radius: 6px; }
+.gw-account-bar__item:hover { background: rgba(255,255,255,0.08); }
