@@ -127,3 +127,134 @@ describe("mountAccountHeader", () => {
     expect(document.body.classList.contains("gw-has-account-bar")).toBe(false);
   });
 });
+
+describe("mountAccountHeader v0.1.2 polish", () => {
+  it("does not re-render when an auth event carries the same state and handle", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, "rusty");
+    mountAccountHeader(kit);
+    await tick();
+    const chip = document.querySelector(".gw-account-bar__chip") as HTMLButtonElement;
+    chip.click();
+    const menu = document.querySelector(".gw-account-bar__menu") as HTMLElement;
+    expect(menu.hidden).toBe(false);
+
+    kit.emit({ user: { id: "u1" } });
+    await tick();
+
+    expect(document.querySelector(".gw-account-bar__menu")).toBe(menu);
+    expect(menu.hidden).toBe(false);
+    expect(kit.getProfile).toHaveBeenCalledTimes(2);
+  });
+
+  it("closes the menu on Escape and on outside click", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, "rusty");
+    mountAccountHeader(kit);
+    await tick();
+    const chip = document.querySelector(".gw-account-bar__chip") as HTMLButtonElement;
+    const menu = document.querySelector(".gw-account-bar__menu") as HTMLElement;
+
+    chip.click();
+    expect(menu.hidden).toBe(false);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(menu.hidden).toBe(true);
+
+    chip.click();
+    expect(menu.hidden).toBe(false);
+    document.body.click();
+    expect(menu.hidden).toBe(true);
+
+    chip.click();
+    expect(menu.hidden).toBe(false);
+    menu.click();
+    expect(menu.hidden).toBe(false);
+  });
+
+  it("exposes the menu with ARIA", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, "rusty");
+    mountAccountHeader(kit);
+    await tick();
+    const bar = document.querySelector(".gw-account-bar")!;
+    expect(bar.getAttribute("role")).toBe("navigation");
+    expect(bar.getAttribute("aria-label")).toBe("Account");
+
+    const chip = document.querySelector(".gw-account-bar__chip") as HTMLButtonElement;
+    const menu = document.querySelector(".gw-account-bar__menu") as HTMLElement;
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
+    expect(chip.getAttribute("aria-haspopup")).toBe("menu");
+    expect(chip.getAttribute("aria-controls")).toBe(menu.id);
+    expect(menu.id).toBeTruthy();
+
+    chip.click();
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+
+    const items = [...menu.querySelectorAll("button,a")];
+    expect(items.length).toBeGreaterThan(0);
+    for (const item of items) expect(item.getAttribute("role")).toBe("menuitem");
+  });
+
+  it("is idempotent when mounted twice", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, "rusty");
+    const h1 = mountAccountHeader(kit);
+    await tick();
+    const h2 = mountAccountHeader(kit);
+    expect(document.querySelectorAll(".gw-account-bar").length).toBe(1);
+    expect(h2.unmount).toBe(h1.unmount);
+    h1.unmount();
+  });
+
+  it("drops a refresh queued before unmount", async () => {
+    const kit = fakeKit(null, null);
+    const handle = mountAccountHeader(kit);
+    await tick();
+    kit.emit({ user: { id: "u1" } });
+    handle.unmount();
+    await tick();
+    expect(document.querySelector(".gw-account-bar")).toBeNull();
+    expect(kit.getProfile).not.toHaveBeenCalled();
+  });
+
+  it("keeps the last known handle when a later profile read fails", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, "rusty");
+    mountAccountHeader(kit);
+    await tick();
+    expect(document.querySelector(".gw-account-bar__chip")!.textContent).toContain("rusty");
+
+    (kit.getProfile as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("profiles unavailable"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    kit.emit({ user: { id: "u1" } });
+    await tick();
+
+    const bar = document.querySelector(".gw-account-bar")!;
+    expect(bar.getAttribute("data-state")).toBe("signed-in");
+    expect(document.querySelector(".gw-account-bar__chip")!.textContent).toContain("rusty");
+    warn.mockRestore();
+  });
+
+  it("shows a notice when sign-out fails and clears it on the next successful state", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, "rusty");
+    (kit.signOut as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("network down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mountAccountHeader(kit);
+    await tick();
+
+    (document.querySelector(".gw-account-bar__chip") as HTMLButtonElement).click();
+    const outBtn = [...document.querySelectorAll(".gw-account-bar__menu button")].find(
+      (b) => b.textContent === "Sign out",
+    ) as HTMLButtonElement;
+    outBtn.click();
+    await tick();
+
+    const notice = document.querySelector(".gw-account-bar__notice") as HTMLElement;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toBe("Sign out failed — try again.");
+
+    (kit.signOut as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    kit.emit(null);
+    await tick();
+
+    expect(document.querySelector(".gw-account-bar")!.getAttribute("data-state")).toBe("signed-out");
+    const noticeAfter = document.querySelector(".gw-account-bar__notice") as HTMLElement | null;
+    expect(!noticeAfter || noticeAfter.hidden).toBe(true);
+    warn.mockRestore();
+  });
+});
