@@ -16,6 +16,16 @@ Add to your `package.json`:
 
 Then run `npm install`.
 
+## Usage
+
+```ts
+import { createAccountKit, mountAccountHeader } from "@gridwatch/account-kit";
+import "@gridwatch/account-kit/header.css";
+
+const kit = createAccountKit({ returnPath: "/play/match/" });
+mountAccountHeader(kit);
+```
+
 ## Exports
 
 - **`.`** — Core utilities: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `PLAY_ALIASES`, `NEXUS_ORIGIN`, `HANDLE_RE`, `validateHandle`, `validateReturnPath`, `signInUrl`.
