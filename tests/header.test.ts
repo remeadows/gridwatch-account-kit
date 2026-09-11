@@ -95,6 +95,29 @@ describe("mountAccountHeader", () => {
     expect(document.querySelector(".gw-account-bar")!.getAttribute("data-state")).toBe("signed-in");
   });
 
+  it("still renders signed-in (with 'Set handle') when the profile read rejects", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, null);
+    (kit.getProfile as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("profiles unavailable"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mountAccountHeader(kit);
+    await tick();
+    const bar = document.querySelector(".gw-account-bar")!;
+    expect(bar.getAttribute("data-state")).toBe("signed-in");
+    expect(bar.querySelector(".gw-account-bar__chip")!.textContent).toContain("Set handle");
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("falls back to signed-out when the session read rejects", async () => {
+    const kit = fakeKit(null, null);
+    (kit.getSession as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("auth unavailable"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mountAccountHeader(kit);
+    await tick();
+    expect(document.querySelector(".gw-account-bar")!.getAttribute("data-state")).toBe("signed-out");
+    warn.mockRestore();
+  });
+
   it("unmounts cleanly", async () => {
     const kit = fakeKit(null, null);
     const handle = mountAccountHeader(kit);

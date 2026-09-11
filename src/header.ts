@@ -62,10 +62,21 @@ export function mountAccountHeader(kit: AccountKit, options: MountOptions = {}):
   let generation = 0;
   async function refresh(session?: Session | null) {
     const mine = ++generation;
-    const current = session === undefined ? await kit.getSession() : session;
+    let current: Session | null = null;
+    try {
+      current = session === undefined ? await kit.getSession() : session;
+    } catch (thrown) {
+      console.warn("[account-kit] header session read failed:", thrown instanceof Error ? thrown.message : String(thrown));
+      current = null;
+    }
     if (mine !== generation) return;
     if (!current) { render("signed-out", null); return; }
-    const { handle } = await kit.getProfile();
+    let handle: string | null = null;
+    try {
+      handle = (await kit.getProfile()).handle;
+    } catch (thrown) {
+      console.warn("[account-kit] header profile read failed:", thrown instanceof Error ? thrown.message : String(thrown));
+    }
     if (mine !== generation) return;
     render("signed-in", handle);
   }
