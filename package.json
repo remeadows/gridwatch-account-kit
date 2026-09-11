@@ -1,0 +1,33 @@
+{
+  "name": "@gridwatch/account-kit",
+  "version": "0.1.0",
+  "description": "Shared account bar, single Supabase session, and sign-in flow for GridWatch games.",
+  "type": "module",
+  "license": "MIT",
+  "repository": "github:remeadows/gridwatch-account-kit",
+  "files": ["dist", "README.md"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./react": { "types": "./dist/react.d.ts", "default": "./dist/react.js" },
+    "./header.css": "./dist/header.css"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp src/header.css dist/header.css",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check:dist": "npm run build && git diff --exit-code -- dist"
+  },
+  "peerDependencies": {
+    "@supabase/supabase-js": "^2.110.0",
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": { "react": { "optional": true } },
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.110.4",
+    "@types/react": "^19.2.0",
+    "jsdom": "^30.0.1",
+    "react": "19.2.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  }
+}
