@@ -29,25 +29,26 @@ export function createAccountKit(input: AccountKitConfig): AccountKit {
   const config = { returnPath: input.returnPath, nexusOrigin: input.nexusOrigin ?? NEXUS_ORIGIN };
   const defaultRedirect = () => signInUrl(config.returnPath, config.nexusOrigin);
 
+  // Contract: getSession() never rejects. Any failure (auth error or thrown network error) is
+  // logged and reported as "no session", so callers can always settle their loading state.
+  async function getSession() {
+    try {
+      const { data, error } = await getSupabase().auth.getSession();
+      if (error) console.warn("[account-kit] getSession failed:", error.message);
+      return data.session;
+    } catch (thrown) {
+      console.warn("[account-kit] getSession threw:", thrown instanceof Error ? thrown.message : String(thrown));
+      return null;
+    }
+  }
+
   async function currentUserId(): Promise<string | null> {
-    const { data } = await getSupabase().auth.getSession();
-    return data.session?.user.id ?? null;
+    return (await getSession())?.user.id ?? null;
   }
 
   return {
     config,
-    // Contract: getSession() never rejects. Any failure (auth error or thrown network error) is
-    // logged and reported as "no session", so callers can always settle their loading state.
-    async getSession() {
-      try {
-        const { data, error } = await getSupabase().auth.getSession();
-        if (error) console.warn("[account-kit] getSession failed:", error.message);
-        return data.session;
-      } catch (thrown) {
-        console.warn("[account-kit] getSession threw:", thrown instanceof Error ? thrown.message : String(thrown));
-        return null;
-      }
-    },
+    getSession,
     onChange(callback) {
       const { data } = getSupabase().auth.onAuthStateChange((_event, session) => callback(session));
       return () => data.subscription.unsubscribe();

@@ -81,4 +81,13 @@ describe("createAccountKit", () => {
     sb.auth.signInWithOtp.mockResolvedValueOnce({ error: { message: "rate limited" } } as never);
     expect(await createAccountKit({ returnPath: "/" }).signInWithEmail("r@example.com")).toBe("rate limited");
   });
+
+  it("getProfile and saveHandle survive a throwing auth.getSession (via the safe wrapper)", async () => {
+    const sb = fakeSupabase(null);
+    sb.auth.getSession.mockRejectedValue(new Error("network down"));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/" });
+    expect(await kit.getProfile()).toEqual({ handle: null });
+    expect(await kit.saveHandle("rusty")).toBe("Not signed in.");
+  });
 });
