@@ -4,9 +4,17 @@ Shared account bar, single Supabase session, and sign-in flow for GridWatch game
 
 ## Installation
 
-```bash
-npm install @gridwatch/account-kit@latest
+Add to your `package.json`:
+
+```json
+{
+  "dependencies": {
+    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.1.0"
+  }
+}
 ```
+
+Then run `npm install`.
 
 ## Exports
 
