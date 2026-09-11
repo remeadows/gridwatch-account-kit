@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
-import type { AccountKit, Provider } from "./session";
+import type { AccountKit, Provider } from "./session.js";
 
 /** Drop-in replacement for the apps' former useAuth(): same return shape. */
 export function useAccount(kit: AccountKit) {

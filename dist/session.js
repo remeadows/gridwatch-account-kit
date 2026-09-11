@@ -1,7 +1,7 @@
-import { getSupabase } from "./client";
-import { NEXUS_ORIGIN } from "./config";
-import { validateHandle } from "./handle";
-import { signInUrl } from "./returnPath";
+import { getSupabase } from "./client.js";
+import { NEXUS_ORIGIN } from "./config.js";
+import { validateHandle } from "./handle.js";
+import { signInUrl } from "./returnPath.js";
 export function createAccountKit(input) {
     const config = { returnPath: input.returnPath, nexusOrigin: input.nexusOrigin ?? NEXUS_ORIGIN };
     const defaultRedirect = () => signInUrl(config.returnPath, config.nexusOrigin);

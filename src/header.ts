@@ -1,5 +1,5 @@
 import type { Session } from "@supabase/supabase-js";
-import type { AccountKit } from "./session";
+import type { AccountKit } from "./session.js";
 
 export interface MountOptions { container?: HTMLElement }
 export interface MountedHeader { unmount(): void; refresh(): Promise<void> }

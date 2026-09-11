@@ -1,8 +1,8 @@
 import type { Session } from "@supabase/supabase-js";
-import { getSupabase } from "./client";
-import { NEXUS_ORIGIN } from "./config";
-import { validateHandle } from "./handle";
-import { signInUrl } from "./returnPath";
+import { getSupabase } from "./client.js";
+import { NEXUS_ORIGIN } from "./config.js";
+import { validateHandle } from "./handle.js";
+import { signInUrl } from "./returnPath.js";
 
 export type Provider = "google" | "github";
 export interface SignInOptions { redirectTo?: string }

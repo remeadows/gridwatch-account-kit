@@ -1,5 +1,5 @@
 import type { Session } from "@supabase/supabase-js";
-import type { AccountKit, Provider } from "./session";
+import type { AccountKit, Provider } from "./session.js";
 /** Drop-in replacement for the apps' former useAuth(): same return shape. */
 export declare function useAccount(kit: AccountKit): {
     session: Session | null;

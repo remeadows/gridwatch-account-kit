@@ -1,5 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
-import { SUPABASE_ANON_KEY, SUPABASE_URL } from "./config";
+import { SUPABASE_ANON_KEY, SUPABASE_URL } from "./config.js";
 let client = null;
 /** The ONE Supabase client for the page. Apps must not create their own. */
 export function getSupabase() {

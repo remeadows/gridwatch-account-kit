@@ -1,5 +1,5 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { SUPABASE_ANON_KEY, SUPABASE_URL } from "./config";
+import { SUPABASE_ANON_KEY, SUPABASE_URL } from "./config.js";
 
 let client: SupabaseClient | null = null;
 

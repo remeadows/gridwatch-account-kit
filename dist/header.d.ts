@@ -1,4 +1,4 @@
-import type { AccountKit } from "./session";
+import type { AccountKit } from "./session.js";
 export interface MountOptions {
     container?: HTMLElement;
 }

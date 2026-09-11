@@ -1,4 +1,4 @@
-import { NEXUS_ORIGIN, PLAY_ALIASES } from "./config";
+import { NEXUS_ORIGIN, PLAY_ALIASES } from "./config.js";
 const RAW_FORBIDDEN = /\\|%2f|%5c|%2e/i; // backslash or encoded / \ .
 const SEGMENT_FORBIDDEN = /(^|\/)\.\.?(\/|$)/; // . or .. segment
 const CONSENT = /^\/oauth\/consent$/;
