@@ -11,12 +11,20 @@ const SIGN_OUT_FAILED_TEXT = "Sign out failed — try again.";
 // Module-level singleton: mountAccountHeader is idempotent while a bar is actually
 // present in the document. If the caller wiped the DOM out from under us (rather than
 // calling unmount()), `root.isConnected` goes false and we treat that as "not mounted".
-let mountedInstance: { root: HTMLElement; header: MountedHeader } | null = null;
+let mountedInstance: { root: HTMLElement; header: MountedHeader; teardown: () => void } | null = null;
 
 /** Always-visible account bar. Plain DOM so it mounts identically in React, Phaser, three.js, and vanilla apps. */
 export function mountAccountHeader(kit: AccountKit, options: MountOptions = {}): MountedHeader {
-  if (mountedInstance && mountedInstance.root.isConnected) {
-    return mountedInstance.header;
+  if (mountedInstance) {
+    if (mountedInstance.root.isConnected) {
+      return mountedInstance.header;
+    }
+    // The previous root was disconnected without an explicit unmount() (e.g. a router
+    // did `document.body.innerHTML = ""`). Tear the abandoned instance down — unsubscribe
+    // its onChange listener and drop its document listeners — before replacing it, so it
+    // doesn't keep reacting to auth events or leak document-level handlers.
+    mountedInstance.teardown();
+    mountedInstance = null;
   }
 
   const host = options.container ?? document.body;
@@ -170,21 +178,32 @@ export function mountAccountHeader(kit: AccountKit, options: MountOptions = {}):
   // client calls, so the callback only schedules the refresh for the next macrotask.
   const off = kit.onChange((session) => { setTimeout(() => { void refresh(session); }, 0); });
 
+  // Local cleanup only: unsubscribe from auth events and drop this instance's document
+  // listeners. Always safe to call, including for an instance that was superseded rather
+  // than explicitly unmounted (see the supersession branch above).
+  function teardown() {
+    if (disposed) return;
+    disposed = true;
+    document.removeEventListener("keydown", onDocKeydown);
+    document.removeEventListener("click", onDocClick);
+    off();
+  }
+
   const header: MountedHeader = {
     unmount() {
-      if (disposed) return;
-      disposed = true;
-      document.removeEventListener("keydown", onDocKeydown);
-      document.removeEventListener("click", onDocClick);
-      off();
+      teardown();
       root.remove();
-      document.body.classList.remove("gw-has-account-bar");
-      if (mountedInstance && mountedInstance.root === root) mountedInstance = null;
+      // Only the currently-active instance may clear the shared body class / singleton —
+      // a stale handle from a superseded mount must not disturb the live bar that replaced it.
+      if (mountedInstance && mountedInstance.root === root) {
+        document.body.classList.remove("gw-has-account-bar");
+        mountedInstance = null;
+      }
     },
     refresh: () => refresh(),
   };
 
-  mountedInstance = { root, header };
+  mountedInstance = { root, header, teardown };
   return header;
 }
 

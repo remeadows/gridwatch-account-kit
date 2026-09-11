@@ -3,18 +3,19 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mountAccountHeader } from "../src/header";
 import type { AccountKit } from "../src/session";
 
-function fakeKit(session: unknown, handle: string | null): AccountKit & { emit: (s: unknown) => void } {
-  let listener: ((s: never) => void) | null = null;
+function fakeKit(session: unknown, handle: string | null): AccountKit & { emit: (s: unknown) => void; subscriberCount: number } {
+  let listeners: Array<(s: never) => void> = [];
   return {
     config: { returnPath: "/play/match/", nexusOrigin: "https://nexus.warsignallabs.net" },
     getSession: vi.fn(async () => session as never),
-    onChange: vi.fn((cb) => { listener = cb; return () => { listener = null; }; }),
+    onChange: vi.fn((cb) => { listeners.push(cb); return () => { listeners = listeners.filter((l) => l !== cb); }; }),
     signInWithEmail: vi.fn(), signInWithProvider: vi.fn(),
     signOut: vi.fn(async () => undefined),
     getProfile: vi.fn(async () => ({ handle })),
     saveHandle: vi.fn(),
     signInUrl: () => "https://nexus.warsignallabs.net/account/sign-in?return=%2Fplay%2Fmatch%2F",
-    emit: (s) => listener?.(s as never),
+    emit: (s) => { for (const l of listeners) l(s as never); },
+    get subscriberCount() { return listeners.length; },
   };
 }
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -255,6 +256,73 @@ describe("mountAccountHeader v0.1.2 polish", () => {
     expect(document.querySelector(".gw-account-bar")!.getAttribute("data-state")).toBe("signed-out");
     const noticeAfter = document.querySelector(".gw-account-bar__notice") as HTMLElement | null;
     expect(!noticeAfter || noticeAfter.hidden).toBe(true);
+    warn.mockRestore();
+  });
+});
+
+describe("mountAccountHeader v0.1.2 fix round 1", () => {
+  it("tears down a superseded mount (DOM wiped without unmount()) before creating the replacement", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, "rusty");
+    mountAccountHeader(kit);
+    await tick();
+    (document.querySelector(".gw-account-bar__chip") as HTMLButtonElement).click(); // open the menu
+
+    document.body.innerHTML = ""; // router-style wipe; no unmount() called
+
+    mountAccountHeader(kit); // remount; the old instance's root is no longer connected
+    await tick();
+
+    // The old instance's onChange subscription must have been torn down.
+    expect(kit.subscriberCount).toBe(1);
+
+    (kit.getProfile as ReturnType<typeof vi.fn>).mockClear();
+    kit.emit({ user: { id: "u1" } });
+    await tick();
+    expect(kit.getProfile).toHaveBeenCalledTimes(1); // only the live instance responds
+
+    // The dead instance's document listeners must be gone: dispatching these must not throw.
+    expect(() => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      document.body.click();
+    }).not.toThrow();
+  });
+
+  it("does not let a stale handle's unmount() strip the body class or remove the active bar", async () => {
+    const kitA = fakeKit(null, null);
+    const a = mountAccountHeader(kitA);
+    await tick();
+
+    document.body.innerHTML = ""; // superseded without an explicit unmount()
+
+    const kitB = fakeKit(null, null);
+    mountAccountHeader(kitB);
+    await tick();
+    const barB = document.querySelector(".gw-account-bar");
+    expect(barB).not.toBeNull();
+
+    a.unmount(); // stale handle from the superseded mount
+
+    expect(document.body.classList.contains("gw-has-account-bar")).toBe(true);
+    expect(document.querySelector(".gw-account-bar")).toBe(barB);
+  });
+
+  it("shows a notice when sign-out fails via Switch account", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, "rusty");
+    (kit.signOut as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("network down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mountAccountHeader(kit);
+    await tick();
+
+    (document.querySelector(".gw-account-bar__chip") as HTMLButtonElement).click();
+    const switchBtn = [...document.querySelectorAll(".gw-account-bar__menu button")].find(
+      (b) => b.textContent === "Switch account",
+    ) as HTMLButtonElement;
+    switchBtn.click();
+    await tick();
+
+    const notice = document.querySelector(".gw-account-bar__notice") as HTMLElement;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toBe("Sign out failed — try again.");
     warn.mockRestore();
   });
 });
