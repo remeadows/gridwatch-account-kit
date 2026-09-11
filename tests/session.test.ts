@@ -17,6 +17,7 @@ function fakeSupabase(session: unknown = null) {
     from: vi.fn(() => ({ select: () => ({ eq: () => ({ maybeSingle }) }), upsert })),
     __emit: (s: unknown) => listeners.forEach((l) => l("SIGNED_IN", s)),
     __upsert: upsert,
+    __maybeSingle: maybeSingle,
   };
   __setSupabaseForTests(client as never);
   return client;
@@ -110,5 +111,42 @@ describe("createAccountKit", () => {
     const kit = createAccountKit({ returnPath: "/" });
     expect(await kit.getProfile()).toEqual({ handle: null });
     expect(await kit.saveHandle("rusty")).toBe("Not signed in.");
+  });
+
+  // A1: signOut discards a returned Supabase error rather than surfacing it.
+  it("signOut rejects with the error message when auth.signOut resolves a returned error", async () => {
+    const sb = fakeSupabase(user);
+    sb.auth.signOut.mockResolvedValueOnce({ error: { message: "nope" } } as never);
+    const kit = createAccountKit({ returnPath: "/" });
+    await expect(kit.signOut()).rejects.toThrow("nope");
+  });
+
+  it("signOut resolves when auth.signOut reports no error", async () => {
+    const sb = fakeSupabase(user);
+    sb.auth.signOut.mockResolvedValueOnce({ error: null } as never);
+    const kit = createAccountKit({ returnPath: "/" });
+    await expect(kit.signOut()).resolves.toBeUndefined();
+  });
+
+  // A2: getProfile silently converts a PostgREST error into a null handle instead of rejecting.
+  it("getProfile rejects when the profile query resolves a PostgREST error", async () => {
+    const sb = fakeSupabase(user);
+    sb.__maybeSingle.mockResolvedValueOnce({ data: null, error: { message: "boom" } } as never);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/" });
+    await expect(kit.getProfile()).rejects.toThrow("boom");
+  });
+
+  it("getProfile resolves { handle: null } when data is null with no error", async () => {
+    const sb = fakeSupabase(user);
+    sb.__maybeSingle.mockResolvedValueOnce({ data: null, error: null } as never);
+    const kit = createAccountKit({ returnPath: "/" });
+    expect(await kit.getProfile()).toEqual({ handle: null });
+  });
+
+  it("getProfile resolves the handle from data", async () => {
+    fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    expect(await kit.getProfile()).toEqual({ handle: "rusty" });
   });
 });

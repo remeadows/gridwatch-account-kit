@@ -51,15 +51,19 @@ export function createAccountKit(input) {
             return error ? error.message : null;
         },
         async signOut() {
-            await getSupabase().auth.signOut();
+            const { error } = await getSupabase().auth.signOut();
+            if (error)
+                throw new Error(error.message);
         },
         async getProfile() {
             const userId = await currentUserId();
             if (!userId)
                 return { handle: null };
             const { data, error } = await getSupabase().from("profiles").select("handle").eq("user_id", userId).maybeSingle();
-            if (error)
+            if (error) {
                 console.warn("[account-kit] profile load failed:", error.message);
+                throw new Error(error.message);
+            }
             return { handle: data?.handle ?? null };
         },
         async saveHandle(raw) {

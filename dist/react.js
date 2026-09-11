@@ -27,11 +27,12 @@ export function useAccount(kit) {
             setHandle(null);
             return;
         }
+        setHandle(null); // a new user must never inherit the previous user's handle while the read is in flight or if it fails
         let cancelled = false;
         kit.getProfile()
             .then(({ handle: h }) => { if (!cancelled)
             setHandle(h); })
-            .catch((thrown) => { console.warn("[account-kit] getProfile rejected:", thrown); }); // kit contract says never; belt and braces — handle stays null
+            .catch((thrown) => { console.warn("[account-kit] getProfile rejected:", thrown); }); // kit contract: rejects on read failure; hook keeps current (null) handle
         return () => { cancelled = true; };
     }, [kit, userId]);
     const signInWithEmail = useCallback((email, redirectTo) => kit.signInWithEmail(email, { redirectTo }), [kit]);
@@ -42,6 +43,6 @@ export function useAccount(kit) {
             setHandle(raw.trim());
         return error;
     }, [kit]);
-    const signOut = useCallback(() => kit.signOut(), [kit]);
+    const signOut = useCallback(() => kit.signOut().catch((thrown) => { console.warn("[account-kit] signOut failed:", thrown); }), [kit]);
     return { session, handle, loading, signInWithEmail, signInWithProvider, saveHandle, signOut };
 }

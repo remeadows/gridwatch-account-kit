@@ -104,4 +104,29 @@ describe("useAccount", () => {
     expect(result.current.handle).toBeNull();
     expect(warn).toHaveBeenCalled();
   });
+
+  // A1 (hook ruling): a kit signOut rejection must not surface to the consumer.
+  it("signOut resolves (never rejects) and warns when the kit's signOut rejects", async () => {
+    const { kit } = fakeKit(null, null);
+    (kit.signOut as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("nope"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { result } = renderHook(() => useAccount(kit));
+    await act(async () => {});
+    await expect(act(async () => { await result.current.signOut(); })).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith("[account-kit] signOut failed:", expect.anything());
+  });
+
+  // C2: switching users must not leak the previous user's handle when the new profile read fails.
+  it("clears the handle on a user switch, even before the new profile read settles", async () => {
+    const { kit, emit } = fakeKit({ user: { id: "u1" } }, "rusty");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { result } = renderHook(() => useAccount(kit));
+    await act(async () => {});
+    expect(result.current.handle).toBe("rusty");
+
+    (kit.getProfile as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("profile fetch failed"));
+    await act(async () => { emit({ user: { id: "u2" } }); });
+    expect(result.current.handle).toBeNull();
+    expect(warn).toHaveBeenCalled();
+  });
 });

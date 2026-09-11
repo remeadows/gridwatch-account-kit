@@ -11,12 +11,20 @@ const SIGN_OUT_FAILED_TEXT = "Sign out failed — try again.";
 // Module-level singleton: mountAccountHeader is idempotent while a bar is actually
 // present in the document. If the caller wiped the DOM out from under us (rather than
 // calling unmount()), `root.isConnected` goes false and we treat that as "not mounted".
-let mountedInstance: { root: HTMLElement; header: MountedHeader; teardown: () => void } | null = null;
+// Dev-only note: a hot-module-reload that re-evaluates this module resets this singleton,
+// so an HMR reload can yield a second bar in dev even though the DOM contract stays idempotent
+// within one module instance.
+let mountedInstance: { root: HTMLElement; header: MountedHeader; teardown: () => void; kit: AccountKit } | null = null;
 
 /** Always-visible account bar. Plain DOM so it mounts identically in React, Phaser, three.js, and vanilla apps. */
 export function mountAccountHeader(kit: AccountKit, options: MountOptions = {}): MountedHeader {
   if (mountedInstance) {
     if (mountedInstance.root.isConnected) {
+      if (mountedInstance.kit !== kit) {
+        console.warn(
+          "[account-kit] mountAccountHeader: a bar is already mounted with a different kit; returning the existing mount",
+        );
+      }
       return mountedInstance.header;
     }
     // The previous root was disconnected without an explicit unmount() (e.g. a router
@@ -47,7 +55,7 @@ export function mountAccountHeader(kit: AccountKit, options: MountOptions = {}):
   let notice: HTMLParagraphElement | null = null;
 
   function onDocKeydown(event: KeyboardEvent) {
-    if (event.key === "Escape") closeMenu();
+    if (event.key === "Escape") { closeMenu(); currentChip?.focus(); }
   }
   function onDocClick(event: MouseEvent) {
     if (!root.contains(event.target as Node)) closeMenu();
@@ -130,6 +138,7 @@ export function mountAccountHeader(kit: AccountKit, options: MountOptions = {}):
 
       const noticeEl = el("p", "gw-account-bar__notice") as HTMLParagraphElement;
       noticeEl.hidden = true;
+      noticeEl.setAttribute("role", "alert");
       root.append(noticeEl);
 
       currentMenu = menu;
@@ -163,7 +172,9 @@ export function mountAccountHeader(kit: AccountKit, options: MountOptions = {}):
     try {
       const profile = await kit.getProfile();
       handle = profile.handle;
-      lastKnownProfile = { userId, handle };
+      // Only the still-current generation may update the shared cache — an obsolete refresh
+      // that resolves late (or fails) must not clobber a newer generation's cached handle.
+      if (!disposed && mine === generation) lastKnownProfile = { userId, handle };
     } catch (thrown) {
       console.warn("[account-kit] header profile read failed:", thrown instanceof Error ? thrown.message : String(thrown));
       handle = lastKnownProfile && lastKnownProfile.userId === userId ? lastKnownProfile.handle : null;
@@ -203,7 +214,7 @@ export function mountAccountHeader(kit: AccountKit, options: MountOptions = {}):
     refresh: () => refresh(),
   };
 
-  mountedInstance = { root, header, teardown };
+  mountedInstance = { root, header, teardown, kit };
   return header;
 }
 

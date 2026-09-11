@@ -248,6 +248,7 @@ describe("mountAccountHeader v0.1.2 polish", () => {
     const notice = document.querySelector(".gw-account-bar__notice") as HTMLElement;
     expect(notice.hidden).toBe(false);
     expect(notice.textContent).toBe("Sign out failed — try again.");
+    expect(notice.getAttribute("role")).toBe("alert"); // C3: live-region semantics
 
     (kit.signOut as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     kit.emit(null);
@@ -324,5 +325,84 @@ describe("mountAccountHeader v0.1.2 fix round 1", () => {
     expect(notice.hidden).toBe(false);
     expect(notice.textContent).toBe("Sign out failed — try again.");
     warn.mockRestore();
+  });
+});
+
+describe("mountAccountHeader v0.1.2 final fix round", () => {
+  // A3 / C1: a slower, obsolete refresh must not clobber the profile cache with a stale handle.
+  it("does not let an obsolete refresh's profile write clobber a newer cached handle", async () => {
+    const kit = fakeKit(null, null);
+    const resolvers: Array<(v: { handle: string | null }) => void> = [];
+    (kit.getProfile as ReturnType<typeof vi.fn>).mockImplementation(
+      () => new Promise((r) => { resolvers.push(r); }),
+    );
+    mountAccountHeader(kit);
+    await tick(); // initial refresh: signed-out (no session yet), getProfile not called
+
+    kit.emit({ user: { id: "u1" } }); // refresh generation N (obsolete-to-be)
+    await tick();
+    kit.emit({ user: { id: "u1" } }); // refresh generation N+1 (current)
+    await tick();
+    expect(resolvers.length).toBe(2);
+
+    // Resolve the NEWER (current) generation first with the newer handle.
+    resolvers[1]({ handle: "newer" });
+    await tick();
+    const chip = () => document.querySelector(".gw-account-bar__chip")!.textContent;
+    expect(chip()).toContain("newer");
+
+    // Now the OLDER (obsolete) generation resolves late with a stale handle.
+    resolvers[0]({ handle: "older" });
+    await tick();
+    expect(chip()).toContain("newer"); // render is already generation-guarded
+
+    // A later failure must fall back to the newer cached handle, not the stale one
+    // an obsolete refresh may have written to the cache.
+    (kit.getProfile as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("profiles unavailable"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    kit.emit({ user: { id: "u1" } });
+    await tick();
+    expect(chip()).toContain("newer");
+    warn.mockRestore();
+  });
+
+  // B5: a second mount with a different kit must not silently adopt the new kit.
+  it("warns and returns the existing mount when a second mount uses a different kit", async () => {
+    const kitA = fakeKit({ user: { id: "u1" } }, "rusty");
+    const kitB = fakeKit({ user: { id: "u2" } }, "other");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const a = mountAccountHeader(kitA);
+    await tick();
+    const b = mountAccountHeader(kitB);
+    await tick();
+
+    expect(b).toBe(a);
+    expect(document.querySelectorAll(".gw-account-bar").length).toBe(1);
+    expect(document.querySelector(".gw-account-bar__chip")!.textContent).toContain("rusty");
+    expect(warn).toHaveBeenCalledWith(
+      "[account-kit] mountAccountHeader: a bar is already mounted with a different kit; returning the existing mount",
+    );
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    // A second call with the SAME kit must not warn.
+    mountAccountHeader(kitA);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  // B6: closing the menu via Escape should not leave focus orphaned on a removed/hidden control.
+  it("returns focus to the chip when the menu closes via Escape", async () => {
+    const kit = fakeKit({ user: { id: "u1" } }, "rusty");
+    mountAccountHeader(kit);
+    await tick();
+    const chip = document.querySelector(".gw-account-bar__chip") as HTMLButtonElement;
+    const menu = document.querySelector(".gw-account-bar__menu") as HTMLElement;
+
+    chip.click();
+    expect(menu.hidden).toBe(false);
+    (menu.querySelector("button,a") as HTMLElement).focus();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(menu.hidden).toBe(true);
+    expect(document.activeElement).toBe(chip);
   });
 });
