@@ -21,3 +21,5 @@ body.gw-has-account-bar { padding-top: var(--gw-account-bar-height); }
 .gw-account-bar__menu[hidden] { display: none; }
 .gw-account-bar__item { text-align: left; padding: 8px 10px; background: transparent; color: inherit; border: 0; font: inherit; cursor: pointer; border-radius: 6px; }
 .gw-account-bar__item:hover { background: rgba(255,255,255,0.08); }
+.gw-account-bar__notice { position: absolute; top: 100%; right: 10px; margin: 4px 0 0; font-size: 12px; color: var(--gw-bar-warn, #ffb454); }
+.gw-account-bar__notice[hidden] { display: none; }

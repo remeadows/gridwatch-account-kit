@@ -17,6 +17,7 @@ function fakeSupabase(session: unknown = null) {
     from: vi.fn(() => ({ select: () => ({ eq: () => ({ maybeSingle }) }), upsert })),
     __emit: (s: unknown) => listeners.forEach((l) => l("SIGNED_IN", s)),
     __upsert: upsert,
+    __maybeSingle: maybeSingle,
   };
   __setSupabaseForTests(client as never);
   return client;
@@ -76,6 +77,27 @@ describe("createAccountKit", () => {
     expect(warn).toHaveBeenCalled();
   });
 
+  it("returns exactly null when the client reports an error alongside a session", async () => {
+    const sb = fakeSupabase(user);
+    sb.auth.getSession.mockResolvedValueOnce({ data: { session: user }, error: { message: "stale token" } } as never);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await createAccountKit({ returnPath: "/" }).getSession()).toBeNull();
+  });
+
+  it("signOut calls auth.signOut once and resolves", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    await expect(kit.signOut()).resolves.toBeUndefined();
+    expect(sb.auth.signOut).toHaveBeenCalledTimes(1);
+  });
+
+  it("saveHandle returns the error message when the error object has no code", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    sb.__upsert.mockResolvedValueOnce({ error: { message: "constraint violation" } } as never);
+    expect(await kit.saveHandle("rusty")).toBe("constraint violation");
+  });
+
   it("returns the provider error message instead of throwing", async () => {
     const sb = fakeSupabase(null);
     sb.auth.signInWithOtp.mockResolvedValueOnce({ error: { message: "rate limited" } } as never);
@@ -89,5 +111,42 @@ describe("createAccountKit", () => {
     const kit = createAccountKit({ returnPath: "/" });
     expect(await kit.getProfile()).toEqual({ handle: null });
     expect(await kit.saveHandle("rusty")).toBe("Not signed in.");
+  });
+
+  // A1: signOut discards a returned Supabase error rather than surfacing it.
+  it("signOut rejects with the error message when auth.signOut resolves a returned error", async () => {
+    const sb = fakeSupabase(user);
+    sb.auth.signOut.mockResolvedValueOnce({ error: { message: "nope" } } as never);
+    const kit = createAccountKit({ returnPath: "/" });
+    await expect(kit.signOut()).rejects.toThrow("nope");
+  });
+
+  it("signOut resolves when auth.signOut reports no error", async () => {
+    const sb = fakeSupabase(user);
+    sb.auth.signOut.mockResolvedValueOnce({ error: null } as never);
+    const kit = createAccountKit({ returnPath: "/" });
+    await expect(kit.signOut()).resolves.toBeUndefined();
+  });
+
+  // A2: getProfile silently converts a PostgREST error into a null handle instead of rejecting.
+  it("getProfile rejects when the profile query resolves a PostgREST error", async () => {
+    const sb = fakeSupabase(user);
+    sb.__maybeSingle.mockResolvedValueOnce({ data: null, error: { message: "boom" } } as never);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/" });
+    await expect(kit.getProfile()).rejects.toThrow("boom");
+  });
+
+  it("getProfile resolves { handle: null } when data is null with no error", async () => {
+    const sb = fakeSupabase(user);
+    sb.__maybeSingle.mockResolvedValueOnce({ data: null, error: null } as never);
+    const kit = createAccountKit({ returnPath: "/" });
+    expect(await kit.getProfile()).toEqual({ handle: null });
+  });
+
+  it("getProfile resolves the handle from data", async () => {
+    fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    expect(await kit.getProfile()).toEqual({ handle: "rusty" });
   });
 });

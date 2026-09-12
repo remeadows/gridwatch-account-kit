@@ -5,6 +5,7 @@ export function useAccount(kit) {
     const [handle, setHandle] = useState(null);
     const [loading, setLoading] = useState(true);
     useEffect(() => {
+        setLoading(true); // a new kit means a fresh read — don't keep showing the old kit's settled state
         let cancelled = false;
         let eventSeen = false;
         kit.getSession()
@@ -26,9 +27,12 @@ export function useAccount(kit) {
             setHandle(null);
             return;
         }
+        setHandle(null); // a new user must never inherit the previous user's handle while the read is in flight or if it fails
         let cancelled = false;
-        kit.getProfile().then(({ handle: h }) => { if (!cancelled)
-            setHandle(h); });
+        kit.getProfile()
+            .then(({ handle: h }) => { if (!cancelled)
+            setHandle(h); })
+            .catch((thrown) => { console.warn("[account-kit] getProfile rejected:", thrown); }); // kit contract: rejects on read failure; hook keeps current (null) handle
         return () => { cancelled = true; };
     }, [kit, userId]);
     const signInWithEmail = useCallback((email, redirectTo) => kit.signInWithEmail(email, { redirectTo }), [kit]);
@@ -39,6 +43,6 @@ export function useAccount(kit) {
             setHandle(raw.trim());
         return error;
     }, [kit]);
-    const signOut = useCallback(() => kit.signOut(), [kit]);
+    const signOut = useCallback(() => kit.signOut().catch((thrown) => { console.warn("[account-kit] signOut failed:", thrown); }), [kit]);
     return { session, handle, loading, signInWithEmail, signInWithProvider, saveHandle, signOut };
 }
