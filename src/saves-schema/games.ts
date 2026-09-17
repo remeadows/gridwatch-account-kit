@@ -54,10 +54,17 @@ export const payloadSchemas: Readonly<Record<string, Readonly<Record<number, Rea
   "gridwatch-match": Object.freeze({ 1: Object.freeze({ campaign: MATCH_CAMPAIGN_V1, settings: MATCH_SETTINGS_V1 }) }),
 });
 
-/** Schema check, then the recursive key denylist (spec §3.2). */
+/** Schema check, then the recursive key denylist (spec §3.2). Every lookup level is
+ *  Object.hasOwn-guarded so a prototype-chain key ("__proto__", "constructor", "toString", ...)
+ *  can never resolve to a schema that was never registered. */
 export function validatePayload(gameSlug: string, schemaVersion: number, slot: string, value: unknown): ValidationResult {
-  const schema = payloadSchemas[gameSlug]?.[schemaVersion]?.[slot];
-  if (!schema) return { ok: false, detail: "unknown_schema" };
+  if (!Number.isInteger(schemaVersion)) return { ok: false, detail: "unknown_schema" };
+  if (!Object.hasOwn(payloadSchemas, gameSlug)) return { ok: false, detail: "unknown_schema" };
+  const versions = payloadSchemas[gameSlug];
+  if (!Object.hasOwn(versions, schemaVersion)) return { ok: false, detail: "unknown_schema" };
+  const slots = versions[schemaVersion];
+  if (!Object.hasOwn(slots, slot)) return { ok: false, detail: "unknown_schema" };
+  const schema = slots[slot];
   const structural = validateAgainst(schema, value);
   if (!structural.ok) return structural;
   const denied = findDeniedKey(value);

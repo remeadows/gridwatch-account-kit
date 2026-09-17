@@ -11,6 +11,9 @@ export type Schema =
 
 export const LIMITS = Object.freeze({ maxDepth: 32, maxItems: 10_000, maxStringLength: 16_384 });
 
+/** Prototype-pollution guard: these keys are never legal in a record or object payload, own or not. */
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 export type ValidationResult = { ok: true } | { ok: false; detail: string };
 
 class Budget {
@@ -66,6 +69,7 @@ function check(schema: Schema, value: unknown, path: string, depth: number, budg
       for (const [key, child] of Object.entries(value)) {
         const over = budget.count(path);
         if (over) return fail(over);
+        if (FORBIDDEN_KEYS.has(key)) return fail(`${path}.${key}: forbidden key`);
         if (!schema.keyPattern.test(key)) return fail(`${path}.${key}: key does not match pattern`);
         const result = check(schema.value, child, `${path}.${key}`, depth + 1, budget);
         if (!result.ok) return result;
@@ -78,6 +82,7 @@ function check(schema: Schema, value: unknown, path: string, depth: number, budg
       for (const key of Object.keys(value)) {
         const over = budget.count(path);
         if (over) return fail(over);
+        if (FORBIDDEN_KEYS.has(key)) return fail(`${path}.${key}: forbidden key`);
         if (!Object.hasOwn(schema.properties, key)) return fail(`${path}.${key}: unknown property`);
       }
       for (const [key, child] of Object.entries(schema.properties)) {
@@ -89,6 +94,10 @@ function check(schema: Schema, value: unknown, path: string, depth: number, budg
         if (!result.ok) return result;
       }
       return { ok: true };
+    }
+    default: {
+      const exhaustiveCheck: never = schema;
+      return fail(`${path}: unknown schema type`);
     }
   }
 }

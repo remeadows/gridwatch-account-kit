@@ -41,6 +41,13 @@ describe("validateAgainst", () => {
     expect(validateAgainst(schema, { ...base, ratio: Number.NaN })).toEqual({ ok: false, detail: "$.ratio: expected number" });
     expect(validateAgainst(schema, { ...base, coins: 2 ** 53 })).toEqual({ ok: false, detail: "$.coins: expected integer" });
   });
+  it("rejects __proto__/constructor/prototype keys before the pattern check (prototype-pollution guard)", () => {
+    // Built via JSON.parse so the forbidden key is an own enumerable property, not the actual prototype.
+    const recordValue = JSON.parse('{"coins":1,"name":"abc","ratio":0.5,"flags":{"__proto__":true},"list":[]}');
+    expect(validateAgainst(schema, recordValue)).toEqual({ ok: false, detail: "$.flags.__proto__: forbidden key" });
+    const objectValue = JSON.parse('{"coins":1,"name":"abc","ratio":0.5,"flags":{},"list":[],"constructor":1}');
+    expect(validateAgainst(schema, objectValue)).toEqual({ ok: false, detail: "$.constructor: forbidden key" });
+  });
   it("enforces the structural caps", () => {
     const deep: Schema = { type: "record", keyPattern: /^d$/, value: { type: "record", keyPattern: /^d$/, value: { type: "boolean" } } };
     let nested: unknown = true;

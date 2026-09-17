@@ -10,4 +10,8 @@ export interface StoreRequest { schemaVersion: number; baseRevision: number; pay
 export interface StoreOk { revision: number; updatedAt: string }
 export interface CloudSummary { schemaVersion: number; sizeBytes: number; payloadDigest: string; deviceId: string | null }
 export interface ConflictBody { error: "conflict"; cloud: { revision: number; updatedAt: string; summary: CloudSummary } }
-export interface ErrorBody { error: string; detail?: string }
+export type SaveErrorCode =
+  | "no_save" | "conflict" | "unknown_game" | "unknown_slot" | "not_found" | "method_not_allowed"
+  | "payload_too_large" | "invalid_body" | "invalid_payload" | "denied_key" | "save_rejected"
+  | "rate_limited" | "upstream" | "saves_unavailable" | "unauthorized" | "idempotency_key_reused";
+export interface ErrorBody { error: SaveErrorCode; detail?: string }

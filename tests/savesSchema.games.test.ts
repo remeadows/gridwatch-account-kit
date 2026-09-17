@@ -34,6 +34,13 @@ describe("save game registry", () => {
     expect(validatePayload("gridwatch-match", 1, "inventory", campaign)).toEqual({ ok: false, detail: "unknown_schema" });
     expect(validatePayload("gridwatch-match", 1, "campaign", { ...campaign, intelSeen: { accessToken: true } })).toEqual({ ok: false, detail: "denied_key $.intelSeen.accessToken" });
   });
+  it("does not resolve a schema by walking the prototype chain (__proto__/constructor lookups)", () => {
+    expect(validatePayload("gridwatch-match", 1, "__proto__", campaign)).toEqual({ ok: false, detail: "unknown_schema" });
+    expect(validatePayload("constructor", "prototype" as never, "constructor", campaign)).toEqual({ ok: false, detail: "unknown_schema" });
+  });
+  it("rejects a non-integer schemaVersion (e.g. a string) instead of coercing it", () => {
+    expect(validatePayload("gridwatch-match", "1" as never, "campaign", campaign)).toEqual({ ok: false, detail: "unknown_schema" });
+  });
   it("publishes the wire constants", () => {
     expect(MAX_BODY_BYTES).toBe(65536);
     expect(UUID_RE.test("6ba7b810-9dad-11d1-80b4-00c04fd430c8")).toBe(true);

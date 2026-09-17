@@ -21,4 +21,10 @@ describe("denylist", () => {
     expect(findDeniedKey({ coins: 3, levels: { "1": { stars: 3, score: 10 } }, note: "my secret token" })).toBeNull();
     expect(findDeniedKey([1, "token", null])).toBeNull();
   });
+  it("bounds recursion depth instead of blowing the stack", () => {
+    let nested: unknown = { token: "x" };
+    for (let i = 0; i < 40; i++) nested = { a: nested };
+    expect(() => findDeniedKey(nested)).toThrow(RangeError);
+    expect(() => findDeniedKey(nested)).toThrow(/deeper than 32/);
+  });
 });

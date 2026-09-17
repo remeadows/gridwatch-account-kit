@@ -19,6 +19,17 @@ describe("canonicalJson", () => {
       expect(() => canonicalJson(bad)).toThrow(TypeError);
     }
   });
+  it("rejects non-plain-object values like Date instances", () => {
+    expect(() => canonicalJson(new Date())).toThrow(TypeError);
+    expect(() => canonicalJson({ when: new Date() })).toThrow(TypeError);
+  });
+  it("bounds recursion depth instead of blowing the stack", async () => {
+    let nested: unknown = 1;
+    for (let i = 0; i < 40; i++) nested = { a: nested };
+    expect(() => canonicalJson(nested)).toThrow(RangeError);
+    expect(() => canonicalJson(nested)).toThrow(/deeper than 32/);
+    await expect(requestHash({ game: "g", slot: "s", schemaVersion: 1, baseRevision: 0, payload: nested })).rejects.toThrow(/deeper than 32/);
+  });
 });
 
 describe("sha256Hex / requestHash", () => {
