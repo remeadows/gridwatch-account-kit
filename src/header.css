@@ -23,3 +23,16 @@ body.gw-has-account-bar { padding-top: var(--gw-account-bar-height); }
 .gw-account-bar__item:hover { background: rgba(255,255,255,0.08); }
 .gw-account-bar__notice { position: absolute; top: 100%; right: 10px; margin: 4px 0 0; font-size: 12px; color: var(--gw-bar-warn, #ffb454); }
 .gw-account-bar__notice[hidden] { display: none; }
+.gw-save-prompt {
+  max-width: 360px; padding: 20px; border: 1px solid var(--gw-bar-rim, #1f2a44); border-radius: 12px;
+  background: var(--gw-bar-bg, #0b1020); color: var(--gw-bar-fg, #f8fbff);
+  font: 500 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.gw-save-prompt::backdrop { background: rgba(0, 0, 0, 0.6); }
+.gw-save-prompt__text { margin: 0 0 16px; }
+.gw-save-prompt__actions { display: flex; gap: 8px; justify-content: flex-end; }
+.gw-save-prompt__primary, .gw-save-prompt__secondary {
+  padding: 8px 14px; border-radius: 999px; border: 1px solid var(--gw-bar-rim, #1f2a44);
+  background: transparent; color: inherit; font: inherit; cursor: pointer;
+}
+.gw-save-prompt__primary { background: var(--gw-bar-live, #35e6ff); color: #0b1020; border-color: transparent; }
