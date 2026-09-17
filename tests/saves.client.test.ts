@@ -107,6 +107,32 @@ describe("store", () => {
     expect(await h.client.store("campaign", campaign)).toEqual({ status: "signed_out" });
     expect(h.store).not.toHaveBeenCalled();
   });
+  it("resolves a pending store instead of hanging when dispose() runs before the debounce timer fires", async () => {
+    const h = harness();
+    const promise = h.client.store("campaign", campaign);
+    h.client.dispose();
+    await expect(promise).resolves.toEqual({ status: "error", error: { code: "http", message: "disposed" } });
+    expect(h.store).not.toHaveBeenCalled();
+  });
+  it("settles all waiters with an http error when the flush chain throws, without an unhandled rejection", async () => {
+    const load = vi.fn<Transport["load"]>();
+    const store = vi.fn<Transport["store"]>();
+    const prompt = { ask: vi.fn(async () => "primary" as const) };
+    const state = createSaveStateStore(game.gameSlug);
+    const client = createSavesClient({
+      game,
+      getSession: async () => { throw new Error("boom"); },
+      state,
+      transport: { load, store },
+      prompt,
+      sleep: async () => undefined,
+      debounceMs: 0,
+    });
+    clients.push(client);
+    const result = await client.store("campaign", campaign);
+    expect(result).toEqual({ status: "error", error: { code: "http", message: "boom" } });
+    expect(store).not.toHaveBeenCalled();
+  });
 });
 
 describe("reconcile", () => {
@@ -168,5 +194,10 @@ describe("reconcile", () => {
     const h = harness();
     h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
     expect(await h.client.reconcile("campaign", null)).toEqual({ status: "nothing" });
+  });
+  it("throws synchronously on an unknown slot without sending anything", () => {
+    const h = harness();
+    expect(() => h.client.reconcile("inventory", null)).toThrow(RangeError);
+    expect(h.store).not.toHaveBeenCalled();
   });
 });

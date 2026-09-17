@@ -118,12 +118,18 @@ export function createSavesClient(deps) {
             }
             const entry = { payload, settle: [settle], timer: setTimeout(() => {
                     pending.delete(slot);
-                    void serialized(slot, () => flush(slot, entry.payload)).then((result) => entry.settle.forEach((fn) => fn(result)));
+                    void serialized(slot, () => flush(slot, entry.payload))
+                        .then((result) => entry.settle.forEach((fn) => fn(result)))
+                        .catch((thrown) => {
+                        const message = thrown instanceof Error ? thrown.message : String(thrown);
+                        console.warn(`[account-kit] store flush for ${slot} failed: ${message}`);
+                        entry.settle.forEach((fn) => fn({ status: "error", error: { code: "http", message } }));
+                    });
                 }, debounceMs) };
             pending.set(slot, entry);
         });
     }
-    async function reconcile(slot, local) {
+    function reconcile(slot, local) {
         assertSlot(slot);
         return serialized(slot, async () => {
             const s = await session();
@@ -198,8 +204,10 @@ export function createSavesClient(deps) {
         dispose() {
             windowRef?.removeEventListener("online", onOnline);
             windowRef?.document.removeEventListener("visibilitychange", onVisibility);
-            for (const entry of pending.values())
+            for (const entry of pending.values()) {
                 clearTimeout(entry.timer);
+                entry.settle.forEach((fn) => fn({ status: "error", error: { code: "http", message: "disposed" } }));
+            }
             pending.clear();
         },
     };

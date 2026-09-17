@@ -138,13 +138,19 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       if (existing) { existing.payload = payload; existing.settle.push(settle); return; }
       const entry = { payload, settle: [settle], timer: setTimeout(() => {
         pending.delete(slot);
-        void serialized(slot, () => flush(slot, entry.payload)).then((result) => entry.settle.forEach((fn) => fn(result)));
+        void serialized(slot, () => flush(slot, entry.payload))
+          .then((result) => entry.settle.forEach((fn) => fn(result)))
+          .catch((thrown: unknown) => {
+            const message = thrown instanceof Error ? thrown.message : String(thrown);
+            console.warn(`[account-kit] store flush for ${slot} failed: ${message}`);
+            entry.settle.forEach((fn) => fn({ status: "error", error: { code: "http", message } }));
+          });
       }, debounceMs) };
       pending.set(slot, entry);
     });
   }
 
-  async function reconcile(slot: string, local: SavePayload | null): Promise<ReconcileResult> {
+  function reconcile(slot: string, local: SavePayload | null): Promise<ReconcileResult> {
     assertSlot(slot);
     return serialized(slot, async () => {
       const s = await session();
@@ -215,7 +221,10 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     dispose() {
       windowRef?.removeEventListener("online", onOnline);
       windowRef?.document.removeEventListener("visibilitychange", onVisibility);
-      for (const entry of pending.values()) clearTimeout(entry.timer);
+      for (const entry of pending.values()) {
+        clearTimeout(entry.timer);
+        entry.settle.forEach((fn) => fn({ status: "error", error: { code: "http", message: "disposed" } }));
+      }
       pending.clear();
     },
   };
