@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavesClient } from "../src/saves/client";
 import { CONFLICT_COPY, OWNERSHIP_COPY, type PromptAnswer, type PromptCopy } from "../src/saves/prompt";
 import { createSaveStateStore } from "../src/saves/state";
@@ -10,6 +10,9 @@ const campaign = { coins: 5, boosters: { rocket: 1 }, selectedHeroId: "rusty", c
 const row = (revision: number, payload = campaign) => ({ slot: "campaign", schemaVersion: 1, revision, payload, updatedAt: "2026-09-17T00:00:00.000Z" });
 const ok = (status: number, body: unknown): TransportResult => ({ kind: "ok", status, body, retryAfterMs: null });
 
+const clients: Array<{ dispose(): void }> = [];
+afterEach(() => { for (const c of clients.splice(0)) c.dispose(); });
+
 function harness(session: { access_token: string; user: { id: string } } | null = { access_token: "tok", user: { id: "u1" } }) {
   localStorage.clear();
   const load = vi.fn<Transport["load"]>();
@@ -19,6 +22,7 @@ function harness(session: { access_token: string; user: { id: string } } | null 
   const prompt = { ask: vi.fn(async (copy: PromptCopy) => { asked.push(copy); return answers.shift() ?? "primary"; }) };
   const state = createSaveStateStore(game.gameSlug);
   const client = createSavesClient({ game, getSession: async () => session, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs: 0 });
+  clients.push(client);
   return { client, load, store, prompt, answers, asked, state };
 }
 const flush = () => new Promise((r) => setTimeout(r, 5));
