@@ -30,6 +30,15 @@ describe("canonicalJson", () => {
     expect(() => canonicalJson(nested)).toThrow(/deeper than 32/);
     await expect(requestHash({ game: "g", slot: "s", schemaVersion: 1, baseRevision: 0, payload: nested })).rejects.toThrow(/deeper than 32/);
   });
+  it("rejects sparse arrays instead of silently skipping holes (Array.prototype.map skips them)", () => {
+    expect(() => canonicalJson(Array(1))).toThrow(TypeError);
+    expect(() => canonicalJson([1, , 2])).toThrow(TypeError);
+  });
+  it("rejects lone UTF-16 surrogates in values and object keys (RFC 8785), but accepts a valid pair", () => {
+    expect(() => canonicalJson("\uD800")).toThrow(TypeError);
+    expect(() => canonicalJson({ "\uDC00": 1 })).toThrow(TypeError);
+    expect(() => canonicalJson("😀")).not.toThrow();
+  });
 });
 
 describe("sha256Hex / requestHash", () => {

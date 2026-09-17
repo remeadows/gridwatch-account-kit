@@ -48,6 +48,16 @@ describe("validateAgainst", () => {
     const objectValue = JSON.parse('{"coins":1,"name":"abc","ratio":0.5,"flags":{},"list":[],"constructor":1}');
     expect(validateAgainst(schema, objectValue)).toEqual({ ok: false, detail: "$.constructor: forbidden key" });
   });
+  it("rejects a non-plain object like a Date even when the schema is a record type", () => {
+    expect(validateAgainst({ type: "record", keyPattern: /./, value: { type: "boolean" } }, new Date())).toEqual({ ok: false, detail: "$: expected object" });
+  });
+  it("resets a stateful /g pattern's lastIndex before each test instead of carrying state across calls", () => {
+    const statefulSchema: Schema = { type: "string", pattern: /^[a-z]+$/g };
+    expect(validateAgainst(statefulSchema, "abc")).toEqual({ ok: true });
+    expect(validateAgainst(statefulSchema, "abc")).toEqual({ ok: true });
+    const keySchema: Schema = { type: "record", keyPattern: /^[a-z]+$/g, value: { type: "boolean" } };
+    expect(validateAgainst(keySchema, { abc: true, def: true })).toEqual({ ok: true });
+  });
   it("enforces the structural caps", () => {
     const deep: Schema = { type: "record", keyPattern: /^d$/, value: { type: "record", keyPattern: /^d$/, value: { type: "boolean" } } };
     let nested: unknown = true;

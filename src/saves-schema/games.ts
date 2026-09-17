@@ -3,13 +3,15 @@ import { validateAgainst, type Schema, type ValidationResult } from "./validate.
 
 export interface SaveGame { slug: string; slots: readonly string[]; schemaVersion: number }
 
-/** Alias → game. Only games wired to the kit client appear here; Zero keeps its own path (spec §2.3). */
-export const SAVE_GAMES: Readonly<Record<string, SaveGame>> = Object.freeze({
+/** Alias → game. Only games wired to the kit client appear here; Zero keeps its own path (spec §2.3).
+ *  Typed sparse (`| undefined`) so every lookup site must guard instead of trusting a plain
+ *  Record<string, SaveGame> index signature, which TypeScript otherwise treats as always present. */
+export const SAVE_GAMES: Readonly<Record<string, SaveGame | undefined>> = Object.freeze({
   match: Object.freeze({ slug: "gridwatch-match", slots: Object.freeze(["campaign", "settings"]), schemaVersion: 1 }),
 });
 
 export function resolveSaveGame(alias: string): SaveGame | null {
-  return Object.hasOwn(SAVE_GAMES, alias) ? SAVE_GAMES[alias] : null;
+  return Object.hasOwn(SAVE_GAMES, alias) ? (SAVE_GAMES[alias] ?? null) : null;
 }
 
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -50,7 +52,13 @@ export const MATCH_SETTINGS_V1: Schema = {
   },
 };
 
-export const payloadSchemas: Readonly<Record<string, Readonly<Record<number, Readonly<Record<string, Schema>>>>>> = Object.freeze({
+/** Sparse at every level (game slug, schema version, slot), for the same reason as SAVE_GAMES:
+ *  an index signature typed without `| undefined` lets a lookup by an unregistered key compile
+ *  as if it always returns a Schema, hiding exactly the kind of bug the hasOwn guards below exist
+ *  to prevent. */
+export const payloadSchemas: Readonly<
+  Record<string, Readonly<Record<number, Readonly<Record<string, Schema | undefined>> | undefined>> | undefined>
+> = Object.freeze({
   "gridwatch-match": Object.freeze({ 1: Object.freeze({ campaign: MATCH_CAMPAIGN_V1, settings: MATCH_SETTINGS_V1 }) }),
 });
 
@@ -59,12 +67,10 @@ export const payloadSchemas: Readonly<Record<string, Readonly<Record<number, Rea
  *  can never resolve to a schema that was never registered. */
 export function validatePayload(gameSlug: string, schemaVersion: number, slot: string, value: unknown): ValidationResult {
   if (!Number.isInteger(schemaVersion)) return { ok: false, detail: "unknown_schema" };
-  if (!Object.hasOwn(payloadSchemas, gameSlug)) return { ok: false, detail: "unknown_schema" };
-  const versions = payloadSchemas[gameSlug];
-  if (!Object.hasOwn(versions, schemaVersion)) return { ok: false, detail: "unknown_schema" };
-  const slots = versions[schemaVersion];
-  if (!Object.hasOwn(slots, slot)) return { ok: false, detail: "unknown_schema" };
-  const schema = slots[slot];
+  const versions = Object.hasOwn(payloadSchemas, gameSlug) ? payloadSchemas[gameSlug] : undefined;
+  const slots = versions && Object.hasOwn(versions, schemaVersion) ? versions[schemaVersion] : undefined;
+  const schema = slots && Object.hasOwn(slots, slot) ? slots[slot] : undefined;
+  if (!schema) return { ok: false, detail: "unknown_schema" };
   const structural = validateAgainst(schema, value);
   if (!structural.ok) return structural;
   const denied = findDeniedKey(value);

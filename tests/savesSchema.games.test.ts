@@ -19,7 +19,7 @@ describe("save game registry", () => {
     expect(SAVE_GAMES).toEqual({ match: { slug: "gridwatch-match", slots: ["campaign", "settings"], schemaVersion: 1 } });
     expect(resolveSaveGame("match")).toEqual(SAVE_GAMES.match);
     for (const alias of ["zero", "breach", "drift", "gambit", "MATCH", "match/"]) expect(resolveSaveGame(alias)).toBeNull();
-    expect(payloadSchemas["gridwatch-match"][1]).toEqual({ campaign: MATCH_CAMPAIGN_V1, settings: MATCH_SETTINGS_V1 });
+    expect(payloadSchemas["gridwatch-match"]?.[1]).toEqual({ campaign: MATCH_CAMPAIGN_V1, settings: MATCH_SETTINGS_V1 });
   });
   it("validates the Match v1 slots", () => {
     expect(validatePayload("gridwatch-match", 1, "campaign", campaign)).toEqual({ ok: true });

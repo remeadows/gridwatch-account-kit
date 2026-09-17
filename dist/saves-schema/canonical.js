@@ -1,6 +1,14 @@
 // Canonical JSON (RFC 8785 shape: recursively sorted keys, no whitespace, JSON.stringify
 // escaping and number forms) and the server-side request hash from spec §3.1.
 import { LIMITS } from "./validate.js";
+// RFC 8785 rejects a string containing an unpaired UTF-16 surrogate; JSON.stringify silently
+// escapes it instead of rejecting it, so this must be checked explicitly for every string that
+// goes through canonicalJson, values and object keys alike.
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+function assertWellFormedString(value, path) {
+    if (LONE_SURROGATE_RE.test(value))
+        throw new TypeError(`canonicalJson: lone surrogate at ${path}`);
+}
 function assertJsonValue(value, path) {
     if (value === null)
         return;
@@ -28,14 +36,28 @@ function serialize(value, path, depth) {
     if (depth > LIMITS.maxDepth)
         throw new RangeError(`canonicalJson: deeper than ${LIMITS.maxDepth}`);
     assertJsonValue(value, path);
+    if (typeof value === "string") {
+        assertWellFormedString(value, path);
+        return JSON.stringify(value);
+    }
     if (value === null || typeof value !== "object")
         return JSON.stringify(value);
-    if (Array.isArray(value))
-        return `[${value.map((item, i) => serialize(item, `${path}[${i}]`, depth + 1)).join(",")}]`;
+    if (Array.isArray(value)) {
+        // Array.prototype.map skips holes (Array(2) -> [<2 empty>]), which would silently drop data
+        // instead of rejecting it. Walk every index explicitly and reject anything not an own property.
+        const parts = [];
+        for (let i = 0; i < value.length; i++) {
+            if (!Object.hasOwn(value, i))
+                throw new TypeError(`canonicalJson: sparse array at ${path}[${i}]`);
+            parts.push(serialize(value[i], `${path}[${i}]`, depth + 1));
+        }
+        return `[${parts.join(",")}]`;
+    }
     const record = value;
     const keys = Object.keys(record).sort(); // default sort = UTF-16 code unit order (RFC 8785)
     const parts = [];
     for (const key of keys) {
+        assertWellFormedString(key, `${path}.${key}`);
         parts.push(`${JSON.stringify(key)}:${serialize(record[key], `${path}.${key}`, depth + 1)}`);
     }
     return `{${parts.join(",")}}`;

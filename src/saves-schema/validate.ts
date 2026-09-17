@@ -29,7 +29,11 @@ function fail(detail: string): ValidationResult {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  // Reject class instances (Date, RegExp, Map, ...) masquerading as plain objects: only a
+  // literal-shaped object (or one with a null prototype) is an acceptable payload record.
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 function check(schema: Schema, value: unknown, path: string, depth: number, budget: Budget): ValidationResult {
@@ -41,7 +45,12 @@ function check(schema: Schema, value: unknown, path: string, depth: number, budg
       if (typeof value !== "string") return fail(`${path}: expected string`);
       const cap = Math.min(schema.maxLength ?? LIMITS.maxStringLength, LIMITS.maxStringLength);
       if (value.length > cap) return fail(`${path}: longer than ${cap}`);
-      if (schema.pattern && !schema.pattern.test(value)) return fail(`${path}: does not match pattern`);
+      if (schema.pattern) {
+        // A /g or /y pattern carries lastIndex between calls; reset it so one schema object
+        // reused across values (or keys) doesn't intermittently pass/fail based on prior state.
+        schema.pattern.lastIndex = 0;
+        if (!schema.pattern.test(value)) return fail(`${path}: does not match pattern`);
+      }
       return { ok: true };
     }
     case "integer":
@@ -70,6 +79,7 @@ function check(schema: Schema, value: unknown, path: string, depth: number, budg
         const over = budget.count(path);
         if (over) return fail(over);
         if (FORBIDDEN_KEYS.has(key)) return fail(`${path}.${key}: forbidden key`);
+        schema.keyPattern.lastIndex = 0; // see the string-pattern case above
         if (!schema.keyPattern.test(key)) return fail(`${path}.${key}: key does not match pattern`);
         const result = check(schema.value, child, `${path}.${key}`, depth + 1, budget);
         if (!result.ok) return result;
