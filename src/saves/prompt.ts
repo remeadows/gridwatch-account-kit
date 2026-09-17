@@ -57,14 +57,13 @@ function show(doc: Document, copy: PromptCopy): Promise<PromptAnswer> {
 /** `doc` is resolved when a prompt is first shown, so the host can be created where there is no DOM yet. */
 export function createDomPromptHost(doc?: Document): PromptHost {
   let queue: Promise<unknown> = Promise.resolve();
-  let pending: { copy: PromptCopy; answer: Promise<PromptAnswer> } | null = null;
+  const pending = new Map<string, Promise<PromptAnswer>>();
   return {
     ask(copy) {
-      if (pending && pending.copy.text === copy.text) return pending.answer;
+      if (pending.has(copy.text)) return pending.get(copy.text)!;
       const answer = queue.then(() => show(doc ?? document, copy));
-      const entry = { copy, answer };
-      pending = entry;
-      queue = answer.finally(() => { if (pending === entry) pending = null; });
+      pending.set(copy.text, answer);
+      queue = answer.finally(() => { pending.delete(copy.text); });
       return answer;
     },
   };

@@ -62,4 +62,20 @@ describe("createDomPromptHost", () => {
     (dialog.querySelector(".gw-save-prompt__secondary") as HTMLButtonElement).click();
     expect(await pending).toBe("secondary");
   });
+  it("shares the answer with a same-copy ask even when a different copy is queued in between", async () => {
+    const host = createDomPromptHost();
+    const a = host.ask(CONFLICT_COPY);
+    const b = host.ask(OWNERSHIP_COPY);
+    const c = host.ask(CONFLICT_COPY);
+    await tick();
+    expect(document.querySelectorAll("dialog.gw-save-prompt").length).toBe(1);
+    (document.querySelector(".gw-save-prompt__secondary") as HTMLButtonElement).click();
+    expect(await Promise.all([a, c])).toEqual(["secondary", "secondary"]);
+    await tick();
+    expect(document.querySelectorAll("dialog.gw-save-prompt").length).toBe(1);
+    expect(document.querySelector(".gw-save-prompt__text")!.textContent).toBe(OWNERSHIP_COPY.text);
+    (document.querySelector(".gw-save-prompt__primary") as HTMLButtonElement).click();
+    expect(await b).toBe("primary");
+    expect(document.querySelector("dialog.gw-save-prompt")).toBeNull();
+  });
 });
