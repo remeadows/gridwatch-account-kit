@@ -1,6 +1,6 @@
 {
   "name": "@gridwatch/account-kit",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Shared account bar, single Supabase session, and sign-in flow for GridWatch games.",
   "type": "module",
   "license": "MIT",
@@ -17,6 +17,10 @@
     "./react": {
       "types": "./dist/react.d.ts",
       "default": "./dist/react.js"
+    },
+    "./saves-schema": {
+      "types": "./dist/saves-schema/index.d.ts",
+      "default": "./dist/saves-schema/index.js"
     },
     "./header.css": "./dist/header.css"
   },

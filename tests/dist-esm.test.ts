@@ -43,4 +43,27 @@ describe("dist is valid strict ESM", () => {
       ),
     ).not.toThrow();
   });
+  it("saves-schema/index.js loads under Node's resolver", () => {
+    expect(() =>
+      loadUnderNode(
+        dist("saves-schema/index.js"),
+        `if (typeof mod.validatePayload !== "function") throw new Error("validatePayload missing");
+         if (typeof mod.requestHash !== "function") throw new Error("requestHash missing");
+         if (mod.MAX_BODY_BYTES !== 65536) throw new Error("MAX_BODY_BYTES wrong");`,
+      ),
+    ).not.toThrow();
+  });
+  it("saves/index.js loads under Node's resolver and exposes the client-assembly primitives", () => {
+    expect(() =>
+      loadUnderNode(
+        dist("saves/index.js"),
+        `if (typeof mod.createSavesClient !== "function") throw new Error("createSavesClient missing");
+         if (typeof mod.createSaveStateStore !== "function") throw new Error("createSaveStateStore missing");
+         if (typeof mod.createTransport !== "function") throw new Error("createTransport missing");
+         if (typeof mod.withRetry !== "function") throw new Error("withRetry missing");
+         if (typeof mod.createDomPromptHost !== "function") throw new Error("createDomPromptHost missing");
+         if (typeof mod.decideReconcile !== "function") throw new Error("decideReconcile missing");`,
+      ),
+    ).not.toThrow();
+  });
 });
