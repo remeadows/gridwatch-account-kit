@@ -45,11 +45,11 @@ await kit.saves!.store("campaign", localCampaign);                      // on ev
 
 A background re-flush — triggered by the `online` event or the tab becoming visible again, for any slot the kit already knows is dirty — never prompts the player. If it hits a 409, the record is simply left dirty for the next foreground `store()` or `reconcile()` call to resolve normally with a prompt; a background flush is not the moment to interrupt play with a "use cloud or keep this one" decision.
 
-Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SPA): it removes the `online`/`visibilitychange` listeners, closes any prompt dialog that's on screen, and settles every in-flight `store()`/`reconcile()` call with `{ status: "error", error: { code: "http", message: "disposed" } }` instead of leaving them hanging.
+Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SPA): it removes the `online`/`visibilitychange` listeners, closes any prompt dialog that's on screen, settles calls still waiting on the debounce timer or on a prompt immediately, and marks the client disposed so a call that is mid-request settles with `{ status: "error", error: { code: "http", message: "disposed" } }` as soon as its current transport attempt returns (the deadline below bounds that wait); no state is written after `dispose()`.
 
 ### Runtime requirements
 
-`kit.saves` needs `crypto.getRandomValues`, `fetch`, `AbortController`, `localStorage` (falls back to an in-memory store when unavailable, e.g. private mode), and `<dialog>` (falls back to a plain `open` attribute when `HTMLDialogElement.showModal` isn't supported). Each transport request is bounded by a 15 s deadline, and each request body is capped at 64 KB — a `store`/`reconcile` payload that would exceed it locally resolves `{ status: "error", error: { code: "invalid_payload", ... } }` without ever reaching the network.
+`kit.saves` needs `crypto.getRandomValues`, `fetch`, `AbortController`, `localStorage` (falls back to an in-memory store when unavailable, e.g. private mode), and `<dialog>` (falls back to a plain `open` attribute when `HTMLDialogElement.showModal` isn't supported). Each transport *attempt* is bounded by a 15 s deadline (a store that retries three times against a dead network can take about 47 s to resolve), and each request body is capped at 64 KB — a `store`/`reconcile` payload that would exceed it locally resolves `{ status: "error", error: { code: "invalid_payload", ... } }` without ever reaching the network.
 
 ## Exports
 
