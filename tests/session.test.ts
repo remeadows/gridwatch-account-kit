@@ -149,4 +149,13 @@ describe("createAccountKit", () => {
     const kit = createAccountKit({ returnPath: "/" });
     expect(await kit.getProfile()).toEqual({ handle: "rusty" });
   });
+
+  it("exposes saves only when a game config is given", () => {
+    fakeSupabase(null);
+    expect(createAccountKit({ returnPath: "/" }).saves).toBeUndefined();
+    const kit = createAccountKit({ returnPath: "/play/match/", game: { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 } });
+    expect(kit.saves?.game.routeAlias).toBe("match");
+    expect(kit.config).toEqual({ returnPath: "/play/match/", nexusOrigin: "https://nexus.warsignallabs.net" });
+    expect(() => kit.saves!.load("inventory")).toThrow(RangeError);
+  });
 });

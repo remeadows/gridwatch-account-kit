@@ -2,6 +2,10 @@ import { getSupabase } from "./client.js";
 import { NEXUS_ORIGIN } from "./config.js";
 import { validateHandle } from "./handle.js";
 import { signInUrl } from "./returnPath.js";
+import { createSavesClient } from "./saves/client.js";
+import { createDomPromptHost } from "./saves/prompt.js";
+import { createSaveStateStore } from "./saves/state.js";
+import { createTransport } from "./saves/transport.js";
 /** True when `e` carries a string `code` field (e.g. a PostgrestError), narrowing its type. */
 function hasCode(e) {
     return typeof e === "object" && e !== null && "code" in e && typeof e.code === "string";
@@ -29,8 +33,18 @@ export function createAccountKit(input) {
     async function currentUserId() {
         return (await getSession())?.user.id ?? null;
     }
+    const saves = input.game
+        ? createSavesClient({
+            game: input.game,
+            getSession: async () => { const s = await getSession(); return s ? { access_token: s.access_token, user: { id: s.user.id } } : null; },
+            state: createSaveStateStore(input.game.gameSlug),
+            transport: createTransport(`${config.nexusOrigin}/api/saves/${input.game.routeAlias}`),
+            prompt: createDomPromptHost(),
+        })
+        : undefined;
     return {
         config,
+        saves,
         getSession,
         onChange(callback) {
             const { data } = getSupabase().auth.onAuthStateChange((_event, session) => callback(session));

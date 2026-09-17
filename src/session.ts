@@ -3,6 +3,11 @@ import { getSupabase } from "./client.js";
 import { NEXUS_ORIGIN } from "./config.js";
 import { validateHandle } from "./handle.js";
 import { signInUrl } from "./returnPath.js";
+import { createSavesClient } from "./saves/client.js";
+import { createDomPromptHost } from "./saves/prompt.js";
+import { createSaveStateStore } from "./saves/state.js";
+import { createTransport } from "./saves/transport.js";
+import type { SaveGameConfig, SavesClient } from "./saves/types.js";
 
 export type Provider = "google" | "github";
 export interface SignInOptions { redirectTo?: string }
@@ -11,6 +16,8 @@ export interface AccountKitConfig {
   /** Where this app lives on the Nexus origin, e.g. "/" for Nexus, "/play/match/" for Match. */
   returnPath: string;
   nexusOrigin?: string;
+  /** Spec §3.2 constants; enables kit.saves. */
+  game?: SaveGameConfig;
 }
 
 /** True when `e` carries a string `code` field (e.g. a PostgrestError), narrowing its type. */
@@ -19,7 +26,8 @@ function hasCode(e: unknown): e is { code: string } {
 }
 
 export interface AccountKit {
-  readonly config: Required<AccountKitConfig>;
+  readonly config: Readonly<{ returnPath: string; nexusOrigin: string }>;
+  readonly saves: SavesClient | undefined;
   getSession(): Promise<Session | null>;
   onChange(callback: (session: Session | null) => void): () => void;
   signInWithEmail(email: string, options?: SignInOptions): Promise<string | null>;
@@ -55,8 +63,19 @@ export function createAccountKit(input: AccountKitConfig): AccountKit {
     return (await getSession())?.user.id ?? null;
   }
 
+  const saves: SavesClient | undefined = input.game
+    ? createSavesClient({
+        game: input.game,
+        getSession: async () => { const s = await getSession(); return s ? { access_token: s.access_token, user: { id: s.user.id } } : null; },
+        state: createSaveStateStore(input.game.gameSlug),
+        transport: createTransport(`${config.nexusOrigin}/api/saves/${input.game.routeAlias}`),
+        prompt: createDomPromptHost(),
+      })
+    : undefined;
+
   return {
     config,
+    saves,
     getSession,
     onChange(callback) {
       const { data } = getSupabase().auth.onAuthStateChange((_event, session) => callback(session));

@@ -1,0 +1,64 @@
+export const CONFLICT_COPY = Object.freeze({
+    text: "Newer save in the cloud from another device. Use cloud or keep this one?",
+    primary: "Use cloud",
+    secondary: "Keep this one",
+});
+export const OWNERSHIP_COPY = Object.freeze({
+    text: "This device has progress from another account. Upload it to this account, or start fresh?",
+    primary: "Upload",
+    secondary: "Start fresh",
+});
+function button(doc, className, label) {
+    const node = doc.createElement("button");
+    node.type = "button";
+    node.className = className;
+    node.textContent = label;
+    return node;
+}
+function show(doc, copy) {
+    return new Promise((resolve) => {
+        const dialog = doc.createElement("dialog");
+        dialog.className = "gw-save-prompt";
+        dialog.setAttribute("role", "alertdialog");
+        dialog.setAttribute("aria-modal", "true");
+        const text = doc.createElement("p");
+        text.className = "gw-save-prompt__text";
+        text.textContent = copy.text;
+        const actions = doc.createElement("div");
+        actions.className = "gw-save-prompt__actions";
+        const primary = button(doc, "gw-save-prompt__primary", copy.primary);
+        primary.autofocus = true;
+        const secondary = button(doc, "gw-save-prompt__secondary", copy.secondary);
+        actions.append(primary, secondary);
+        dialog.append(text, actions);
+        dialog.addEventListener("cancel", (event) => event.preventDefault()); // Escape must not dismiss
+        const finish = (answer) => {
+            if (typeof dialog.close === "function")
+                dialog.close();
+            dialog.remove();
+            resolve(answer);
+        };
+        primary.addEventListener("click", () => finish("primary"));
+        secondary.addEventListener("click", () => finish("secondary"));
+        doc.body.append(dialog);
+        if (typeof dialog.showModal === "function")
+            dialog.showModal();
+        else
+            dialog.setAttribute("open", "");
+    });
+}
+/** `doc` is resolved when a prompt is first shown, so the host can be created where there is no DOM yet. */
+export function createDomPromptHost(doc) {
+    let queue = Promise.resolve();
+    const pending = new Map();
+    return {
+        ask(copy) {
+            if (pending.has(copy.text))
+                return pending.get(copy.text);
+            const answer = queue.then(() => show(doc ?? document, copy));
+            pending.set(copy.text, answer);
+            queue = answer.finally(() => { pending.delete(copy.text); });
+            return answer;
+        },
+    };
+}

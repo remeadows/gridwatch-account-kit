@@ -7,6 +7,7 @@ function fakeKit(session: unknown, handle: string | null): AccountKit & { emit: 
   let listeners: Array<(s: never) => void> = [];
   return {
     config: { returnPath: "/play/match/", nexusOrigin: "https://nexus.warsignallabs.net" },
+    saves: undefined,
     getSession: vi.fn(async () => session as never),
     onChange: vi.fn((cb) => { listeners.push(cb); return () => { listeners = listeners.filter((l) => l !== cb); }; }),
     signInWithEmail: vi.fn(), signInWithProvider: vi.fn(),
