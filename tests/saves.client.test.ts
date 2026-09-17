@@ -30,8 +30,12 @@ describe("load", () => {
     expect(await h.client.load("campaign")).toEqual({ status: "ok", save: { revision: 2, schemaVersion: 1, payload: campaign, updatedAt: row(2).updatedAt } });
     h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
     expect(await h.client.load("campaign")).toEqual({ status: "none" });
-    h.load.mockResolvedValueOnce({ kind: "network", message: "down" });
-    expect((await h.client.load("campaign")).status).toBe("error");
+    h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+      .mockResolvedValueOnce({ kind: "network", message: "down" })
+      .mockResolvedValueOnce({ kind: "network", message: "down" });
+    const failed = await h.client.load("campaign");
+    expect(failed).toMatchObject({ status: "error", error: { code: "network", message: "down" } });
+    expect(h.load).toHaveBeenCalledTimes(5);
     expect(() => h.client.load("inventory")).toThrow(RangeError);
     expect(await harness(null).client.load("campaign")).toEqual({ status: "signed_out" });
   });
