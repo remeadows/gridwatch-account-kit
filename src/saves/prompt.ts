@@ -2,7 +2,7 @@
 // forbids inline styles). One dialog at a time; identical concurrent asks share the answer.
 export interface PromptCopy { text: string; primary: string; secondary: string }
 export type PromptAnswer = "primary" | "secondary";
-export interface PromptHost { ask(copy: PromptCopy): Promise<PromptAnswer> }
+export interface PromptHost { ask(copy: PromptCopy): Promise<PromptAnswer>; dispose(): void }
 
 export const CONFLICT_COPY: PromptCopy = Object.freeze({
   text: "Newer save in the cloud from another device. Use cloud or keep this one?",
@@ -24,47 +24,71 @@ function button(doc: Document, className: string, label: string): HTMLButtonElem
   return node;
 }
 
-function show(doc: Document, copy: PromptCopy): Promise<PromptAnswer> {
-  return new Promise((resolve) => {
-    const dialog = doc.createElement("dialog");
-    dialog.className = "gw-save-prompt";
-    dialog.setAttribute("role", "alertdialog");
-    dialog.setAttribute("aria-modal", "true");
-    const text = doc.createElement("p");
-    text.className = "gw-save-prompt__text";
-    text.textContent = copy.text;
-    const actions = doc.createElement("div");
-    actions.className = "gw-save-prompt__actions";
-    const primary = button(doc, "gw-save-prompt__primary", copy.primary);
-    primary.autofocus = true;
-    const secondary = button(doc, "gw-save-prompt__secondary", copy.secondary);
-    actions.append(primary, secondary);
-    dialog.append(text, actions);
-    dialog.addEventListener("cancel", (event) => event.preventDefault()); // Escape must not dismiss
-    const finish = (answer: PromptAnswer) => {
-      if (typeof dialog.close === "function") dialog.close();
-      dialog.remove();
-      resolve(answer);
-    };
-    primary.addEventListener("click", () => finish("primary"));
-    secondary.addEventListener("click", () => finish("secondary"));
-    doc.body.append(dialog);
-    if (typeof dialog.showModal === "function") dialog.showModal();
-    else dialog.setAttribute("open", "");
-  });
-}
-
 /** `doc` is resolved when a prompt is first shown, so the host can be created where there is no DOM yet. */
 export function createDomPromptHost(doc?: Document): PromptHost {
   let queue: Promise<unknown> = Promise.resolve();
-  const pending = new Map<string, Promise<PromptAnswer>>();
+  const pending = new Map<string, { promise: Promise<PromptAnswer>; reject: (reason: unknown) => void }>();
+  let openDialog: HTMLDialogElement | null = null;
+
+  function show(copy: PromptCopy): Promise<PromptAnswer> {
+    return new Promise((resolve) => {
+      const d = doc ?? document;
+      const dialog = d.createElement("dialog");
+      dialog.className = "gw-save-prompt";
+      dialog.setAttribute("role", "alertdialog");
+      dialog.setAttribute("aria-modal", "true");
+      const text = d.createElement("p");
+      text.className = "gw-save-prompt__text";
+      text.textContent = copy.text;
+      const actions = d.createElement("div");
+      actions.className = "gw-save-prompt__actions";
+      const primary = button(d, "gw-save-prompt__primary", copy.primary);
+      primary.autofocus = true;
+      const secondary = button(d, "gw-save-prompt__secondary", copy.secondary);
+      actions.append(primary, secondary);
+      dialog.append(text, actions);
+      dialog.addEventListener("cancel", (event) => event.preventDefault()); // Escape must not dismiss
+      const finish = (answer: PromptAnswer) => {
+        if (typeof dialog.close === "function") dialog.close();
+        dialog.remove();
+        if (openDialog === dialog) openDialog = null;
+        resolve(answer);
+      };
+      primary.addEventListener("click", () => finish("primary"));
+      secondary.addEventListener("click", () => finish("secondary"));
+      d.body.append(dialog);
+      openDialog = dialog;
+      if (typeof dialog.showModal === "function") dialog.showModal();
+      else dialog.setAttribute("open", "");
+    });
+  }
+
   return {
     ask(copy) {
-      if (pending.has(copy.text)) return pending.get(copy.text)!;
-      const answer = queue.then(() => show(doc ?? document, copy));
-      pending.set(copy.text, answer);
-      queue = answer.finally(() => { pending.delete(copy.text); });
-      return answer;
+      const existing = pending.get(copy.text);
+      if (existing) return existing.promise;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<PromptAnswer>((resolve, rej) => {
+        reject = rej;
+        const answer = queue.then(() => show(copy));
+        answer.then(resolve, rej);
+        // The queue advances even if show() throws or this ask is later rejected by dispose(),
+        // so one bad prompt can never permanently wedge every ask after it.
+        queue = answer.catch(() => undefined).finally(() => { pending.delete(copy.text); });
+      });
+      pending.set(copy.text, { promise, reject });
+      return promise;
+    },
+    dispose() {
+      if (openDialog) {
+        const dialog = openDialog;
+        openDialog = null;
+        if (typeof dialog.close === "function") dialog.close();
+        dialog.remove();
+      }
+      for (const entry of pending.values()) entry.reject(new Error("disposed"));
+      pending.clear();
+      queue = Promise.resolve();
     },
   };
 }

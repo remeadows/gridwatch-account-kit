@@ -1,4 +1,6 @@
 export const LIMITS = Object.freeze({ maxDepth: 32, maxItems: 10_000, maxStringLength: 16_384 });
+/** Prototype-pollution guard: these keys are never legal in a record or object payload, own or not. */
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 class Budget {
     items = 0;
     count(path) {
@@ -63,6 +65,8 @@ function check(schema, value, path, depth, budget) {
                 const over = budget.count(path);
                 if (over)
                     return fail(over);
+                if (FORBIDDEN_KEYS.has(key))
+                    return fail(`${path}.${key}: forbidden key`);
                 if (!schema.keyPattern.test(key))
                     return fail(`${path}.${key}: key does not match pattern`);
                 const result = check(schema.value, child, `${path}.${key}`, depth + 1, budget);
@@ -79,6 +83,8 @@ function check(schema, value, path, depth, budget) {
                 const over = budget.count(path);
                 if (over)
                     return fail(over);
+                if (FORBIDDEN_KEYS.has(key))
+                    return fail(`${path}.${key}: forbidden key`);
                 if (!Object.hasOwn(schema.properties, key))
                     return fail(`${path}.${key}: unknown property`);
             }
@@ -93,6 +99,10 @@ function check(schema, value, path, depth, budget) {
                     return result;
             }
             return { ok: true };
+        }
+        default: {
+            const exhaustiveCheck = schema;
+            return fail(`${path}: unknown schema type`);
         }
     }
 }

@@ -79,3 +79,32 @@ describe("createDomPromptHost", () => {
     expect(document.querySelector("dialog.gw-save-prompt")).toBeNull();
   });
 });
+
+describe("dispose", () => {
+  it("closes the open dialog and rejects the pending ask, then a fresh ask afterwards still works", async () => {
+    const host = createDomPromptHost();
+    const pending = host.ask(CONFLICT_COPY);
+    await tick();
+    expect(document.querySelector("dialog.gw-save-prompt")).not.toBeNull();
+
+    host.dispose();
+    await expect(pending).rejects.toThrow("disposed");
+    expect(document.querySelector("dialog.gw-save-prompt")).toBeNull();
+
+    const next = host.ask(OWNERSHIP_COPY);
+    await tick();
+    const dialog = document.querySelector("dialog.gw-save-prompt")!;
+    expect(dialog.querySelector(".gw-save-prompt__text")!.textContent).toBe(OWNERSHIP_COPY.text);
+    (dialog.querySelector(".gw-save-prompt__primary") as HTMLButtonElement).click();
+    expect(await next).toBe("primary");
+  });
+  it("rejects every pending ask, including ones still queued behind the open dialog", async () => {
+    const host = createDomPromptHost();
+    const first = host.ask(CONFLICT_COPY);
+    const second = host.ask(OWNERSHIP_COPY);
+    await tick();
+    host.dispose();
+    await expect(first).rejects.toThrow("disposed");
+    await expect(second).rejects.toThrow("disposed");
+  });
+});

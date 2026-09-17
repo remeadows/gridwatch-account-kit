@@ -6,6 +6,7 @@ export interface PromptCopy {
 export type PromptAnswer = "primary" | "secondary";
 export interface PromptHost {
     ask(copy: PromptCopy): Promise<PromptAnswer>;
+    dispose(): void;
 }
 export declare const CONFLICT_COPY: PromptCopy;
 export declare const OWNERSHIP_COPY: PromptCopy;

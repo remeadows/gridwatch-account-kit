@@ -11,5 +11,7 @@ export declare function resolveSaveGame(alias: string): SaveGame | null;
 export declare const MATCH_CAMPAIGN_V1: Schema;
 export declare const MATCH_SETTINGS_V1: Schema;
 export declare const payloadSchemas: Readonly<Record<string, Readonly<Record<number, Readonly<Record<string, Schema>>>>>>;
-/** Schema check, then the recursive key denylist (spec §3.2). */
+/** Schema check, then the recursive key denylist (spec §3.2). Every lookup level is
+ *  Object.hasOwn-guarded so a prototype-chain key ("__proto__", "constructor", "toString", ...)
+ *  can never resolve to a schema that was never registered. */
 export declare function validatePayload(gameSlug: string, schemaVersion: number, slot: string, value: unknown): ValidationResult;

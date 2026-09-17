@@ -2,10 +2,40 @@ import { getSupabase } from "./client.js";
 import { NEXUS_ORIGIN } from "./config.js";
 import { validateHandle } from "./handle.js";
 import { signInUrl } from "./returnPath.js";
+import { payloadSchemas, resolveSaveGame } from "./saves-schema/games.js";
+import { ALIAS_RE, SLOT_RE } from "./saves-schema/wire.js";
 import { createSavesClient } from "./saves/client.js";
 import { createDomPromptHost } from "./saves/prompt.js";
 import { createSaveStateStore } from "./saves/state.js";
 import { createTransport } from "./saves/transport.js";
+function gameConfigMismatch(what) {
+    return new TypeError(`[account-kit] game config does not match the saves registry: ${what}`);
+}
+/** Fail fast when a game config was hand-typed wrong (transposed fields, a typo'd slot) instead
+ *  of letting it silently 404/mismatch at runtime — the saves registry is the source of truth. */
+function assertGameConfig(game) {
+    if (!ALIAS_RE.test(game.routeAlias))
+        throw gameConfigMismatch(`invalid routeAlias "${game.routeAlias}"`);
+    for (const slot of game.slots) {
+        if (!SLOT_RE.test(slot))
+            throw gameConfigMismatch(`invalid slot "${slot}"`);
+    }
+    const registered = resolveSaveGame(game.routeAlias);
+    if (!registered)
+        throw gameConfigMismatch(`unknown routeAlias "${game.routeAlias}"`);
+    if (registered.slug !== game.gameSlug)
+        throw gameConfigMismatch(`gameSlug "${game.gameSlug}" does not match registry "${registered.slug}" for "${game.routeAlias}"`);
+    const sameSlots = registered.slots.length === game.slots.length && registered.slots.every((slot) => game.slots.includes(slot));
+    if (!sameSlots)
+        throw gameConfigMismatch(`slots [${game.slots.join(", ")}] do not match registry [${registered.slots.join(", ")}] for "${game.routeAlias}"`);
+    if (registered.schemaVersion !== game.schemaVersion)
+        throw gameConfigMismatch(`schemaVersion ${game.schemaVersion} does not match registry ${registered.schemaVersion} for "${game.routeAlias}"`);
+    const slotSchemas = payloadSchemas[game.gameSlug]?.[game.schemaVersion];
+    for (const slot of game.slots) {
+        if (!slotSchemas || !Object.hasOwn(slotSchemas, slot))
+            throw gameConfigMismatch(`no schema registered for slot "${slot}"`);
+    }
+}
 /** True when `e` carries a string `code` field (e.g. a PostgrestError), narrowing its type. */
 function hasCode(e) {
     return typeof e === "object" && e !== null && "code" in e && typeof e.code === "string";
@@ -33,12 +63,14 @@ export function createAccountKit(input) {
     async function currentUserId() {
         return (await getSession())?.user.id ?? null;
     }
+    if (input.game)
+        assertGameConfig(input.game);
     const saves = input.game
         ? createSavesClient({
             game: input.game,
             getSession: async () => { const s = await getSession(); return s ? { access_token: s.access_token, user: { id: s.user.id } } : null; },
             state: createSaveStateStore(input.game.gameSlug),
-            transport: createTransport(`${config.nexusOrigin}/api/saves/${input.game.routeAlias}`),
+            transport: createTransport(`${config.nexusOrigin.replace(/\/+$/, "")}/api/saves/${input.game.routeAlias}`),
             prompt: createDomPromptHost(),
         })
         : undefined;

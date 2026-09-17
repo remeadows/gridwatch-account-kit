@@ -158,4 +158,32 @@ describe("createAccountKit", () => {
     expect(kit.config).toEqual({ returnPath: "/play/match/", nexusOrigin: "https://nexus.warsignallabs.net" });
     expect(() => kit.saves!.load("inventory")).toThrow(RangeError);
   });
+
+  it("rejects a game config that doesn't match the saves registry", () => {
+    fakeSupabase(null);
+    // Transposed fields: gameSlug and routeAlias swapped.
+    expect(() => createAccountKit({ returnPath: "/", game: { gameSlug: "match", routeAlias: "gridwatch-match", slots: ["campaign", "settings"], schemaVersion: 1 } })).toThrow(TypeError);
+    // Unknown slot not in the registry for this game.
+    expect(() => createAccountKit({ returnPath: "/", game: { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "inventory"], schemaVersion: 1 } })).toThrow(TypeError);
+    // Wrong schemaVersion.
+    expect(() => createAccountKit({ returnPath: "/", game: { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 2 } })).toThrow(TypeError);
+    // The valid Match config must not throw.
+    expect(() => createAccountKit({ returnPath: "/play/match/", game: { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 } })).not.toThrow();
+  });
+
+  it("strips a trailing slash from nexusOrigin before building the saves transport base URL", async () => {
+    fakeSupabase(user);
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: "no_save" }), { status: 404, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchImpl);
+    const kit = createAccountKit({
+      returnPath: "/play/match/",
+      nexusOrigin: "https://nexus.example/",
+      game: { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 },
+    });
+    await kit.saves!.load("campaign");
+    const [url] = fetchImpl.mock.calls[0] as unknown as [string];
+    expect(url).toBe("https://nexus.example/api/saves/match/campaign");
+    expect(url.slice("https://".length)).not.toContain("//");
+    vi.unstubAllGlobals();
+  });
 });

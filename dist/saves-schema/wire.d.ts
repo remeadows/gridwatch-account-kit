@@ -35,7 +35,8 @@ export interface ConflictBody {
         summary: CloudSummary;
     };
 }
+export type SaveErrorCode = "no_save" | "conflict" | "unknown_game" | "unknown_slot" | "not_found" | "method_not_allowed" | "payload_too_large" | "invalid_body" | "invalid_payload" | "denied_key" | "save_rejected" | "rate_limited" | "upstream" | "saves_unavailable" | "unauthorized" | "idempotency_key_reused";
 export interface ErrorBody {
-    error: string;
+    error: SaveErrorCode;
     detail?: string;
 }

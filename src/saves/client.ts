@@ -25,10 +25,11 @@ type SendOutcome =
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-function isSaveRow(value: unknown): value is SaveRow {
+function isSaveRow(value: unknown, slot: string): value is SaveRow {
   const v = value as SaveRow;
-  return typeof v === "object" && v !== null && typeof v.slot === "string" && Number.isSafeInteger(v.schemaVersion)
-    && Number.isSafeInteger(v.revision) && typeof v.payload === "object" && v.payload !== null && typeof v.updatedAt === "string";
+  return typeof v === "object" && v !== null && v.slot === slot && Number.isSafeInteger(v.schemaVersion)
+    && Number.isSafeInteger(v.revision) && typeof v.payload === "object" && v.payload !== null && !Array.isArray(v.payload)
+    && typeof v.updatedAt === "string";
 }
 
 function toCloudSave(row: SaveRow): CloudSave {
@@ -62,7 +63,16 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
 
   async function loadWith(slot: string, s: Session): Promise<LoadResult> {
     const result = await withRetry(() => transport.load(slot, s.token), sleep);
-    if (result.kind === "ok" && result.status === 200 && isSaveRow(result.body)) return { status: "ok", save: toCloudSave(result.body) };
+    if (result.kind === "ok" && result.status === 200 && isSaveRow(result.body, slot)) {
+      // Inbound cloud data is untrusted: a bad row (wrong shape, denylisted key, stale schema)
+      // must not reach the game just because the server said 200.
+      const valid = validatePayload(game.gameSlug, result.body.schemaVersion, slot, result.body.payload);
+      if (!valid.ok) {
+        console.warn(`[account-kit] rejecting cloud row for ${slot}: ${valid.detail}`);
+        return { status: "error", error: { code: "invalid_payload", message: valid.detail } };
+      }
+      return { status: "ok", save: toCloudSave(result.body) };
+    }
     if (result.kind === "ok" && result.status === 404) return { status: "none" };
     return { status: "error", error: errorFor(result) };
   }
@@ -77,7 +87,12 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     }
     if (result.kind === "ok" && result.status === 409) {
       const cloud = (result.body as ConflictBody)?.cloud;
-      return { kind: "conflict", cloudRevision: Number.isSafeInteger(cloud?.revision) ? cloud.revision : 0 };
+      if (!Number.isSafeInteger(cloud?.revision)) {
+        // A 409 that doesn't tell us the cloud revision can't be resolved by prompting (there's
+        // nothing to prompt with) or by looping — treat it as terminal instead of guessing 0.
+        return { kind: "error", error: { code: "http", status: 409, message: "malformed conflict" }, dirty: true };
+      }
+      return { kind: "conflict", cloudRevision: cloud.revision };
     }
     const error = errorFor(result);
     const dirty = result.kind === "network" || result.status >= 500 || result.status === 429 || result.status === 401;
@@ -153,43 +168,80 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   function reconcile(slot: string, local: SavePayload | null): Promise<ReconcileResult> {
     assertSlot(slot);
     return serialized(slot, async () => {
-      const s = await session();
-      if (!s) return { status: "signed_out" };
-      const loaded = await loadWith(slot, s);
-      if (loaded.status === "error") return loaded;
-      const cloud = loaded.status === "ok" ? loaded.save : null;
-      const decision = decideReconcile({ signedIn: true, cloud, local, record: state.readRecord(s.userId, slot), owner: state.readOwner(slot), userId: s.userId });
-      const asReconcile = (result: StoreResult): ReconcileResult =>
-        result.status === "stored" ? { status: "stored", revision: result.revision } : result;
-      const upload = async (): Promise<ReconcileResult> => {
-        const result = await sendWithConflicts(slot, local as SavePayload, 0, s);
-        return result.status === "stored" ? { status: "uploaded", revision: result.revision } : result;
-      };
-      switch (decision) {
-        case "signed_out": return { status: "signed_out" };
-        case "nothing": return { status: "nothing" };
-        case "upload": return upload();
-        case "ownership_prompt": {
-          if ((await prompt.ask(OWNERSHIP_COPY)) === "primary") return upload();
-          state.writeOwner(slot, s.userId);
-          return { status: "fresh" };
-        }
-        case "use_cloud": confirmed(slot, s, (cloud as CloudSave).revision); return { status: "use_cloud", save: cloud as CloudSave };
-        case "conflict_prompt": {
-          // The table already decided a prompt is due: never send first (a send on the cloud
-          // revision would silently win). Ask, then act on the answer.
-          const current = cloud as CloudSave;
-          state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
-          if ((await prompt.ask(CONFLICT_COPY)) === "primary") {
-            confirmed(slot, s, current.revision);
-            return { status: "use_cloud", save: current };
+      try {
+        // The migration path can hand us anything the old client had lying around locally
+        // (denylisted keys included) — validate before it ever reaches a request.
+        if (local !== null) {
+          const valid = validatePayload(game.gameSlug, game.schemaVersion, slot, local);
+          if (!valid.ok) {
+            console.warn(`[account-kit] refusing to reconcile ${slot}: ${valid.detail}`);
+            return { status: "error", error: { code: "invalid_payload", message: valid.detail } };
           }
-          return asReconcile(await sendWithConflicts(slot, local as SavePayload, current.revision, s));
         }
-        case "current": return { status: "current" };
-        case "restore_dirty":
-          return asReconcile(await sendWithConflicts(slot, local as SavePayload, state.readRecord(s.userId, slot)?.revision ?? 0, s));
+        const s = await session();
+        if (!s) return { status: "signed_out" };
+        const loaded = await loadWith(slot, s);
+        if (loaded.status === "error") return loaded;
+        const cloud = loaded.status === "ok" ? loaded.save : null;
+        const decision = decideReconcile({ signedIn: true, cloud, local, record: state.readRecord(s.userId, slot), owner: state.readOwner(slot), userId: s.userId });
+        const asReconcile = (result: StoreResult): ReconcileResult =>
+          result.status === "stored" ? { status: "stored", revision: result.revision } : result;
+        const upload = async (): Promise<ReconcileResult> => {
+          const result = await sendWithConflicts(slot, local as SavePayload, 0, s);
+          return result.status === "stored" ? { status: "uploaded", revision: result.revision } : result;
+        };
+        switch (decision) {
+          case "signed_out": return { status: "signed_out" };
+          case "nothing": return { status: "nothing" };
+          case "upload": return upload();
+          case "ownership_prompt": {
+            if ((await prompt.ask(OWNERSHIP_COPY)) === "primary") return upload();
+            state.writeOwner(slot, s.userId);
+            return { status: "fresh" };
+          }
+          case "use_cloud": confirmed(slot, s, (cloud as CloudSave).revision); return { status: "use_cloud", save: cloud as CloudSave };
+          case "conflict_prompt": {
+            // The table already decided a prompt is due: never send first (a send on the cloud
+            // revision would silently win). Ask, then act on the answer.
+            const current = cloud as CloudSave;
+            state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
+            if ((await prompt.ask(CONFLICT_COPY)) === "primary") {
+              confirmed(slot, s, current.revision);
+              return { status: "use_cloud", save: current };
+            }
+            return asReconcile(await sendWithConflicts(slot, local as SavePayload, current.revision, s));
+          }
+          case "current": return { status: "current" };
+          case "restore_dirty":
+            return asReconcile(await sendWithConflicts(slot, local as SavePayload, state.readRecord(s.userId, slot)?.revision ?? 0, s));
+        }
+      } catch (thrown) {
+        // reconcile() never rejects (same contract as load()/store()): a caller-supplied
+        // getSession/transport/prompt that throws must still resolve to a reportable error.
+        const message = thrown instanceof Error ? thrown.message : String(thrown);
+        console.warn(`[account-kit] reconcile ${slot} failed: ${message}`);
+        return { status: "error", error: { code: "http", message } };
       }
+    });
+  }
+
+  /** Background re-flush of a dirty slot (online / visibilitychange): one attempt, no prompt.
+   *  Prompting from here would resolve a conflict behind the player's back — see C1: a 409
+   *  here just leaves the record dirty for the next foreground store()/reconcile() to resolve. */
+  function quietFlush(slot: string, payload: SavePayload): Promise<void> {
+    return serialized(slot, async () => {
+      const s = await session();
+      if (!s) return;
+      const base = state.readRecord(s.userId, slot)?.revision ?? 0;
+      const outcome = await sendOnce(slot, payload, base, s);
+      if (outcome.kind === "stored") { confirmed(slot, s, outcome.revision); return; }
+      if (outcome.kind === "conflict") return; // never prompt; record is already dirty
+      if (outcome.kind === "error" && outcome.dirty) {
+        state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
+      }
+    }).catch((thrown: unknown) => {
+      const message = thrown instanceof Error ? thrown.message : String(thrown);
+      console.warn(`[account-kit] background re-flush for ${slot} failed: ${message}`);
     });
   }
 
@@ -197,7 +249,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     const s = await session();
     if (!s) return;
     for (const [slot, payload] of lastPayload) {
-      if (state.readRecord(s.userId, slot)?.dirty) void store(slot, payload);
+      if (state.readRecord(s.userId, slot)?.dirty) void quietFlush(slot, payload);
     }
   }
   const onOnline = () => { void reflushDirty(); };
@@ -208,8 +260,16 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   function load(slot: string): Promise<LoadResult> {
     assertSlot(slot);
     return (async () => {
-      const s = await session();
-      return s ? loadWith(slot, s) : { status: "signed_out" };
+      try {
+        const s = await session();
+        return s ? await loadWith(slot, s) : { status: "signed_out" };
+      } catch (thrown) {
+        // load() never rejects: a caller-supplied getSession/transport that throws must still
+        // resolve to a reportable error (same contract as store()/reconcile()).
+        const message = thrown instanceof Error ? thrown.message : String(thrown);
+        console.warn(`[account-kit] load ${slot} failed: ${message}`);
+        return { status: "error", error: { code: "http", message } };
+      }
     })();
   }
 
@@ -219,6 +279,10 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     store,
     reconcile,
     dispose() {
+      // Close any open prompt / reject its pending ask FIRST: a conflict/ownership prompt
+      // in flight inside sendWithConflicts()/reconcile() surfaces through their own catch as
+      // { status: "error", error: { code: "http", message: "disposed" } } once this rejects.
+      prompt.dispose();
       windowRef?.removeEventListener("online", onOnline);
       windowRef?.document.removeEventListener("visibilitychange", onVisibility);
       for (const entry of pending.values()) {

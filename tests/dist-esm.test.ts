@@ -53,4 +53,17 @@ describe("dist is valid strict ESM", () => {
       ),
     ).not.toThrow();
   });
+  it("saves/index.js loads under Node's resolver and exposes the client-assembly primitives", () => {
+    expect(() =>
+      loadUnderNode(
+        dist("saves/index.js"),
+        `if (typeof mod.createSavesClient !== "function") throw new Error("createSavesClient missing");
+         if (typeof mod.createSaveStateStore !== "function") throw new Error("createSaveStateStore missing");
+         if (typeof mod.createTransport !== "function") throw new Error("createTransport missing");
+         if (typeof mod.withRetry !== "function") throw new Error("withRetry missing");
+         if (typeof mod.createDomPromptHost !== "function") throw new Error("createDomPromptHost missing");
+         if (typeof mod.decideReconcile !== "function") throw new Error("decideReconcile missing");`,
+      ),
+    ).not.toThrow();
+  });
 });

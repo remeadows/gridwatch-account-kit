@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSavesClient } from "../src/saves/client";
-import { CONFLICT_COPY, OWNERSHIP_COPY, type PromptAnswer, type PromptCopy } from "../src/saves/prompt";
+import { CONFLICT_COPY, OWNERSHIP_COPY, createDomPromptHost, type PromptAnswer, type PromptCopy } from "../src/saves/prompt";
 import { createSaveStateStore } from "../src/saves/state";
 import type { Transport, TransportResult } from "../src/saves/transport";
 
@@ -19,7 +19,7 @@ function harness(session: { access_token: string; user: { id: string } } | null 
   const store = vi.fn<Transport["store"]>();
   const answers: PromptAnswer[] = [];
   const asked: PromptCopy[] = [];
-  const prompt = { ask: vi.fn(async (copy: PromptCopy) => { asked.push(copy); return answers.shift() ?? "primary"; }) };
+  const prompt = { ask: vi.fn(async (copy: PromptCopy) => { asked.push(copy); return answers.shift() ?? "primary"; }), dispose: vi.fn() };
   const state = createSaveStateStore(game.gameSlug);
   const client = createSavesClient({ game, getSession: async () => session, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs: 0 });
   clients.push(client);
@@ -42,6 +42,22 @@ describe("load", () => {
     expect(h.load).toHaveBeenCalledTimes(5);
     expect(() => h.client.load("inventory")).toThrow(RangeError);
     expect(await harness(null).client.load("campaign")).toEqual({ status: "signed_out" });
+  });
+  it("rejects an inbound cloud row with an invalid payload or the wrong slot instead of handing it to the game", async () => {
+    const h = harness();
+    h.load.mockResolvedValueOnce(ok(200, row(2, { ...campaign, extra: 1 } as typeof campaign)));
+    expect(await h.client.load("campaign")).toMatchObject({ status: "error", error: { code: "invalid_payload" } });
+    h.load.mockResolvedValueOnce(ok(200, { ...row(2), slot: "settings" }));
+    expect((await h.client.load("campaign")).status).toBe("error");
+  });
+  it("never rejects: a thrown getSession becomes a reportable error", async () => {
+    const load = vi.fn<Transport["load"]>();
+    const store = vi.fn<Transport["store"]>();
+    const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
+    const state = createSaveStateStore(game.gameSlug);
+    const client = createSavesClient({ game, getSession: async () => { throw new Error("boom"); }, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs: 0 });
+    clients.push(client);
+    await expect(client.load("campaign")).resolves.toEqual({ status: "error", error: { code: "http", message: "boom" } });
   });
 });
 
@@ -117,7 +133,7 @@ describe("store", () => {
   it("settles all waiters with an http error when the flush chain throws, without an unhandled rejection", async () => {
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
-    const prompt = { ask: vi.fn(async () => "primary" as const) };
+    const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
     const state = createSaveStateStore(game.gameSlug);
     const client = createSavesClient({
       game,
@@ -132,6 +148,30 @@ describe("store", () => {
     const result = await client.store("campaign", campaign);
     expect(result).toEqual({ status: "error", error: { code: "http", message: "boom" } });
     expect(store).not.toHaveBeenCalled();
+  });
+  it("treats a 409 with no safe-integer cloud.revision as a terminal error instead of looping", async () => {
+    const h = harness();
+    h.store.mockResolvedValueOnce(ok(409, { error: "conflict" })); // no cloud.revision at all
+    const result = await h.client.store("campaign", campaign);
+    expect(result).toEqual({ status: "error", error: { code: "http", status: 409, message: "malformed conflict" } });
+    expect(h.prompt.ask).not.toHaveBeenCalled();
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+  });
+  it("dispose() closes an open conflict prompt and resolves the pending store as disposed", async () => {
+    const load = vi.fn<Transport["load"]>();
+    const store = vi.fn<Transport["store"]>();
+    const conflict = ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
+    store.mockResolvedValueOnce(conflict);
+    const state = createSaveStateStore(game.gameSlug);
+    const prompt = createDomPromptHost();
+    const client = createSavesClient({ game, getSession: async () => ({ access_token: "tok", user: { id: "u1" } }), state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs: 0 });
+    clients.push(client);
+    const pending = client.store("campaign", campaign);
+    await flush();
+    expect(document.querySelector("dialog.gw-save-prompt")).not.toBeNull();
+    client.dispose();
+    expect(await pending).toEqual({ status: "error", error: { code: "http", message: "disposed" } });
+    expect(document.querySelector("dialog.gw-save-prompt")).toBeNull();
   });
 });
 
@@ -199,5 +239,46 @@ describe("reconcile", () => {
     const h = harness();
     expect(() => h.client.reconcile("inventory", null)).toThrow(RangeError);
     expect(h.store).not.toHaveBeenCalled();
+  });
+  it("validates the local payload before sending anything (migration path can carry denylisted keys)", async () => {
+    const h = harness();
+    const result = await h.client.reconcile("campaign", { ...campaign, sessionToken: "x" });
+    expect(result).toMatchObject({ status: "error", error: { code: "invalid_payload" } });
+    expect(h.load).not.toHaveBeenCalled();
+    expect(h.store).not.toHaveBeenCalled();
+  });
+  it("never rejects: a thrown getSession becomes a reportable error", async () => {
+    const load = vi.fn<Transport["load"]>();
+    const store = vi.fn<Transport["store"]>();
+    const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
+    const state = createSaveStateStore(game.gameSlug);
+    const client = createSavesClient({ game, getSession: async () => { throw new Error("boom"); }, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs: 0 });
+    clients.push(client);
+    await expect(client.reconcile("campaign", null)).resolves.toEqual({ status: "error", error: { code: "http", message: "boom" } });
+  });
+});
+
+describe("background re-flush", () => {
+  it("never prompts on a background re-flush; a later reconcile with a newer cloud row still prompts as usual", async () => {
+    const h = harness();
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+
+    h.store.mockReset();
+    h.store.mockResolvedValue(ok(409, { error: "conflict", cloud: { revision: 5, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.prompt.ask).not.toHaveBeenCalled();
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 6, updatedAt: "t3" }));
+    h.load.mockResolvedValueOnce(ok(200, row(5)));
+    h.answers.push("secondary");
+    const result = await h.client.reconcile("campaign", campaign);
+    expect(h.asked).toEqual([CONFLICT_COPY]);
+    expect(result).toEqual({ status: "stored", revision: 6 });
   });
 });
