@@ -18,6 +18,10 @@
       "types": "./dist/react.d.ts",
       "default": "./dist/react.js"
     },
+    "./saves-schema": {
+      "types": "./dist/saves-schema/index.d.ts",
+      "default": "./dist/saves-schema/index.js"
+    },
     "./header.css": "./dist/header.css"
   },
   "scripts": {

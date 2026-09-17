@@ -43,4 +43,14 @@ describe("dist is valid strict ESM", () => {
       ),
     ).not.toThrow();
   });
+  it("saves-schema/index.js loads under Node's resolver", () => {
+    expect(() =>
+      loadUnderNode(
+        dist("saves-schema/index.js"),
+        `if (typeof mod.validatePayload !== "function") throw new Error("validatePayload missing");
+         if (typeof mod.requestHash !== "function") throw new Error("requestHash missing");
+         if (mod.MAX_BODY_BYTES !== 65536) throw new Error("MAX_BODY_BYTES wrong");`,
+      ),
+    ).not.toThrow();
+  });
 });
