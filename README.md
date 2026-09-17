@@ -47,6 +47,10 @@ A background re-flush — triggered by the `online` event or the tab becoming vi
 
 Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SPA): it removes the `online`/`visibilitychange` listeners, closes any prompt dialog that's on screen, and settles every in-flight `store()`/`reconcile()` call with `{ status: "error", error: { code: "http", message: "disposed" } }` instead of leaving them hanging.
 
+### Runtime requirements
+
+`kit.saves` needs `crypto.getRandomValues`, `fetch`, `AbortController`, `localStorage` (falls back to an in-memory store when unavailable, e.g. private mode), and `<dialog>` (falls back to a plain `open` attribute when `HTMLDialogElement.showModal` isn't supported). Each transport request is bounded by a 15 s deadline, and each request body is capped at 64 KB — a `store`/`reconcile` payload that would exceed it locally resolves `{ status: "error", error: { code: "invalid_payload", ... } }` without ever reaching the network.
+
 ## Exports
 
 - **`.`** — Core utilities: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `PLAY_ALIASES`, `NEXUS_ORIGIN`, `HANDLE_RE`, `validateHandle`, `validateReturnPath`, `signInUrl`, `createAccountKit`, `mountAccountHeader`, plus the full saves client surface: `createSavesClient`, `CONFLICT_COPY`, `OWNERSHIP_COPY`, `createDomPromptHost`, `createSaveStateStore`, `createTransport`, `withRetry`, `decideReconcile`, and their types (`SaveGameConfig`, `SavesClient`, `LoadResult`, `StoreResult`, `ReconcileResult`, `CloudSave`, `SaveError`, `PromptHost`, `PromptCopy`, `PromptAnswer`, `SaveStateStore`, `SyncRecord`, `Transport`, `TransportResult`, `ReconcileDecision`, `ReconcileInputs`) — enough to assemble a `SavesClient` yourself with a custom transport or prompt host, not just through `createAccountKit`.
