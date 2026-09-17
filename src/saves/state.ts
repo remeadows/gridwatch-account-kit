@@ -1,6 +1,9 @@
 // Per-browser sync state (spec §5.4): one { revision, dirty } record per (user, game, slot),
 // one ownership record per (game, slot), one device id per browser. Storage failures
 // (private mode, quota) degrade to memory so the client keeps working for the session.
+import { UUID_RE } from "../saves-schema/wire.js";
+import { uuidV4 } from "./uuid.js";
+
 export interface SyncRecord { revision: number; dirty: boolean }
 
 export interface SaveStateStore {
@@ -67,8 +70,8 @@ export function createSaveStateStore(gameSlug: string, storage: Storage | null =
     },
     deviceId() {
       const existing = read(DEVICE_KEY);
-      if (existing && /^[0-9a-f-]{36}$/.test(existing)) return existing;
-      const created = crypto.randomUUID();
+      if (existing && UUID_RE.test(existing)) return existing;
+      const created = uuidV4();
       write(DEVICE_KEY, created);
       return created;
     },

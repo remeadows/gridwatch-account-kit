@@ -1,8 +1,16 @@
 import { validatePayload } from "../saves-schema/games.js";
+import { MAX_BODY_BYTES } from "../saves-schema/wire.js";
 import { CONFLICT_COPY, OWNERSHIP_COPY } from "./prompt.js";
 import { decideReconcile } from "./reconcile.js";
 import { withRetry } from "./transport.js";
+import { uuidV4 } from "./uuid.js";
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** Terminal instead of infinite: a peer that keeps winning every round means the loop itself,
+ *  not one more prompt, is the problem. */
+const MAX_CONFLICT_PROMPTS = 5;
+function disposedError() {
+    return { code: "http", message: "disposed" };
+}
 function isSaveRow(value, slot) {
     const v = value;
     return typeof v === "object" && v !== null && v.slot === slot && Number.isSafeInteger(v.schemaVersion)
@@ -26,6 +34,10 @@ export function createSavesClient(deps) {
     const lastPayload = new Map();
     const pending = new Map();
     const running = new Map();
+    // Set by dispose(); checked at the start of every serialized callback and immediately after
+    // each await of session()/withRetry/prompt.ask so in-flight work started before dispose()
+    // can't finish touching state after the client has been torn down.
+    let disposed = false;
     function assertSlot(slot) {
         if (!game.slots.includes(slot))
             throw new RangeError(`[account-kit] unknown save slot "${slot}" for ${game.gameSlug}`);
@@ -36,6 +48,8 @@ export function createSavesClient(deps) {
     }
     async function loadWith(slot, s) {
         const result = await withRetry(() => transport.load(slot, s.token), sleep);
+        if (disposed)
+            return { status: "error", error: disposedError() };
         if (result.kind === "ok" && result.status === 200 && isSaveRow(result.body, slot)) {
             // Inbound cloud data is untrusted: a bad row (wrong shape, denylisted key, stale schema)
             // must not reach the game just because the server said 200.
@@ -51,8 +65,14 @@ export function createSavesClient(deps) {
         return { status: "error", error: errorFor(result) };
     }
     async function sendOnce(slot, payload, baseRevision, s) {
-        const body = { schemaVersion: game.schemaVersion, baseRevision, payload, deviceId: state.deviceId(), idempotencyKey: crypto.randomUUID() };
+        const body = { schemaVersion: game.schemaVersion, baseRevision, payload, deviceId: state.deviceId(), idempotencyKey: uuidV4() };
+        const encodedBytes = new TextEncoder().encode(JSON.stringify(body)).byteLength;
+        if (encodedBytes > MAX_BODY_BYTES) {
+            return { kind: "error", error: { code: "invalid_payload", message: `request body exceeds ${MAX_BODY_BYTES} bytes` }, dirty: false };
+        }
         const result = await withRetry(() => transport.store(slot, body, s.token), sleep);
+        if (disposed)
+            return { kind: "error", error: disposedError(), dirty: false };
         if (result.kind === "ok" && result.status === 200) {
             const ok = result.body;
             if (Number.isSafeInteger(ok?.revision) && typeof ok.updatedAt === "string")
@@ -76,9 +96,12 @@ export function createSavesClient(deps) {
         state.writeRecord(s.userId, slot, { revision, dirty: false });
         state.writeOwner(slot, s.userId);
     }
-    /** Send, and on 409 run the conflict prompt until the player's choice lands. */
+    /** Send, and on 409 run the conflict prompt until the player's choice lands. Bounded: a peer
+     *  that keeps winning every round for MAX_CONFLICT_PROMPTS rounds ends the loop with a
+     *  terminal error instead of prompting forever (the record is left dirty either way). */
     async function sendWithConflicts(slot, payload, baseRevision, s) {
         let base = baseRevision;
+        let conflictRounds = 0;
         for (;;) {
             const outcome = await sendOnce(slot, payload, base, s);
             if (outcome.kind === "stored") {
@@ -91,7 +114,13 @@ export function createSavesClient(deps) {
                 return { status: "error", error: outcome.error };
             }
             state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
+            if (conflictRounds >= MAX_CONFLICT_PROMPTS) {
+                return { status: "error", error: { code: "http", status: 409, message: "conflict retries exhausted" } };
+            }
+            conflictRounds += 1;
             const answer = await prompt.ask(CONFLICT_COPY);
+            if (disposed)
+                return { status: "error", error: disposedError() };
             if (answer === "primary") {
                 const loaded = await loadWith(slot, s);
                 if (loaded.status !== "ok")
@@ -109,7 +138,11 @@ export function createSavesClient(deps) {
         return next;
     }
     async function flush(slot, payload) {
+        if (disposed)
+            return { status: "error", error: disposedError() };
         const s = await session();
+        if (disposed)
+            return { status: "error", error: disposedError() };
         if (!s)
             return { status: "signed_out" };
         const base = state.readRecord(s.userId, slot)?.revision ?? 0;
@@ -146,6 +179,8 @@ export function createSavesClient(deps) {
     function reconcile(slot, local) {
         assertSlot(slot);
         return serialized(slot, async () => {
+            if (disposed)
+                return { status: "error", error: disposedError() };
             try {
                 // The migration path can hand us anything the old client had lying around locally
                 // (denylisted keys included) — validate before it ever reaches a request.
@@ -157,6 +192,8 @@ export function createSavesClient(deps) {
                     }
                 }
                 const s = await session();
+                if (disposed)
+                    return { status: "error", error: disposedError() };
                 if (!s)
                     return { status: "signed_out" };
                 const loaded = await loadWith(slot, s);
@@ -174,7 +211,10 @@ export function createSavesClient(deps) {
                     case "nothing": return { status: "nothing" };
                     case "upload": return upload();
                     case "ownership_prompt": {
-                        if ((await prompt.ask(OWNERSHIP_COPY)) === "primary")
+                        const answer = await prompt.ask(OWNERSHIP_COPY);
+                        if (disposed)
+                            return { status: "error", error: disposedError() };
+                        if (answer === "primary")
                             return upload();
                         state.writeOwner(slot, s.userId);
                         return { status: "fresh" };
@@ -187,7 +227,10 @@ export function createSavesClient(deps) {
                         // revision would silently win). Ask, then act on the answer.
                         const current = cloud;
                         state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
-                        if ((await prompt.ask(CONFLICT_COPY)) === "primary") {
+                        const answer = await prompt.ask(CONFLICT_COPY);
+                        if (disposed)
+                            return { status: "error", error: disposedError() };
+                        if (answer === "primary") {
                             confirmed(slot, s, current.revision);
                             return { status: "use_cloud", save: current };
                         }
@@ -212,11 +255,24 @@ export function createSavesClient(deps) {
      *  here just leaves the record dirty for the next foreground store()/reconcile() to resolve. */
     function quietFlush(slot, payload) {
         return serialized(slot, async () => {
+            if (disposed)
+                return;
             const s = await session();
+            if (disposed)
+                return;
             if (!s)
+                return;
+            // A foreground conflict prompt (store()/reconcile()) may have been running when this quiet
+            // flush was queued behind it; by the time it's our turn, the player may already have
+            // resolved that conflict and cleared dirty. Re-read it now, inside the serialized callback,
+            // instead of trusting the state from when reflushDirty() first queued us — otherwise this
+            // still uploads the stale in-memory `payload` on top of the just-confirmed revision.
+            if (!state.readRecord(s.userId, slot)?.dirty)
                 return;
             const base = state.readRecord(s.userId, slot)?.revision ?? 0;
             const outcome = await sendOnce(slot, payload, base, s);
+            if (disposed)
+                return;
             if (outcome.kind === "stored") {
                 confirmed(slot, s, outcome.revision);
                 return;
@@ -248,8 +304,12 @@ export function createSavesClient(deps) {
     function load(slot) {
         assertSlot(slot);
         return (async () => {
+            if (disposed)
+                return { status: "error", error: disposedError() };
             try {
                 const s = await session();
+                if (disposed)
+                    return { status: "error", error: disposedError() };
                 return s ? await loadWith(slot, s) : { status: "signed_out" };
             }
             catch (thrown) {
@@ -267,6 +327,7 @@ export function createSavesClient(deps) {
         store,
         reconcile,
         dispose() {
+            disposed = true;
             // Close any open prompt / reject its pending ask FIRST: a conflict/ownership prompt
             // in flight inside sendWithConflicts()/reconcile() surfaces through their own catch as
             // { status: "error", error: { code: "http", message: "disposed" } } once this rejects.

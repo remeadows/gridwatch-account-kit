@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from "vitest";
+import { UUID_RE } from "../src/saves-schema/wire";
 import { createSaveStateStore } from "../src/saves/state";
 
 beforeEach(() => localStorage.clear());
@@ -35,6 +36,15 @@ describe("createSaveStateStore", () => {
     const store = createSaveStateStore("gridwatch-match");
     expect(store.readRecord("u1", "campaign")).toBeNull();
     expect(store.readOwner("campaign")).toBeNull();
+  });
+  it("replaces a malformed cached device id (that the old /^[0-9a-f-]{36}$/ check would have accepted) with a fresh valid UUID", () => {
+    const bogus = "-".repeat(36); // 36 hyphens: matches /^[0-9a-f-]{36}$/ but not UUID_RE
+    localStorage.setItem("gw-account-kit.device-id.v1", bogus);
+    const store = createSaveStateStore("gridwatch-match");
+    const id = store.deviceId();
+    expect(id).toMatch(UUID_RE);
+    expect(id).not.toBe(bogus);
+    expect(localStorage.getItem("gw-account-kit.device-id.v1")).toBe(id);
   });
   it("falls back to memory when storage throws", () => {
     const throwing = { getItem() { throw new Error("private mode"); }, setItem() { throw new Error("private mode"); } } as unknown as Storage;

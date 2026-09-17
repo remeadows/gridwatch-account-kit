@@ -7,24 +7,36 @@ function retryAfterMs(response) {
     const seconds = Number(raw);
     return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : null;
 }
-async function send(fetchImpl, url, init) {
-    let response;
+const DEFAULT_TIMEOUT_MS = 15_000;
+async function send(fetchImpl, url, init, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        response = await fetchImpl(url, init);
+        let response;
+        try {
+            response = await fetchImpl(url, { ...init, signal: controller.signal });
+        }
+        catch (thrown) {
+            // An abort (deadline exceeded) or any other fetch failure both map to "network" so the
+            // existing retry/dirty handling runs exactly as it would for a dropped connection.
+            return { kind: "network", message: thrown instanceof Error ? thrown.message : String(thrown) };
+        }
+        let body = null;
+        try {
+            body = await response.json();
+        }
+        catch {
+            body = null;
+        }
+        return { kind: "ok", status: response.status, body, retryAfterMs: retryAfterMs(response) };
     }
-    catch (thrown) {
-        return { kind: "network", message: thrown instanceof Error ? thrown.message : String(thrown) };
+    finally {
+        // Keep the timer alive through response.json() (a hung body read must still be bounded by
+        // the same deadline) and only clear it once this attempt is fully settled either way.
+        clearTimeout(timer);
     }
-    let body = null;
-    try {
-        body = await response.json();
-    }
-    catch {
-        body = null;
-    }
-    return { kind: "ok", status: response.status, body, retryAfterMs: retryAfterMs(response) };
 }
-export function createTransport(baseUrl, fetchImpl = fetch) {
+export function createTransport(baseUrl, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS) {
     const url = (slot) => `${baseUrl}/${slot}`;
     return {
         load(slot, token) {
@@ -32,7 +44,7 @@ export function createTransport(baseUrl, fetchImpl = fetch) {
                 method: "GET",
                 cache: "no-store",
                 headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-            });
+            }, timeoutMs);
         },
         store(slot, body, token) {
             return send(fetchImpl, url(slot), {
@@ -40,7 +52,7 @@ export function createTransport(baseUrl, fetchImpl = fetch) {
                 cache: "no-store",
                 headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
                 body: JSON.stringify(body),
-            });
+            }, timeoutMs);
         },
     };
 }

@@ -157,6 +157,44 @@ describe("store", () => {
     expect(h.prompt.ask).not.toHaveBeenCalled();
     expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
   });
+  it("rejects a request whose encoded body exceeds the 64 KB cap without calling the transport", async () => {
+    const h = harness();
+    const levels: Record<string, { stars: number; score: number; completedAt: string }> = {};
+    for (let i = 0; i < 1200; i++) levels[String(i)] = { stars: 3, score: 1200, completedAt: "2026-09-17T10:00:00.000Z" };
+    const big = { ...campaign, levels };
+    const result = await h.client.store("campaign", big);
+    expect(result).toEqual({ status: "error", error: { code: "invalid_payload", message: "request body exceeds 65536 bytes" } });
+    expect(h.store).not.toHaveBeenCalled();
+    expect(h.state.readRecord("u1", "campaign")).toBeNull();
+  });
+  it("caps the conflict loop at 5 prompts and returns a terminal error instead of looping forever", async () => {
+    const h = harness();
+    const conflict = ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
+    h.store.mockResolvedValue(conflict);
+    h.answers.push("secondary", "secondary", "secondary", "secondary", "secondary");
+    const result = await h.client.store("campaign", campaign);
+    expect(result).toEqual({ status: "error", error: { code: "http", status: 409, message: "conflict retries exhausted" } });
+    expect(h.prompt.ask).toHaveBeenCalledTimes(5);
+    expect(h.store).toHaveBeenCalledTimes(6);
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+  });
+  it("resolves disposed (writing no record) when the transport settles only after dispose() has already run", async () => {
+    localStorage.clear();
+    const load = vi.fn<Transport["load"]>();
+    let resolveStore!: (r: TransportResult) => void;
+    const store = vi.fn<Transport["store"]>(() => new Promise((resolve) => { resolveStore = resolve; }));
+    const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
+    const state = createSaveStateStore(game.gameSlug);
+    const client = createSavesClient({ game, getSession: async () => ({ access_token: "tok", user: { id: "u1" } }), state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs: 0 });
+    clients.push(client);
+    const pending = client.store("campaign", campaign);
+    await flush(); // let the debounce timer fire and the flush reach the (now hanging) transport call
+    expect(store).toHaveBeenCalledTimes(1);
+    client.dispose();
+    resolveStore(ok(200, { revision: 1, updatedAt: "t" }));
+    expect(await pending).toEqual({ status: "error", error: { code: "http", message: "disposed" } });
+    expect(state.readRecord("u1", "campaign")).toBeNull();
+  });
   it("dispose() closes an open conflict prompt and resolves the pending store as disposed", async () => {
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
@@ -280,5 +318,30 @@ describe("background re-flush", () => {
     const result = await h.client.reconcile("campaign", campaign);
     expect(h.asked).toEqual([CONFLICT_COPY]);
     expect(result).toEqual({ status: "stored", revision: 6 });
+  });
+  it("rechecks dirty inside the serialized quiet-flush callback: an online re-flush queued behind an open foreground conflict prompt must not re-upload the stale payload once 'Use cloud' has already cleared dirty", async () => {
+    const h = harness();
+    const conflict = ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
+    h.store.mockResolvedValueOnce(conflict);
+    h.load.mockResolvedValueOnce(ok(200, row(7, { ...campaign, coins: 70 })));
+    let resolveAsk!: (a: PromptAnswer) => void;
+    h.prompt.ask.mockImplementationOnce((copy: PromptCopy) => {
+      h.asked.push(copy);
+      return new Promise<PromptAnswer>((resolve) => { resolveAsk = resolve; });
+    });
+    const pending = h.client.store("campaign", campaign);
+    await flush(); // let the debounce timer fire and the flush reach the (now open) conflict prompt
+    expect(h.prompt.ask).toHaveBeenCalledTimes(1);
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+
+    // An online/visibilitychange event fires while the foreground prompt is still pending: it
+    // queues a quiet re-flush of the same slot behind the running flush.
+    window.dispatchEvent(new Event("online"));
+    resolveAsk("primary"); // player picks "Use cloud"
+    expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: { ...campaign, coins: 70 }, updatedAt: row(7).updatedAt } });
+    await flush(); // let the queued quiet re-flush actually run
+
+    expect(h.store).toHaveBeenCalledTimes(1); // no second PUT from the stale queued re-flush
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
   });
 });

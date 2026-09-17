@@ -32,6 +32,20 @@ describe("createTransport", () => {
     const t2 = createTransport("https://x", vi.fn(async () => new Response("<html>", { status: 502 })) as never);
     expect(await t2.load("campaign", "tok")).toEqual({ kind: "ok", status: 502, body: null, retryAfterMs: null });
   });
+  it("aborts the request once the deadline passes and reports it as a network error", async () => {
+    const fetchImpl = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        const err = new Error("The operation was aborted.");
+        err.name = "AbortError";
+        reject(err);
+      });
+    }));
+    const t = createTransport("https://nexus.example/api/saves/match", fetchImpl as never, 10);
+    const result = await t.load("campaign", "tok");
+    expect(result.kind).toBe("network");
+    const [, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  }, 2000);
 });
 
 describe("withRetry", () => {
