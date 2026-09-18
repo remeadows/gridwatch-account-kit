@@ -230,8 +230,10 @@ export function createSavesClient(deps) {
         // doesn't land. Calling reconcile() right after sign-in (as the usage example already does)
         // observes the new user immediately and avoids this case entirely. forUser is null only for
         // the very first store() this client ever makes before any session has resolved at all —
-        // there is no prior user to compare against, so it proceeds under whoever is signed in at
-        // flush time (today's behavior, unchanged for that one case).
+        // there is no prior user to compare against, so as far as OWNERSHIP goes it proceeds under
+        // whoever is signed in at flush time (today's behavior, unchanged for that one case). The
+        // discard rule has no such exception: the gates above have already answered for that commit,
+        // through the slot's discard generation.
         if (forUser !== null && s.userId !== forUser) {
             console.warn("[account-kit] dropped a store made by a different user");
             return { status: "signed_out" };
@@ -270,10 +272,9 @@ export function createSavesClient(deps) {
             }
             if (existing) {
                 // The entry can no longer take this call, and cannot be left to flush either. Drop it for
-                // its own waiters right now, telling them the same thing its own flush() would have —
-                // which is why the discard check comes first for an UNOWNED entry (flush's owner gate
-                // never applies to one, so its only possible drop reason is a discard) and second for an
-                // owned one (flush checks the owner before the epoch).
+                // its own waiters right now, telling them what the precedence says — the same order
+                // flush() uses: `discarded` if a discard landed for the stamp it carries, whether or not
+                // it has an owner; otherwise `signed_out`, because a different user has been observed.
                 clearTimeout(existing.timer);
                 pending.delete(slot);
                 if (staleByDiscard(existing, slot)) {
