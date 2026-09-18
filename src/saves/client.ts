@@ -181,13 +181,21 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     const s = await session();
     if (disposed) return { status: "error", error: disposedError() };
     if (!s) return { status: "signed_out" };
-    // A store() commit is bound to the user who made it: forUser is the last known user at the
-    // moment store() was called, captured before the debounce timer (and thus before session()
-    // could be awaited) ever runs. If a *different* user is signed in by the time the timer
-    // fires, this is not that user's commit to send — drop it before touching lastPayload, state,
-    // or the transport. forUser is null only for the very first store() this client ever makes
-    // before any session has resolved; there is no prior user to leak from, so it proceeds under
-    // whoever is signed in at flush time (today's behavior, unchanged for that one case).
+    // A store() commit is bound to the user THIS CLIENT last observed signed in — forUser is
+    // lastKnownUserId at the moment store() was called, captured before the debounce timer (and
+    // thus before session() could be awaited) ever runs. That is not necessarily whoever is
+    // signed in globally right now: lastKnownUserId is only primed by this client's own
+    // session() calls, inside load()/reconcile()/flush() — not by a kit.getSession() call made
+    // directly by the account bar or useAccount(), which this client never sees. Consequence: the
+    // FIRST commit made after a sign-in this client hasn't yet observed for itself is compared
+    // against the *previous* user and dropped here, resolving signed_out (with the warning
+    // below); it self-heals on the very next commit, because this same flush's session() call
+    // just observed the new user too — nothing is lost or mis-recorded, only that one commit
+    // doesn't land. Calling reconcile() right after sign-in (as the usage example already does)
+    // observes the new user immediately and avoids this case entirely. forUser is null only for
+    // the very first store() this client ever makes before any session has resolved at all —
+    // there is no prior user to compare against, so it proceeds under whoever is signed in at
+    // flush time (today's behavior, unchanged for that one case).
     if (forUser !== null && s.userId !== forUser) {
       console.warn("[account-kit] dropped a store made by a different user");
       return { status: "signed_out" };
