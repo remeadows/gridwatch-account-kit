@@ -42,13 +42,22 @@ export function createSavesClient(deps) {
     // each await of session()/withRetry/prompt.ask so in-flight work started before dispose()
     // can't finish touching state after the client has been torn down.
     let disposed = false;
+    // The most recently observed real (non-null) userId. store() reads this synchronously to stamp
+    // *which user's* commit a debounced entry is, since session() can't be awaited until the timer
+    // fires. Never cleared on a null (signed-out) session: a commit made while signed out is still
+    // attributed to the last known user, so a *different* sign-in before the timer fires drops it
+    // rather than uploading it under the wrong account (see flush()'s forUser check below).
+    let lastKnownUserId = null;
     function assertSlot(slot) {
         if (!game.slots.includes(slot))
             throw new RangeError(`[account-kit] unknown save slot "${slot}" for ${game.gameSlug}`);
     }
     async function session() {
         const s = await deps.getSession();
-        return s ? { token: s.access_token, userId: s.user.id } : null;
+        const next = s ? { token: s.access_token, userId: s.user.id } : null;
+        if (next)
+            lastKnownUserId = next.userId;
+        return next;
     }
     async function loadWith(slot, s) {
         const result = await withRetry(() => transport.load(slot, s.token), sleep);
@@ -144,7 +153,7 @@ export function createSavesClient(deps) {
         running.set(slot, next);
         return next;
     }
-    async function flush(slot, payload) {
+    async function flush(slot, payload, forUser) {
         if (disposed)
             return { status: "error", error: disposedError() };
         const s = await session();
@@ -152,6 +161,17 @@ export function createSavesClient(deps) {
             return { status: "error", error: disposedError() };
         if (!s)
             return { status: "signed_out" };
+        // A store() commit is bound to the user who made it: forUser is the last known user at the
+        // moment store() was called, captured before the debounce timer (and thus before session()
+        // could be awaited) ever runs. If a *different* user is signed in by the time the timer
+        // fires, this is not that user's commit to send — drop it before touching lastPayload, state,
+        // or the transport. forUser is null only for the very first store() this client ever makes
+        // before any session has resolved; there is no prior user to leak from, so it proceeds under
+        // whoever is signed in at flush time (today's behavior, unchanged for that one case).
+        if (forUser !== null && s.userId !== forUser) {
+            console.warn("[account-kit] dropped a store made by a different user");
+            return { status: "signed_out" };
+        }
         // store() can't know the signed-in user synchronously, so the payload is remembered here,
         // once the session is known, rather than at the top of store() (see payloadKey above).
         lastPayload.set(payloadKey(s.userId, slot), payload);
@@ -172,9 +192,12 @@ export function createSavesClient(deps) {
                 existing.settle.push(settle);
                 return;
             }
-            const entry = { payload, settle: [settle], timer: setTimeout(() => {
+            // Stamp the entry with whoever is (or was last) signed in right now — a later store() call
+            // that coalesces into this same entry does not change whose commit this is.
+            const forUser = lastKnownUserId;
+            const entry = { payload, forUser, settle: [settle], timer: setTimeout(() => {
                     pending.delete(slot);
-                    void serialized(slot, () => flush(slot, entry.payload))
+                    void serialized(slot, () => flush(slot, entry.payload, entry.forUser))
                         .then((result) => entry.settle.forEach((fn) => fn(result)))
                         .catch((thrown) => {
                         const message = thrown instanceof Error ? thrown.message : String(thrown);
@@ -327,10 +350,14 @@ export function createSavesClient(deps) {
         const s = await session();
         if (!s)
             return;
-        // Invariant: a background re-flush may only ever send a payload that the SAME user handed to
-        // this client. Looking up by payloadKey(s.userId, slot) (rather than iterating lastPayload's
-        // own keys) means a payload another account left behind — this client instance outlives
-        // sign-out/sign-in — is simply never visible while a different user is signed in.
+        // Invariant (this client instance outlives sign-out/sign-in, so this must hold everywhere a
+        // payload leaves the client, not just here): a payload handed to the client by one signed-in
+        // user is never sent under a different user's session — on this background re-flush path, on
+        // the foreground debounce path (flush()'s forUser check), or via reconcile() (which threads
+        // one session throughout and never crosses a debounce timer). Here specifically: looking up
+        // by payloadKey(s.userId, slot) — rather than iterating lastPayload's own keys — means a
+        // payload another account left behind is simply never visible while a different user is
+        // signed in.
         for (const slot of game.slots) {
             const payload = lastPayload.get(payloadKey(s.userId, slot));
             if (payload !== undefined && state.readRecord(s.userId, slot)?.dirty)

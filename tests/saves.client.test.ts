@@ -13,7 +13,7 @@ const ok = (status: number, body: unknown): TransportResult => ({ kind: "ok", st
 const clients: Array<{ dispose(): void }> = [];
 afterEach(() => { for (const c of clients.splice(0)) c.dispose(); });
 
-function harness(session: { access_token: string; user: { id: string } } | null = { access_token: "tok", user: { id: "u1" } }) {
+function harness(session: { access_token: string; user: { id: string } } | null = { access_token: "tok", user: { id: "u1" } }, debounceMs = 0) {
   localStorage.clear();
   let currentSession = session;
   const load = vi.fn<Transport["load"]>();
@@ -22,12 +22,13 @@ function harness(session: { access_token: string; user: { id: string } } | null 
   const asked: PromptCopy[] = [];
   const prompt = { ask: vi.fn(async (copy: PromptCopy) => { asked.push(copy); return answers.shift() ?? "primary"; }), dispose: vi.fn() };
   const state = createSaveStateStore(game.gameSlug);
-  const client = createSavesClient({ game, getSession: async () => currentSession, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs: 0 });
+  const client = createSavesClient({ game, getSession: async () => currentSession, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs });
   clients.push(client);
   const setSession = (next: { access_token: string; user: { id: string } } | null) => { currentSession = next; };
   return { client, load, store, prompt, answers, asked, state, setSession };
 }
 const flush = () => new Promise((r) => setTimeout(r, 5));
+const flushDebounce = () => new Promise((r) => setTimeout(r, 80)); // outlasts a 40ms debounce window
 
 describe("load", () => {
   it("maps wire replies", async () => {
@@ -549,5 +550,101 @@ describe("background re-flush", () => {
     expect(h.store).toHaveBeenCalledTimes(1);
     expect(h.store.mock.calls[0][2]).toBe("tok"); // sent under u1's token
     expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+  });
+});
+
+describe("store is bound to the user who made it (foreground debounce, not just background re-flush)", () => {
+  it("drops the flush when a different user is signed in by the time the debounce timer fires", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId with a real u1 session
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.state.writeRecord("u2", "campaign", { revision: 8, dirty: false });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const pending = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok2", user: { id: "u2" } }); // switch inside the debounce window
+    expect(await pending).toEqual({ status: "signed_out" });
+    expect(h.store).not.toHaveBeenCalled();
+    expect(h.state.readRecord("u2", "campaign")).toEqual({ revision: 8, dirty: false });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+    expect(warn).toHaveBeenCalledWith("[account-kit] dropped a store made by a different user");
+    warn.mockRestore();
+
+    // Prove the dropped commit never reached lastPayload under u2's key either: force u2's record
+    // dirty through an unrelated path and confirm a background re-flush still sends nothing.
+    h.state.writeRecord("u2", "campaign", { revision: 8, dirty: true });
+    h.store.mockClear();
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).not.toHaveBeenCalled();
+  });
+
+  it("still flushes when the same user's session is merely refreshed (new token, same id) inside the debounce window", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+
+    const pending = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok-refreshed", user: { id: "u1" } }); // token refresh, same user
+    expect(await pending).toEqual({ status: "stored", revision: 1, updatedAt: "t" });
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][2]).toBe("tok-refreshed");
+  });
+
+  it("a commit made while signed out is attributed to the last known user: a DIFFERENT sign-in before the timer fires drops it", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    h.setSession(null); // signs out
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const pending = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok2", user: { id: "u2" } }); // a DIFFERENT user signs in before the timer fires
+    expect(await pending).toEqual({ status: "signed_out" });
+    expect(h.store).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith("[account-kit] dropped a store made by a different user");
+    warn.mockRestore();
+  });
+
+  it("a commit made while signed out goes through once the SAME user signs back in before the timer fires", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    h.setSession(null); // signs out
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+
+    const pending = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok", user: { id: "u1" } }); // the SAME user signs back in before the timer fires
+    expect(await pending).toEqual({ status: "stored", revision: 1, updatedAt: "t" });
+    expect(h.store).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesced store() calls keep the FIRST caller's forUser: a user switch between the two calls still drops the flush, for both waiters", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const first = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok2", user: { id: "u2" } }); // switch between the two coalescing calls
+    const second = h.client.store("campaign", { ...campaign, coins: 9 });
+
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toEqual({ status: "signed_out" });
+    expect(b).toEqual({ status: "signed_out" });
+    expect(h.store).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1); // one flush, one drop, both waiters settled from it
+    warn.mockRestore();
+  });
+
+  it("the very first store() before any session has ever resolved has no captured user and proceeds under whoever is signed in when the timer fires (documented residual)", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    // Nothing has called load()/store()/reconcile() yet on this client, so lastKnownUserId is
+    // still null: there is no prior user for this first commit to be checked against.
+    expect(await h.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 1, updatedAt: "t" });
+    expect(h.store).toHaveBeenCalledTimes(1);
   });
 });
