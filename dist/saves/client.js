@@ -634,8 +634,9 @@ export function createSavesClient(deps) {
         //     starting a fresh one stamped with the current values.
         //
         // Third invariant, and the one that separates the two kinds of local state: the per-slot
-        // ownership record is only ever changed by a reconcile decision, never by a store or a
-        // background re-flush that finishes after another account claimed the slot. The per-user sync
+        // ownership record is taken over from another account only by a reconcile decision. A store or
+        // a background re-flush claims it just while it is unset or already names that user, never
+        // when it finishes after another account claimed the slot. The per-user sync
         // record has no such rule — it describes the row of the user whose request just succeeded, so
         // writing it is always truthful — but the owner record is shared by every tab and every
         // account on this browser and says whose progress the LOCAL save is, a question only the
