@@ -66,9 +66,13 @@ export function createSavesClient(deps) {
         slotDiscardGen.set(slot, slotGenOf(slot) + 1);
     };
     const pending = new Map();
-    /** True once a discard has landed for what this entry was stamped with, so it may neither flush
-     *  nor absorb a new store() call. */
-    const staleByDiscard = (e, slot) => e.forUser === null ? e.slotGen !== slotGenOf(slot) : e.epoch !== epochOf(e.forUser, slot);
+    /** True once a discard has landed for what this commit was stamped with, so it may neither flush
+     *  nor absorb a new store() call. Judged purely from the captured stamp, so it is answerable
+     *  without a session — which matters, because a commit the player's choice already invalidated
+     *  must report that, not signed_out, even if its user signed out before the flush. */
+    const staleByDiscard = (e, slot) => e.forUser === null
+        ? e.slotGen !== null && slotGenOf(slot) !== e.slotGen
+        : e.epoch !== null && epochOf(e.forUser, slot) !== e.epoch;
     const running = new Map();
     // Set by dispose(); checked at the start of every serialized callback and immediately after
     // each await of session()/withRetry/prompt.ask so in-flight work started before dispose()
@@ -196,6 +200,14 @@ export function createSavesClient(deps) {
         const s = await session();
         if (disposed)
             return { status: "error", error: disposedError() };
+        // Judged before the signed-out return below, because the player's choice outranks the state of
+        // the session: if a discard landed for what this commit was stamped with, it is dead whether or
+        // not anyone is signed in now. Reporting signed_out here instead would tell the caller the
+        // ordinary "nothing was sent, try again later" story, and the README asks callers to retry
+        // exactly that — resurrecting, after the next sign-in, the very save the cloud copy replaced.
+        // Only the disposed checks outrank this: after dispose() the client says nothing else.
+        if (staleByDiscard({ forUser, epoch, slotGen }, slot))
+            return discardedStore();
         if (!s)
             return { status: "signed_out" };
         // A store() commit is bound to the user THIS CLIENT last observed signed in — forUser is
@@ -217,19 +229,13 @@ export function createSavesClient(deps) {
             console.warn("[account-kit] dropped a store made by a different user");
             return { status: "signed_out" };
         }
-        // Between store() capturing this commit and this flush actually running — the debounce timer,
-        // then however long this callback waited its turn in the slot's serialized chain — the player
-        // may have DISCARDED this slot's local copy ("Use cloud" at either prompt, or "Start fresh").
-        // The record now sits clean at the cloud revision, so sending would succeed with no 409 and
-        // replace the copy they chose with the one they threw away. Checked here, before lastPayload
-        // and before any state read/write or transport call, so nothing of this commit survives; every
-        // waiter coalesced into the entry learns the store was dropped rather than stored.
+        // The same discard rule again, now against the session that actually resolved rather than the
+        // captured owner. A stale commit never reaches these two lines — the gate above already
+        // answered for it — so they are a backstop, kept deliberately: they are the ones that read
+        // s.userId, and they guarantee that whatever else is inserted between here and the transport
+        // call, nothing this commit was invalidated for can reach lastPayload, state or the network.
         if (epoch !== null && epochOf(s.userId, slot) !== epoch)
             return discardedStore();
-        // The same rule for a commit this client could not attribute to any user (no session had been
-        // observed when store() was called, so there is no epoch to check): any discard on the slot
-        // since then drops it. The OWNER gate above does not apply to such a commit — that residual is
-        // documented and unchanged — but the DISCARD rule has no exception.
         if (forUser === null && slotGen !== slotGenOf(slot))
             return discardedStore();
         // store() can't know the signed-in user synchronously, so the payload is remembered here,

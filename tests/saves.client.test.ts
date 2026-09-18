@@ -1011,10 +1011,12 @@ describe("a discard also catches a store this client could not attribute to any 
     const state = createSaveStateStore(game.gameSlug);
     let releaseSession!: () => void;
     const gate = new Promise<void>((resolve) => { releaseSession = resolve; });
-    const getSession = vi.fn(async () => { await gate; return { access_token: "tok", user: { id: "u1" } }; });
+    let session: { access_token: string; user: { id: string } } | null = { access_token: "tok", user: { id: "u1" } };
+    const getSession = vi.fn(async () => { await gate; return session; });
     const client = createSavesClient({ game, getSession, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs });
     clients.push(client);
-    return { client, load, store, prompt, answers, asked, state, getSession, releaseSession };
+    const setSession = (next: { access_token: string; user: { id: string } } | null) => { session = next; };
+    return { client, load, store, prompt, answers, asked, state, getSession, releaseSession, setSession };
   }
 
   it("a store made before ANY session was observed is dropped by a discard on that slot", async () => {
@@ -1053,6 +1055,24 @@ describe("a discard also catches a store this client could not attribute to any 
     expect(await blocking).toEqual({ status: "nothing" });
     expect(await pending).toEqual({ status: "stored", revision: 1, updatedAt: "t" });
     expect(h.store).toHaveBeenCalledTimes(1);
+  });
+
+  it("an unattributed store a discard invalidated reports discarded even when the session is gone by the time its timer fires", async () => {
+    const h = gatedHarness(200);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.load.mockResolvedValueOnce(ok(200, row(5)));
+    const blocking = h.client.reconcile("campaign", null);
+    await flush();
+    const pending = h.client.store("campaign", campaign); // unattributed, still inside the window
+
+    h.releaseSession();
+    expect(await blocking).toEqual({ status: "use_cloud", save: cloud5 });
+    h.setSession(null); // signs out before the debounce window elapses
+
+    expect(await pending).toEqual(discarded);
+    expect(h.store).not.toHaveBeenCalled();
+    expect(warn.mock.calls.filter((c) => c[0] === "[account-kit] dropped a store the player discarded")).toHaveLength(1);
+    warn.mockRestore();
   });
 
   it("an unattributed entry left stale by a discard resolves discarded, and the next store (now attributable) goes through", async () => {
@@ -1111,6 +1131,58 @@ describe("a store made after a discard never coalesces into the pre-discard entr
     expect(h.store.mock.calls[0][1].baseRevision).toBe(5);
     expect(warn.mock.calls.filter((c) => c[0] === "[account-kit] dropped a store the player discarded")).toHaveLength(1);
     warn.mockRestore();
+  });
+
+  it("a store a discard invalidated reports discarded even if its user signed out before the flush", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 200);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.state.writeOwner("campaign", "u1");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const pending = h.client.store("campaign", { ...campaign, coins: 1 });
+    h.load.mockResolvedValueOnce(ok(200, row(5)));
+    expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "use_cloud", save: cloud5 });
+    h.setSession(null); // signs out before the debounce window elapses
+
+    // signed_out would invite a retry after the next sign-in; only discarded says "drop this".
+    expect(await pending).toEqual(discarded);
+    expect(h.store).not.toHaveBeenCalled();
+    expect(warn.mock.calls.filter((c) => c[0] === "[account-kit] dropped a store the player discarded")).toHaveLength(1);
+    expect(warn).not.toHaveBeenCalledWith("[account-kit] dropped a store made by a different user");
+    warn.mockRestore();
+  });
+
+  it("a queued store with NO discard behind it still reports signed_out when the user signs out before the flush", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 200);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const pending = h.client.store("campaign", campaign);
+    h.setSession(null);
+
+    expect(await pending).toEqual({ status: "signed_out" });
+    expect(h.store).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("dispose() still wins over a discard: a pending store settles as disposed, not discarded", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 200);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.state.writeOwner("campaign", "u1");
+
+    const pending = h.client.store("campaign", { ...campaign, coins: 1 });
+    h.load.mockResolvedValueOnce(ok(200, row(5)));
+    expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "use_cloud", save: cloud5 });
+    h.client.dispose();
+
+    expect(await pending).toEqual({ status: "error", error: { code: "http", message: "disposed" } });
+    expect(h.store).not.toHaveBeenCalled();
   });
 
   it("two same-owner stores with no discard between them still coalesce into one flush", async () => {
