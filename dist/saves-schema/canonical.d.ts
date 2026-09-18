@@ -1,3 +1,4 @@
+export declare function hasLoneSurrogate(text: string): boolean;
 export declare function canonicalJson(value: unknown): string;
 export declare function sha256Hex(text: string): Promise<string>;
 export interface RequestHashInput {

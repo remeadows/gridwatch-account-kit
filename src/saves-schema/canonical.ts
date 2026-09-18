@@ -9,7 +9,7 @@ import { LIMITS } from "./validate.js";
 // This is a manual code-unit scan rather than a regex lookbehind assertion: lookbehind is a
 // PARSE-time feature, so having one anywhere in this module would fail to even load on an
 // engine that lacks it (Safari < 16.4), taking the whole saves-schema module down with it.
-function hasLoneSurrogate(text: string): boolean {
+export function hasLoneSurrogate(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
     if (code >= 0xd800 && code <= 0xdbff) {
