@@ -11,6 +11,10 @@ const MAX_CONFLICT_PROMPTS = 5;
 function disposedError() {
     return { code: "http", message: "disposed" };
 }
+// lastPayload is keyed by user AND slot, never slot alone: a single SavesClient instance
+// outlives a sign-out/sign-in (createAccountKit builds it once), so a slot-only key would let a
+// background re-flush send one account's remembered payload into another account's cloud row.
+const payloadKey = (userId, slot) => `${userId}:${slot}`;
 function isSaveRow(value, slot) {
     const v = value;
     return typeof v === "object" && v !== null && v.slot === slot && Number.isSafeInteger(v.schemaVersion)
@@ -126,6 +130,9 @@ export function createSavesClient(deps) {
                 if (loaded.status !== "ok")
                     return { status: "error", error: loaded.status === "error" ? loaded.error : { code: "http", status: 404, message: "cloud row vanished" } };
                 confirmed(slot, s, loaded.save.revision);
+                // The player chose "Use cloud": the local payload they were about to send is discarded,
+                // so it must not be resurrected by a later background re-flush.
+                lastPayload.delete(payloadKey(s.userId, slot));
                 return { status: "use_cloud", save: loaded.save };
             }
             base = outcome.cloudRevision;
@@ -145,6 +152,9 @@ export function createSavesClient(deps) {
             return { status: "error", error: disposedError() };
         if (!s)
             return { status: "signed_out" };
+        // store() can't know the signed-in user synchronously, so the payload is remembered here,
+        // once the session is known, rather than at the top of store() (see payloadKey above).
+        lastPayload.set(payloadKey(s.userId, slot), payload);
         const base = state.readRecord(s.userId, slot)?.revision ?? 0;
         return sendWithConflicts(slot, payload, base, s);
     }
@@ -155,7 +165,6 @@ export function createSavesClient(deps) {
             console.warn(`[account-kit] refusing to store ${slot}: ${valid.detail}`);
             return Promise.resolve({ status: "error", error: { code: "invalid_payload", message: valid.detail } });
         }
-        lastPayload.set(slot, payload);
         return new Promise((settle) => {
             const existing = pending.get(slot);
             if (existing) {
@@ -202,13 +211,13 @@ export function createSavesClient(deps) {
                 // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
                 // row, and so a crash or a failed load still leaves the slot protected.
                 let record = state.readRecord(s.userId, slot);
-                let hintDirtied = false;
+                let hintBase = null;
                 if (options?.localChanged === true && local !== null && record !== null && !record.dirty) {
+                    hintBase = record.revision;
                     record = { revision: record.revision, dirty: true };
                     state.writeRecord(s.userId, slot, record);
                     // a background re-flush of this slot must send the player's actual local payload, never an older one
-                    lastPayload.set(slot, local);
-                    hintDirtied = true;
+                    lastPayload.set(payloadKey(s.userId, slot), local);
                 }
                 const loaded = await loadWith(slot, s);
                 if (loaded.status === "error")
@@ -231,17 +240,20 @@ export function createSavesClient(deps) {
                         if (answer === "primary")
                             return upload();
                         state.writeOwner(slot, s.userId);
-                        if (hintDirtied) {
+                        if (hintBase !== null) {
                             // The player just chose to discard the local copy: undo the pre-load dirty seed so
                             // the slot isn't left flagged as holding unsynced work a background re-flush would
                             // otherwise pick up and upload behind the player's back.
-                            state.writeRecord(s.userId, slot, { revision: record?.revision ?? 0, dirty: false });
-                            lastPayload.delete(slot);
+                            state.writeRecord(s.userId, slot, { revision: hintBase, dirty: false });
+                            lastPayload.delete(payloadKey(s.userId, slot));
                         }
                         return { status: "fresh" };
                     }
                     case "use_cloud":
                         confirmed(slot, s, cloud.revision);
+                        // The player had nothing local worth keeping, or the table already decided the cloud
+                        // row wins outright: either way there is no local payload left to protect.
+                        lastPayload.delete(payloadKey(s.userId, slot));
                         return { status: "use_cloud", save: cloud };
                     case "conflict_prompt": {
                         // The table already decided a prompt is due: never send first (a send on the cloud
@@ -253,6 +265,9 @@ export function createSavesClient(deps) {
                             return { status: "error", error: disposedError() };
                         if (answer === "primary") {
                             confirmed(slot, s, current.revision);
+                            // The player chose "Use cloud": the local edits are discarded, so a background
+                            // re-flush must not later resurrect them.
+                            lastPayload.delete(payloadKey(s.userId, slot));
                             return { status: "use_cloud", save: current };
                         }
                         return asReconcile(await sendWithConflicts(slot, local, current.revision, s));
@@ -312,8 +327,13 @@ export function createSavesClient(deps) {
         const s = await session();
         if (!s)
             return;
-        for (const [slot, payload] of lastPayload) {
-            if (state.readRecord(s.userId, slot)?.dirty)
+        // Invariant: a background re-flush may only ever send a payload that the SAME user handed to
+        // this client. Looking up by payloadKey(s.userId, slot) (rather than iterating lastPayload's
+        // own keys) means a payload another account left behind — this client instance outlives
+        // sign-out/sign-in — is simply never visible while a different user is signed in.
+        for (const slot of game.slots) {
+            const payload = lastPayload.get(payloadKey(s.userId, slot));
+            if (payload !== undefined && state.readRecord(s.userId, slot)?.dirty)
                 void quietFlush(slot, payload);
         }
     }
