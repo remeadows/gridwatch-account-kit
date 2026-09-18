@@ -308,11 +308,20 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
         // row, and so a crash or a failed load still leaves the slot protected.
         let record = state.readRecord(s.userId, slot);
-        if (options?.localChanged === true && local !== null && record !== null && !record.dirty) {
-          record = { revision: record.revision, dirty: true };
-          state.writeRecord(s.userId, slot, record);
-          // a background re-flush of this slot must send the player's actual local payload, never an older one
+        if (options?.localChanged === true && local !== null) {
+          // A background re-flush of this slot must send the player's actual local payload, never
+          // an older one — and never skip the slot for want of one. Seeded on EVERY hinted call
+          // with a local payload, independent of the record: if the record is already dirty (an
+          // earlier failed store() or reconcile() left it so), lastPayload is either unset, in
+          // which case the re-flush would skip this slot entirely, or holds an older payload from
+          // that earlier attempt, which is exactly the stale content this seed exists to replace.
           lastPayload.set(payloadKey(s.userId, slot), local);
+          // The dirty flag itself is only forced on a CLEAN record: an already-dirty record needs
+          // no help being prompted for, and rewriting it here would gain nothing.
+          if (record !== null && !record.dirty) {
+            record = { revision: record.revision, dirty: true };
+            state.writeRecord(s.userId, slot, record);
+          }
         }
         const loaded = await loadWith(slot, s);
         if (loaded.status === "error") return loaded;

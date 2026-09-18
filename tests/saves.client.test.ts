@@ -387,6 +387,52 @@ describe("reconcile", () => {
       expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
       expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
     });
+    it("seeds lastPayload even when the record is ALREADY dirty, so the re-flush sends the hinted payload rather than an older remembered one", async () => {
+      const h = harness();
+      const olderPayload = campaign;
+      const newerLocalEdits = { ...campaign, coins: 99 };
+      h.store.mockResolvedValueOnce(ok(200, { revision: 3, updatedAt: "t0" }));
+      expect(await h.client.store("campaign", olderPayload)).toEqual({ status: "stored", revision: 3, updatedAt: "t0" });
+      // Dirty through an unrelated path (an earlier failed store or reconcile), so the hint block's
+      // writeRecord is skipped: only the lastPayload seed is in question here.
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      expect(await h.client.reconcile("campaign", newerLocalEdits, { localChanged: true })).toMatchObject({ status: "error", error: { code: "network" } });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+
+      h.store.mockReset();
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t1" }));
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][1].payload).toEqual(newerLocalEdits);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
+    });
+    it("seeds lastPayload on an ALREADY dirty record with nothing remembered yet, so the re-flush sends the hinted payload instead of skipping the slot", async () => {
+      const h = harness();
+      const newerLocalEdits = { ...campaign, coins: 99 };
+      // Dirty with no remembered payload at all: this client instance never flushed this slot
+      // (e.g. the record was left dirty in a previous page session).
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+      h.state.writeOwner("campaign", "u1");
+
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      expect(await h.client.reconcile("campaign", newerLocalEdits, { localChanged: true })).toMatchObject({ status: "error", error: { code: "network" } });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t1" }));
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][1].payload).toEqual(newerLocalEdits);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+    });
     it("'Start fresh' after a hinted reconcile clears the pre-load dirty seed instead of leaving the discarded local payload flagged for background upload", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });

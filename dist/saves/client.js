@@ -36,6 +36,16 @@ export function createSavesClient(deps) {
     const debounceMs = deps.debounceMs ?? 750;
     const windowRef = deps.windowRef === undefined ? (typeof window === "undefined" ? null : window) : deps.windowRef;
     const lastPayload = new Map();
+    // Bumped every time the player DISCARDS this user's local copy of a slot ("Use cloud" at either
+    // prompt, the table's outright use_cloud, or "Start fresh"). Any store/re-flush that was already
+    // queued for that user+slot captured the older epoch and is dropped instead of sent: forgetting
+    // lastPayload is not enough, because a queued flush carries its own payload and would read its
+    // baseRevision from the record the discard just confirmed at the cloud revision — a PUT that
+    // succeeds with no 409 and silently replaces the copy the player just chose. Keyed like
+    // lastPayload (user AND slot), so one account's discard never drops another account's work.
+    const discardEpoch = new Map();
+    const epochOf = (userId, slot) => discardEpoch.get(payloadKey(userId, slot)) ?? 0;
+    const bumpEpoch = (userId, slot) => discardEpoch.set(payloadKey(userId, slot), epochOf(userId, slot) + 1);
     const pending = new Map();
     const running = new Map();
     // Set by dispose(); checked at the start of every serialized callback and immediately after
@@ -140,8 +150,13 @@ export function createSavesClient(deps) {
                     return { status: "error", error: loaded.status === "error" ? loaded.error : { code: "http", status: 404, message: "cloud row vanished" } };
                 confirmed(slot, s, loaded.save.revision);
                 // The player chose "Use cloud": the local payload they were about to send is discarded,
-                // so it must not be resurrected by a later background re-flush.
+                // so it must not be resurrected by a later background re-flush, and any store or
+                // re-flush this user had already queued for the slot must be dropped rather than sent on
+                // top of the revision we just confirmed. Bumping here cannot affect THIS operation: when
+                // we were reached from a store()'s own flush, that flush already made its epoch check at
+                // its top, before this call — so it still reports its legitimate use_cloud result.
                 lastPayload.delete(payloadKey(s.userId, slot));
+                bumpEpoch(s.userId, slot);
                 return { status: "use_cloud", save: loaded.save };
             }
             base = outcome.cloudRevision;
@@ -153,7 +168,7 @@ export function createSavesClient(deps) {
         running.set(slot, next);
         return next;
     }
-    async function flush(slot, payload, forUser) {
+    async function flush(slot, payload, forUser, epoch) {
         if (disposed)
             return { status: "error", error: disposedError() };
         const s = await session();
@@ -180,6 +195,18 @@ export function createSavesClient(deps) {
             console.warn("[account-kit] dropped a store made by a different user");
             return { status: "signed_out" };
         }
+        // Between store() capturing this commit and this flush actually running — the debounce timer,
+        // then however long this callback waited its turn in the slot's serialized chain — the player
+        // may have DISCARDED this slot's local copy ("Use cloud" at either prompt, or "Start fresh").
+        // The record now sits clean at the cloud revision, so sending would succeed with no 409 and
+        // replace the copy they chose with the one they threw away. Checked here, before lastPayload
+        // and before any state read/write or transport call, so nothing of this commit survives; every
+        // waiter coalesced into the entry learns the store was dropped rather than stored. (epoch is
+        // null only for the very first store() before any session resolved — see store() below.)
+        if (epoch !== null && epochOf(s.userId, slot) !== epoch) {
+            console.warn("[account-kit] dropped a store the player discarded");
+            return { status: "error", error: { code: "http", message: "discarded" } };
+        }
         // store() can't know the signed-in user synchronously, so the payload is remembered here,
         // once the session is known, rather than at the top of store() (see payloadKey above).
         lastPayload.set(payloadKey(s.userId, slot), payload);
@@ -197,7 +224,9 @@ export function createSavesClient(deps) {
             const existing = pending.get(slot);
             if (existing && existing.forUser === lastKnownUserId) {
                 // Same observed owner as the pending entry: coalesce as usual, keeping the first caller's
-                // forUser (a later call here never changes whose commit this is).
+                // forUser and epoch (a later call here never changes whose commit this is, nor which
+                // discards it predates — a discard between the two calls would have been for this same
+                // user and slot, so the whole coalesced entry is rightly dropped at flush time).
                 existing.payload = payload;
                 existing.settle.push(settle);
                 return;
@@ -213,11 +242,16 @@ export function createSavesClient(deps) {
                 existing.settle.forEach((fn) => fn({ status: "signed_out" }));
             }
             // Stamp the entry with whoever is (or was last) signed in right now — a later store() call
-            // that coalesces into this same entry does not change whose commit this is.
+            // that coalesces into this same entry does not change whose commit this is — and with that
+            // user's current discard epoch, so a discard raised between now and the flush drops this
+            // commit instead of overwriting the copy the player chose. No epoch when there is no
+            // observed user to key one by: that is the same documented first-ever-store residual as
+            // forUser === null (there is no prior user, and so no prior discard, to check against).
             const forUser = lastKnownUserId;
-            const entry = { payload, forUser, settle: [settle], timer: setTimeout(() => {
+            const epoch = forUser === null ? null : epochOf(forUser, slot);
+            const entry = { payload, forUser, epoch, settle: [settle], timer: setTimeout(() => {
                     pending.delete(slot);
-                    void serialized(slot, () => flush(slot, entry.payload, entry.forUser))
+                    void serialized(slot, () => flush(slot, entry.payload, entry.forUser, entry.epoch))
                         .then((result) => entry.settle.forEach((fn) => fn(result)))
                         .catch((thrown) => {
                         const message = thrown instanceof Error ? thrown.message : String(thrown);
@@ -254,11 +288,20 @@ export function createSavesClient(deps) {
                 // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
                 // row, and so a crash or a failed load still leaves the slot protected.
                 let record = state.readRecord(s.userId, slot);
-                if (options?.localChanged === true && local !== null && record !== null && !record.dirty) {
-                    record = { revision: record.revision, dirty: true };
-                    state.writeRecord(s.userId, slot, record);
-                    // a background re-flush of this slot must send the player's actual local payload, never an older one
+                if (options?.localChanged === true && local !== null) {
+                    // A background re-flush of this slot must send the player's actual local payload, never
+                    // an older one — and never skip the slot for want of one. Seeded on EVERY hinted call
+                    // with a local payload, independent of the record: if the record is already dirty (an
+                    // earlier failed store() or reconcile() left it so), lastPayload is either unset, in
+                    // which case the re-flush would skip this slot entirely, or holds an older payload from
+                    // that earlier attempt, which is exactly the stale content this seed exists to replace.
                     lastPayload.set(payloadKey(s.userId, slot), local);
+                    // The dirty flag itself is only forced on a CLEAN record: an already-dirty record needs
+                    // no help being prompted for, and rewriting it here would gain nothing.
+                    if (record !== null && !record.dirty) {
+                        record = { revision: record.revision, dirty: true };
+                        state.writeRecord(s.userId, slot, record);
+                    }
                 }
                 const loaded = await loadWith(slot, s);
                 if (loaded.status === "error")
@@ -289,6 +332,7 @@ export function createSavesClient(deps) {
                         if (record !== null)
                             state.writeRecord(s.userId, slot, { revision: record.revision, dirty: false });
                         lastPayload.delete(payloadKey(s.userId, slot));
+                        bumpEpoch(s.userId, slot);
                         return { status: "fresh" };
                     }
                     case "use_cloud":
@@ -296,6 +340,7 @@ export function createSavesClient(deps) {
                         // The player had nothing local worth keeping, or the table already decided the cloud
                         // row wins outright: either way there is no local payload left to protect.
                         lastPayload.delete(payloadKey(s.userId, slot));
+                        bumpEpoch(s.userId, slot);
                         return { status: "use_cloud", save: cloud };
                     case "conflict_prompt": {
                         // The table already decided a prompt is due: never send first (a send on the cloud
@@ -308,8 +353,10 @@ export function createSavesClient(deps) {
                         if (answer === "primary") {
                             confirmed(slot, s, current.revision);
                             // The player chose "Use cloud": the local edits are discarded, so a background
-                            // re-flush must not later resurrect them.
+                            // re-flush must not later resurrect them, and neither must a store this user had
+                            // already queued for the slot behind this reconcile.
                             lastPayload.delete(payloadKey(s.userId, slot));
+                            bumpEpoch(s.userId, slot);
                             return { status: "use_cloud", save: current };
                         }
                         return asReconcile(await sendWithConflicts(slot, local, current.revision, s));
@@ -331,7 +378,7 @@ export function createSavesClient(deps) {
     /** Background re-flush of a dirty slot (online / visibilitychange): one attempt, no prompt.
      *  Prompting from here would resolve a conflict behind the player's back — see C1: a 409
      *  here just leaves the record dirty for the next foreground store()/reconcile() to resolve. */
-    function quietFlush(slot, payload, ownerUserId) {
+    function quietFlush(slot, payload, ownerUserId, epoch) {
         return serialized(slot, async () => {
             if (disposed)
                 return;
@@ -347,6 +394,13 @@ export function createSavesClient(deps) {
             // Re-check before touching anything: a different user's session must never see
             // ownerUserId's payload, record, or revision.
             if (s.userId !== ownerUserId)
+                return;
+            // Same window, different loss: the player may have DISCARDED this slot's local copy while
+            // this re-flush sat in the queue, in which case the payload selected for it is exactly the
+            // work they threw away. The dirty re-read below usually catches that (a discard confirms the
+            // record clean), but not if something marked the slot dirty again in between — so check the
+            // epoch it was selected under before touching anything.
+            if (epochOf(s.userId, slot) !== epoch)
                 return;
             // A foreground conflict prompt (store()/reconcile()) may have been running when this quiet
             // flush was queued behind it; by the time it's our turn, the player may already have
@@ -401,10 +455,27 @@ export function createSavesClient(deps) {
         // caller made the call. That's the intended contract (it's why the usage example calls
         // reconcile() once the session is already known), and it's exactly the case the per-slot
         // ownership record and its take-over prompt ("fresh") exist to handle.
+        //
+        // Second invariant, on the same delayed paths and for the same reason (something captured now,
+        // used after other async work has run): once the player DISCARDS a slot's local copy — the
+        // table's outright use_cloud, "Use cloud" at either prompt, or "Start fresh" — nothing this
+        // user had already queued for that slot may still be sent. Forgetting lastPayload is not
+        // enough: a store whose debounce timer is still pending, and worse a store whose flush is
+        // already queued in the slot's serialized chain behind the discard, each carry their own
+        // payload and would read baseRevision from the record the discard just confirmed AT the cloud
+        // revision — so the PUT succeeds with no 409 and quietly replaces the copy the player chose
+        // with the one they threw away. Both cases are closed by one per-user+slot discardEpoch:
+        // captured when a pending entry is created (store()) and when a payload is selected for a
+        // re-flush (just below), re-checked at the moment of use (flush()'s epoch gate, before
+        // lastPayload or any state/transport touch, resolving an error "discarded" for every waiter of
+        // that entry; quietFlush()'s, which simply returns), and bumped at every discard next to the
+        // lastPayload.delete that accompanies it. It is per user for the same reason lastPayload is:
+        // one account's discard must not drop another account's queued work for that slot. A store
+        // made AFTER the discard captures the new epoch and proceeds normally.
         for (const slot of game.slots) {
             const payload = lastPayload.get(payloadKey(s.userId, slot));
             if (payload !== undefined && state.readRecord(s.userId, slot)?.dirty)
-                void quietFlush(slot, payload, s.userId);
+                void quietFlush(slot, payload, s.userId, epochOf(s.userId, slot));
         }
     }
     const onOnline = () => { void reflushDirty(); };
