@@ -360,6 +360,63 @@ describe("reconcile", () => {
       expect(result).toMatchObject({ status: "error", error: { code: "network", message: "down" } });
       expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
     });
+    it("seeds lastPayload with the hinted local payload so a background re-flush after a failed load sends the player's actual edits, not an earlier store's stale payload", async () => {
+      const h = harness();
+      const olderPayload = campaign;
+      const newerLocalEdits = { ...campaign, coins: 99 };
+      h.store.mockResolvedValueOnce(ok(200, { revision: 3, updatedAt: "t0" }));
+      expect(await h.client.store("campaign", olderPayload)).toEqual({ status: "stored", revision: 3, updatedAt: "t0" });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      const result = await h.client.reconcile("campaign", newerLocalEdits, { localChanged: true });
+      expect(result).toMatchObject({ status: "error", error: { code: "network" } });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+
+      h.store.mockReset();
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t1" }));
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][1].payload).toEqual(newerLocalEdits);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+    });
+    it("'Start fresh' after a hinted reconcile clears the pre-load dirty seed instead of leaving the discarded local payload flagged for background upload", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u9");
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      h.answers.push("secondary");
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
+      expect(h.asked).toEqual([OWNERSHIP_COPY]);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+
+      h.store.mockClear();
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).not.toHaveBeenCalled();
+    });
+    it("does not touch a record that was already dirty before the call (the hint block never fired)", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+      h.state.writeOwner("campaign", "u9");
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      h.answers.push("secondary");
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+    });
+    it("the upload path (owner unset, no cloud row) still ends cleanly synced even when the hint marked the record dirty first", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 0, dirty: false });
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "uploaded", revision: 1 });
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(0);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+    });
   });
 });
 

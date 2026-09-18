@@ -202,9 +202,13 @@ export function createSavesClient(deps) {
                 // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
                 // row, and so a crash or a failed load still leaves the slot protected.
                 let record = state.readRecord(s.userId, slot);
+                let hintDirtied = false;
                 if (options?.localChanged === true && local !== null && record !== null && !record.dirty) {
                     record = { revision: record.revision, dirty: true };
                     state.writeRecord(s.userId, slot, record);
+                    // a background re-flush of this slot must send the player's actual local payload, never an older one
+                    lastPayload.set(slot, local);
+                    hintDirtied = true;
                 }
                 const loaded = await loadWith(slot, s);
                 if (loaded.status === "error")
@@ -227,6 +231,13 @@ export function createSavesClient(deps) {
                         if (answer === "primary")
                             return upload();
                         state.writeOwner(slot, s.userId);
+                        if (hintDirtied) {
+                            // The player just chose to discard the local copy: undo the pre-load dirty seed so
+                            // the slot isn't left flagged as holding unsynced work a background re-flush would
+                            // otherwise pick up and upload behind the player's back.
+                            state.writeRecord(s.userId, slot, { revision: record?.revision ?? 0, dirty: false });
+                            lastPayload.delete(slot);
+                        }
                         return { status: "fresh" };
                     }
                     case "use_cloud":
