@@ -294,6 +294,73 @@ describe("reconcile", () => {
     clients.push(client);
     await expect(client.reconcile("campaign", null)).resolves.toEqual({ status: "error", error: { code: "http", message: "boom" } });
   });
+
+  describe("localChanged hint", () => {
+    it("turns a would-be silent use_cloud into a conflict prompt; 'Keep this one' sends local on the cloud revision", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 6, updatedAt: "t" }));
+      h.answers.push("secondary");
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "stored", revision: 6 });
+      expect(h.asked).toEqual([CONFLICT_COPY]);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(5);
+    });
+    it("turns a would-be silent use_cloud into a conflict prompt; 'Use cloud' applies the cloud row and clears dirty", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      h.answers.push("primary");
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+      expect(h.asked).toEqual([CONFLICT_COPY]);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 5, dirty: false });
+    });
+    it("without the hint, the same setup still answers use_cloud silently (regression guard)", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+      expect(h.asked).toEqual([]);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 5, dirty: false });
+    });
+    it("at equal revisions uploads the local copy without a prompt", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(3)));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "stored", revision: 4 });
+      expect(h.asked).toEqual([]);
+      expect(h.store).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+    });
+    it("is ignored when local is null: no early dirty write, still a silent use_cloud", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      const writeRecordSpy = vi.spyOn(h.state, "writeRecord");
+      expect(await h.client.reconcile("campaign", null, { localChanged: true })).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+      expect(h.asked).toEqual([]);
+      expect(writeRecordSpy).toHaveBeenCalledTimes(1);
+      expect(writeRecordSpy).toHaveBeenCalledWith("u1", "campaign", { revision: 5, dirty: false });
+    });
+    it("persists dirty before the cloud load, so a failed load still leaves the record protected", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      const result = await h.client.reconcile("campaign", campaign, { localChanged: true });
+      expect(result).toMatchObject({ status: "error", error: { code: "network", message: "down" } });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+    });
+  });
 });
 
 describe("background re-flush", () => {
