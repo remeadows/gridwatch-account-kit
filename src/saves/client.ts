@@ -383,21 +383,29 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     const s = await session();
     if (!s) return;
     // Invariant (this client instance outlives sign-out/sign-in, so this must hold everywhere a
-    // payload can leave the client, not just here): a payload handed to the client by one
-    // signed-in user is never sent under a different user's session — on the foreground debounce
-    // path (flush()'s forUser check), when two store() calls coalesce (store()'s
-    // existing.forUser check), on this background re-flush path, or via reconcile() (which
-    // threads one session throughout and never crosses a debounce timer or a serialized queue it
-    // didn't itself start). Every one of those checks is a *delayed* path: something is captured
-    // now and used later, once other async work (a timer, a queued serialized callback, another
-    // caller's operation) has had a chance to run — so each one re-reads who is actually signed
-    // in at the moment it is about to act, rather than trusting who was signed in when the
-    // payload/decision was captured. Here specifically, in two layers: looking up by
-    // payloadKey(s.userId, slot) — rather than iterating lastPayload's own keys — means a payload
-    // another account left behind is never even selected while a different user is signed in;
-    // and quietFlush() re-checks its ownerUserId again once its turn in the slot's serialized
-    // queue actually comes up, since it can be queued behind other work long enough for the
-    // account to have switched again in the meantime.
+    // REMEMBERED payload can leave the client): a payload the client itself remembered —
+    // debounced in store()'s pending entry, coalesced across store() calls, or held in
+    // lastPayload for a background re-flush — is never sent under a different user's session
+    // than the one that supplied it. That covers the foreground debounce path (flush()'s
+    // forUser check), coalescing (store()'s existing.forUser check), and this background
+    // re-flush path, in two layers: looking up by payloadKey(s.userId, slot) — rather than
+    // iterating lastPayload's own keys — means a payload another account left behind is never
+    // even selected while a different user is signed in; and quietFlush() re-checks its
+    // ownerUserId again once its turn in the slot's serialized queue actually comes up, since it
+    // can be queued behind other work long enough for the account to have switched again in the
+    // meantime. Every one of those checks is a *delayed* path: something is captured now and
+    // used later, once other async work (a timer, a queued serialized callback, another caller's
+    // operation) has had a chance to run — so each one re-reads who is actually signed in at the
+    // moment it is about to act, rather than trusting who was signed in when the payload was
+    // captured.
+    //
+    // reconcile() is deliberately NOT part of this list: its `local` payload is supplied fresh
+    // by the caller on every call, not remembered by the client, and reconcile() resolves its
+    // session as late as possible — at the front of the slot's serialized queue — so it is sent
+    // under whoever is signed in AT THAT POINT, which may not be who was signed in when the
+    // caller made the call. That's the intended contract (it's why the usage example calls
+    // reconcile() once the session is already known), and it's exactly the case the per-slot
+    // ownership record and its take-over prompt ("fresh") exist to handle.
     for (const slot of game.slots) {
       const payload = lastPayload.get(payloadKey(s.userId, slot));
       if (payload !== undefined && state.readRecord(s.userId, slot)?.dirty) void quietFlush(slot, payload, s.userId);
