@@ -1,5 +1,27 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { canonicalJson, requestHash, sha256Hex } from "../src/saves-schema/canonical";
+import { canonicalJson, hasLoneSurrogate, requestHash, sha256Hex } from "../src/saves-schema/canonical";
+
+// Reference implementation for the differential test below only — a lookbehind here is fine
+// (this file is never shipped; only src/ is scanned by the release gate and the test above).
+// Deliberately independent of hasLoneSurrogate's code-unit scan: same semantics, different technique.
+const REFERENCE_LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+function referenceHasLoneSurrogate(text: string): boolean {
+  return REFERENCE_LONE_SURROGATE_RE.test(text);
+}
+
+// Small seeded PRNG (mulberry32) so the differential test below is deterministic across runs.
+function mulberry32(seed: number): () => number {
+  let state = seed;
+  return () => {
+    state |= 0;
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 describe("canonicalJson", () => {
   it("sorts object keys recursively and emits no whitespace", () => {
@@ -38,6 +60,45 @@ describe("canonicalJson", () => {
     expect(() => canonicalJson("\uD800")).toThrow(TypeError);
     expect(() => canonicalJson({ "\uDC00": 1 })).toThrow(TypeError);
     expect(() => canonicalJson("😀")).not.toThrow();
+  });
+  it("rejects a trailing high surrogate with nothing after it", () => {
+    expect(() => canonicalJson("a\uD83D")).toThrow(/canonicalJson: lone surrogate at \$/);
+  });
+  it("rejects a leading low surrogate with nothing before it", () => {
+    expect(() => canonicalJson("\uDE00a")).toThrow(/canonicalJson: lone surrogate at \$/);
+  });
+  it("rejects a high surrogate immediately followed by a valid surrogate pair (the first one is lone)", () => {
+    expect(() => canonicalJson("\uD83D😀")).toThrow(/canonicalJson: lone surrogate at \$/);
+  });
+  it("accepts a valid surrogate pair in the middle of a longer string", () => {
+    expect(() => canonicalJson("before😀after")).not.toThrow();
+  });
+  it("hasLoneSurrogate agrees with an independent reference implementation across thousands of random strings (differential test)", () => {
+    const rand = mulberry32(20260917);
+    // 'a' (plain), the surrogate range endpoints (0xD800/0xDBFF for high, 0xDC00/0xDFFF for low —
+    // off-by-one errors at a range boundary are exactly what a handful of hand-picked mid-range
+    // examples would miss), an arbitrary high/low pair, and a valid pair. Random concatenations of
+    // these cover lone surrogates in every position (start/middle/end, adjacent to another lone
+    // surrogate, adjacent to a valid pair) far more thoroughly than the cases spelled out above.
+    const alphabet = ["a", "\uD800", "\uDBFF", "\uDC00", "\uDFFF", "\uD83D", "\uDE00", "😀"];
+    for (let trial = 0; trial < 5000; trial++) {
+      const length = Math.floor(rand() * 8);
+      let s = "";
+      for (let i = 0; i < length; i++) s += alphabet[Math.floor(rand() * alphabet.length)];
+      expect(hasLoneSurrogate(s), `mismatch for ${JSON.stringify(s)}`).toBe(referenceHasLoneSurrogate(s));
+    }
+  });
+  it("builds without a regex lookbehind anywhere under saves-schema/, so the module still parses on engines that lack it (e.g. Safari < 16.4)", () => {
+    // This scans the src/ sources — where lookbehind syntax would fail to parse at all — not the
+    // built dist/ output; check:dist proves a fresh build matches what's committed to dist/, so a
+    // clean scan of src/ is sufficient without also walking dist/.
+    const dir = fileURLToPath(new URL("../src/saves-schema/", import.meta.url));
+    const files = readdirSync(dir).filter((name) => name.endsWith(".ts"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const name of files) {
+      const source = readFileSync(`${dir}${name}`, "utf8");
+      expect(source, `${name} contains a lookbehind`).not.toMatch(/\(\?<[!=]/);
+    }
   });
 });
 

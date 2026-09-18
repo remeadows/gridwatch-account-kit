@@ -17,4 +17,8 @@ describe("uuidV4", () => {
     expect(id).toMatch(UUID_RE);
     expect(id[14]).toBe("4");
   });
+  it("throws a clear error instead of a ReferenceError when crypto is missing entirely", () => {
+    vi.stubGlobal("crypto", undefined);
+    expect(() => uuidV4()).toThrow("[account-kit] crypto.getRandomValues is required for cloud saves");
+  });
 });

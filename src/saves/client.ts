@@ -5,7 +5,7 @@ import { CONFLICT_COPY, OWNERSHIP_COPY, type PromptHost } from "./prompt.js";
 import { decideReconcile } from "./reconcile.js";
 import type { SaveStateStore } from "./state.js";
 import { withRetry, type Transport, type TransportResult } from "./transport.js";
-import type { CloudSave, LoadResult, ReconcileResult, SaveError, SaveGameConfig, SavesClient, StoreResult } from "./types.js";
+import type { CloudSave, LoadResult, ReconcileOptions, ReconcileResult, SaveError, SaveGameConfig, SavesClient, StoreResult } from "./types.js";
 import { uuidV4 } from "./uuid.js";
 
 export interface SavesClientDeps {
@@ -34,6 +34,11 @@ function disposedError(): SaveError {
   return { code: "http", message: "disposed" };
 }
 
+// lastPayload is keyed by user AND slot, never slot alone: a single SavesClient instance
+// outlives a sign-out/sign-in (createAccountKit builds it once), so a slot-only key would let a
+// background re-flush send one account's remembered payload into another account's cloud row.
+const payloadKey = (userId: string, slot: string) => `${userId}:${slot}`;
+
 function isSaveRow(value: unknown, slot: string): value is SaveRow {
   const v = value as SaveRow;
   return typeof v === "object" && v !== null && v.slot === slot && Number.isSafeInteger(v.schemaVersion)
@@ -58,12 +63,18 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   const windowRef = deps.windowRef === undefined ? (typeof window === "undefined" ? null : window) : deps.windowRef;
 
   const lastPayload = new Map<string, SavePayload>();
-  const pending = new Map<string, { payload: SavePayload; timer: ReturnType<typeof setTimeout>; settle: Array<(r: StoreResult) => void> }>();
+  const pending = new Map<string, { payload: SavePayload; forUser: string | null; timer: ReturnType<typeof setTimeout>; settle: Array<(r: StoreResult) => void> }>();
   const running = new Map<string, Promise<unknown>>();
   // Set by dispose(); checked at the start of every serialized callback and immediately after
   // each await of session()/withRetry/prompt.ask so in-flight work started before dispose()
   // can't finish touching state after the client has been torn down.
   let disposed = false;
+  // The most recently observed real (non-null) userId. store() reads this synchronously to stamp
+  // *which user's* commit a debounced entry is, since session() can't be awaited until the timer
+  // fires. Never cleared on a null (signed-out) session: a commit made while signed out is still
+  // attributed to the last known user, so a *different* sign-in before the timer fires drops it
+  // rather than uploading it under the wrong account (see flush()'s forUser check below).
+  let lastKnownUserId: string | null = null;
 
   function assertSlot(slot: string): void {
     if (!game.slots.includes(slot)) throw new RangeError(`[account-kit] unknown save slot "${slot}" for ${game.gameSlug}`);
@@ -71,7 +82,9 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
 
   async function session(): Promise<Session | null> {
     const s = await deps.getSession();
-    return s ? { token: s.access_token, userId: s.user.id } : null;
+    const next = s ? { token: s.access_token, userId: s.user.id } : null;
+    if (next) lastKnownUserId = next.userId;
+    return next;
   }
 
   async function loadWith(slot: string, s: Session): Promise<LoadResult> {
@@ -147,6 +160,9 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         const loaded = await loadWith(slot, s);
         if (loaded.status !== "ok") return { status: "error", error: loaded.status === "error" ? loaded.error : { code: "http", status: 404, message: "cloud row vanished" } };
         confirmed(slot, s, loaded.save.revision);
+        // The player chose "Use cloud": the local payload they were about to send is discarded,
+        // so it must not be resurrected by a later background re-flush.
+        lastPayload.delete(payloadKey(s.userId, slot));
         return { status: "use_cloud", save: loaded.save };
       }
       base = outcome.cloudRevision;
@@ -160,11 +176,33 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     return next;
   }
 
-  async function flush(slot: string, payload: SavePayload): Promise<StoreResult> {
+  async function flush(slot: string, payload: SavePayload, forUser: string | null): Promise<StoreResult> {
     if (disposed) return { status: "error", error: disposedError() };
     const s = await session();
     if (disposed) return { status: "error", error: disposedError() };
     if (!s) return { status: "signed_out" };
+    // A store() commit is bound to the user THIS CLIENT last observed signed in — forUser is
+    // lastKnownUserId at the moment store() was called, captured before the debounce timer (and
+    // thus before session() could be awaited) ever runs. That is not necessarily whoever is
+    // signed in globally right now: lastKnownUserId is only primed by this client's own
+    // session() calls, inside load()/reconcile()/flush() — not by a kit.getSession() call made
+    // directly by the account bar or useAccount(), which this client never sees. Consequence: the
+    // FIRST commit made after a sign-in this client hasn't yet observed for itself is compared
+    // against the *previous* user and dropped here, resolving signed_out (with the warning
+    // below); it self-heals on the very next commit, because this same flush's session() call
+    // just observed the new user too — nothing is lost or mis-recorded, only that one commit
+    // doesn't land. Calling reconcile() right after sign-in (as the usage example already does)
+    // observes the new user immediately and avoids this case entirely. forUser is null only for
+    // the very first store() this client ever makes before any session has resolved at all —
+    // there is no prior user to compare against, so it proceeds under whoever is signed in at
+    // flush time (today's behavior, unchanged for that one case).
+    if (forUser !== null && s.userId !== forUser) {
+      console.warn("[account-kit] dropped a store made by a different user");
+      return { status: "signed_out" };
+    }
+    // store() can't know the signed-in user synchronously, so the payload is remembered here,
+    // once the session is known, rather than at the top of store() (see payloadKey above).
+    lastPayload.set(payloadKey(s.userId, slot), payload);
     const base = state.readRecord(s.userId, slot)?.revision ?? 0;
     return sendWithConflicts(slot, payload, base, s);
   }
@@ -176,13 +214,31 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       console.warn(`[account-kit] refusing to store ${slot}: ${valid.detail}`);
       return Promise.resolve({ status: "error", error: { code: "invalid_payload", message: valid.detail } });
     }
-    lastPayload.set(slot, payload);
     return new Promise<StoreResult>((settle) => {
       const existing = pending.get(slot);
-      if (existing) { existing.payload = payload; existing.settle.push(settle); return; }
-      const entry = { payload, settle: [settle], timer: setTimeout(() => {
+      if (existing && existing.forUser === lastKnownUserId) {
+        // Same observed owner as the pending entry: coalesce as usual, keeping the first caller's
+        // forUser (a later call here never changes whose commit this is).
+        existing.payload = payload;
+        existing.settle.push(settle);
+        return;
+      }
+      if (existing) {
+        // A different user has been observed since the pending entry was created: it is not safe
+        // to coalesce this payload into that entry (the wrong user's commit would ride along
+        // either way). Drop the stale entry for its own waiters right now, the same way a
+        // mismatched flush() would, and start a fresh entry for this call.
+        clearTimeout(existing.timer);
         pending.delete(slot);
-        void serialized(slot, () => flush(slot, entry.payload))
+        console.warn("[account-kit] dropped a store made by a different user");
+        existing.settle.forEach((fn) => fn({ status: "signed_out" }));
+      }
+      // Stamp the entry with whoever is (or was last) signed in right now — a later store() call
+      // that coalesces into this same entry does not change whose commit this is.
+      const forUser = lastKnownUserId;
+      const entry = { payload, forUser, settle: [settle], timer: setTimeout(() => {
+        pending.delete(slot);
+        void serialized(slot, () => flush(slot, entry.payload, entry.forUser))
           .then((result) => entry.settle.forEach((fn) => fn(result)))
           .catch((thrown: unknown) => {
             const message = thrown instanceof Error ? thrown.message : String(thrown);
@@ -194,7 +250,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     });
   }
 
-  function reconcile(slot: string, local: SavePayload | null): Promise<ReconcileResult> {
+  function reconcile(slot: string, local: SavePayload | null, options?: ReconcileOptions): Promise<ReconcileResult> {
     assertSlot(slot);
     return serialized(slot, async () => {
       if (disposed) return { status: "error", error: disposedError() };
@@ -211,10 +267,22 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         const s = await session();
         if (disposed) return { status: "error", error: disposedError() };
         if (!s) return { status: "signed_out" };
+        // The game may hold local edits without ever calling store() (signed out, or stores held
+        // while offline), leaving a clean { revision, dirty: false } record that no longer matches
+        // what's on screen. `localChanged` tells us so: mark the record dirty BEFORE the cloud
+        // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
+        // row, and so a crash or a failed load still leaves the slot protected.
+        let record = state.readRecord(s.userId, slot);
+        if (options?.localChanged === true && local !== null && record !== null && !record.dirty) {
+          record = { revision: record.revision, dirty: true };
+          state.writeRecord(s.userId, slot, record);
+          // a background re-flush of this slot must send the player's actual local payload, never an older one
+          lastPayload.set(payloadKey(s.userId, slot), local);
+        }
         const loaded = await loadWith(slot, s);
         if (loaded.status === "error") return loaded;
         const cloud = loaded.status === "ok" ? loaded.save : null;
-        const decision = decideReconcile({ signedIn: true, cloud, local, record: state.readRecord(s.userId, slot), owner: state.readOwner(slot), userId: s.userId });
+        const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });
         const asReconcile = (result: StoreResult): ReconcileResult =>
           result.status === "stored" ? { status: "stored", revision: result.revision } : result;
         const upload = async (): Promise<ReconcileResult> => {
@@ -230,9 +298,21 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             if (disposed) return { status: "error", error: disposedError() };
             if (answer === "primary") return upload();
             state.writeOwner(slot, s.userId);
+            // "Start fresh" always discards the local payload the player just rejected, no matter
+            // why the record was dirty (a hinted reconcile seeding it above, or an unrelated
+            // earlier failed store()): a background re-flush must never resurrect work the player
+            // explicitly chose to abandon. Clear dirty on whatever record exists (there may be
+            // none at all, if this slot was never synced) and drop any remembered payload.
+            if (record !== null) state.writeRecord(s.userId, slot, { revision: record.revision, dirty: false });
+            lastPayload.delete(payloadKey(s.userId, slot));
             return { status: "fresh" };
           }
-          case "use_cloud": confirmed(slot, s, (cloud as CloudSave).revision); return { status: "use_cloud", save: cloud as CloudSave };
+          case "use_cloud":
+            confirmed(slot, s, (cloud as CloudSave).revision);
+            // The player had nothing local worth keeping, or the table already decided the cloud
+            // row wins outright: either way there is no local payload left to protect.
+            lastPayload.delete(payloadKey(s.userId, slot));
+            return { status: "use_cloud", save: cloud as CloudSave };
           case "conflict_prompt": {
             // The table already decided a prompt is due: never send first (a send on the cloud
             // revision would silently win). Ask, then act on the answer.
@@ -242,6 +322,9 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             if (disposed) return { status: "error", error: disposedError() };
             if (answer === "primary") {
               confirmed(slot, s, current.revision);
+              // The player chose "Use cloud": the local edits are discarded, so a background
+              // re-flush must not later resurrect them.
+              lastPayload.delete(payloadKey(s.userId, slot));
               return { status: "use_cloud", save: current };
             }
             return asReconcile(await sendWithConflicts(slot, local as SavePayload, current.revision, s));
@@ -263,12 +346,19 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   /** Background re-flush of a dirty slot (online / visibilitychange): one attempt, no prompt.
    *  Prompting from here would resolve a conflict behind the player's back — see C1: a 409
    *  here just leaves the record dirty for the next foreground store()/reconcile() to resolve. */
-  function quietFlush(slot: string, payload: SavePayload): Promise<void> {
+  function quietFlush(slot: string, payload: SavePayload, ownerUserId: string): Promise<void> {
     return serialized(slot, async () => {
       if (disposed) return;
       const s = await session();
       if (disposed) return;
       if (!s) return;
+      // This quiet flush was queued for ownerUserId's dirty record and payload, but a foreground
+      // operation (store()/reconcile()) — or simply other queued work — may have been running for
+      // this slot when it was queued; by the time its turn in the serialized chain actually
+      // comes up, the account may have switched (this client instance outlives sign-out/sign-in).
+      // Re-check before touching anything: a different user's session must never see
+      // ownerUserId's payload, record, or revision.
+      if (s.userId !== ownerUserId) return;
       // A foreground conflict prompt (store()/reconcile()) may have been running when this quiet
       // flush was queued behind it; by the time it's our turn, the player may already have
       // resolved that conflict and cleared dirty. Re-read it now, inside the serialized callback,
@@ -292,8 +382,33 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   async function reflushDirty(): Promise<void> {
     const s = await session();
     if (!s) return;
-    for (const [slot, payload] of lastPayload) {
-      if (state.readRecord(s.userId, slot)?.dirty) void quietFlush(slot, payload);
+    // Invariant (this client instance outlives sign-out/sign-in, so this must hold everywhere a
+    // REMEMBERED payload can leave the client): a payload the client itself remembered —
+    // debounced in store()'s pending entry, coalesced across store() calls, or held in
+    // lastPayload for a background re-flush — is never sent under a different user's session
+    // than the one that supplied it. That covers the foreground debounce path (flush()'s
+    // forUser check), coalescing (store()'s existing.forUser check), and this background
+    // re-flush path, in two layers: looking up by payloadKey(s.userId, slot) — rather than
+    // iterating lastPayload's own keys — means a payload another account left behind is never
+    // even selected while a different user is signed in; and quietFlush() re-checks its
+    // ownerUserId again once its turn in the slot's serialized queue actually comes up, since it
+    // can be queued behind other work long enough for the account to have switched again in the
+    // meantime. Every one of those checks is a *delayed* path: something is captured now and
+    // used later, once other async work (a timer, a queued serialized callback, another caller's
+    // operation) has had a chance to run — so each one re-reads who is actually signed in at the
+    // moment it is about to act, rather than trusting who was signed in when the payload was
+    // captured.
+    //
+    // reconcile() is deliberately NOT part of this list: its `local` payload is supplied fresh
+    // by the caller on every call, not remembered by the client, and reconcile() resolves its
+    // session as late as possible — at the front of the slot's serialized queue — so it is sent
+    // under whoever is signed in AT THAT POINT, which may not be who was signed in when the
+    // caller made the call. That's the intended contract (it's why the usage example calls
+    // reconcile() once the session is already known), and it's exactly the case the per-slot
+    // ownership record and its take-over prompt ("fresh") exist to handle.
+    for (const slot of game.slots) {
+      const payload = lastPayload.get(payloadKey(s.userId, slot));
+      if (payload !== undefined && state.readRecord(s.userId, slot)?.dirty) void quietFlush(slot, payload, s.userId);
     }
   }
   const onOnline = () => { void reflushDirty(); };

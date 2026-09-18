@@ -26,10 +26,16 @@ export type ReconcileResult =
   | { status: "stored"; revision: number }
   | { status: "error"; error: SaveError };
 
+export interface ReconcileOptions {
+  /** The game knows this slot's local payload has changes that were never confirmed in the
+   *  cloud (e.g. edits made while signed out). */
+  localChanged?: boolean;
+}
+
 export interface SavesClient {
   readonly game: SaveGameConfig;
   load(slot: string): Promise<LoadResult>;
   store(slot: string, payload: SavePayload): Promise<StoreResult>;
-  reconcile(slot: string, localPayload: SavePayload | null): Promise<ReconcileResult>;
+  reconcile(slot: string, localPayload: SavePayload | null, options?: ReconcileOptions): Promise<ReconcileResult>;
   dispose(): void;
 }

@@ -13,19 +13,22 @@ const ok = (status: number, body: unknown): TransportResult => ({ kind: "ok", st
 const clients: Array<{ dispose(): void }> = [];
 afterEach(() => { for (const c of clients.splice(0)) c.dispose(); });
 
-function harness(session: { access_token: string; user: { id: string } } | null = { access_token: "tok", user: { id: "u1" } }) {
+function harness(session: { access_token: string; user: { id: string } } | null = { access_token: "tok", user: { id: "u1" } }, debounceMs = 0) {
   localStorage.clear();
+  let currentSession = session;
   const load = vi.fn<Transport["load"]>();
   const store = vi.fn<Transport["store"]>();
   const answers: PromptAnswer[] = [];
   const asked: PromptCopy[] = [];
   const prompt = { ask: vi.fn(async (copy: PromptCopy) => { asked.push(copy); return answers.shift() ?? "primary"; }), dispose: vi.fn() };
   const state = createSaveStateStore(game.gameSlug);
-  const client = createSavesClient({ game, getSession: async () => session, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs: 0 });
+  const client = createSavesClient({ game, getSession: async () => currentSession, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs });
   clients.push(client);
-  return { client, load, store, prompt, answers, asked, state };
+  const setSession = (next: { access_token: string; user: { id: string } } | null) => { currentSession = next; };
+  return { client, load, store, prompt, answers, asked, state, setSession };
 }
 const flush = () => new Promise((r) => setTimeout(r, 5));
+const flushDebounce = () => new Promise((r) => setTimeout(r, 80)); // outlasts a 40ms debounce window
 
 describe("load", () => {
   it("maps wire replies", async () => {
@@ -294,6 +297,187 @@ describe("reconcile", () => {
     clients.push(client);
     await expect(client.reconcile("campaign", null)).resolves.toEqual({ status: "error", error: { code: "http", message: "boom" } });
   });
+
+  describe("localChanged hint", () => {
+    it("turns a would-be silent use_cloud into a conflict prompt; 'Keep this one' sends local on the cloud revision", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 6, updatedAt: "t" }));
+      h.answers.push("secondary");
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "stored", revision: 6 });
+      expect(h.asked).toEqual([CONFLICT_COPY]);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(5);
+    });
+    it("turns a would-be silent use_cloud into a conflict prompt; 'Use cloud' applies the cloud row and clears dirty", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      h.answers.push("primary");
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+      expect(h.asked).toEqual([CONFLICT_COPY]);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 5, dirty: false });
+    });
+    it("without the hint, the same setup still answers use_cloud silently (regression guard)", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+      expect(h.asked).toEqual([]);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 5, dirty: false });
+    });
+    it("at equal revisions uploads the local copy without a prompt", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(3)));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "stored", revision: 4 });
+      expect(h.asked).toEqual([]);
+      expect(h.store).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+    });
+    it("is ignored when local is null: no early dirty write, still a silent use_cloud", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      const writeRecordSpy = vi.spyOn(h.state, "writeRecord");
+      expect(await h.client.reconcile("campaign", null, { localChanged: true })).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+      expect(h.asked).toEqual([]);
+      expect(writeRecordSpy).toHaveBeenCalledTimes(1);
+      expect(writeRecordSpy).toHaveBeenCalledWith("u1", "campaign", { revision: 5, dirty: false });
+    });
+    it("persists dirty before the cloud load, so a failed load still leaves the record protected", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      const result = await h.client.reconcile("campaign", campaign, { localChanged: true });
+      expect(result).toMatchObject({ status: "error", error: { code: "network", message: "down" } });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+    });
+    it("seeds lastPayload with the hinted local payload so a background re-flush after a failed load sends the player's actual edits, not an earlier store's stale payload", async () => {
+      const h = harness();
+      const olderPayload = campaign;
+      const newerLocalEdits = { ...campaign, coins: 99 };
+      h.store.mockResolvedValueOnce(ok(200, { revision: 3, updatedAt: "t0" }));
+      expect(await h.client.store("campaign", olderPayload)).toEqual({ status: "stored", revision: 3, updatedAt: "t0" });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      const result = await h.client.reconcile("campaign", newerLocalEdits, { localChanged: true });
+      expect(result).toMatchObject({ status: "error", error: { code: "network" } });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+
+      h.store.mockReset();
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t1" }));
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][1].payload).toEqual(newerLocalEdits);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+    });
+    it("'Start fresh' after a hinted reconcile clears the pre-load dirty seed instead of leaving the discarded local payload flagged for background upload", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u9");
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      h.answers.push("secondary");
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
+      expect(h.asked).toEqual([OWNERSHIP_COPY]);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+
+      h.store.mockClear();
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).not.toHaveBeenCalled();
+    });
+    it("'Start fresh' discards the local payload regardless of why the record was already dirty (hint block never fired here, since the record was dirty going in)", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+      h.state.writeOwner("campaign", "u9");
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      h.answers.push("secondary");
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+
+      h.store.mockClear();
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).not.toHaveBeenCalled();
+    });
+    it("'Start fresh' with no record at all for this user+slot writes nothing (no throw)", async () => {
+      const h = harness();
+      h.state.writeOwner("campaign", "u9"); // owned by someone else; no record for u1 exists yet
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      h.answers.push("secondary");
+      expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "fresh" });
+      expect(h.state.readRecord("u1", "campaign")).toBeNull();
+    });
+    it("the upload path (owner unset, no cloud row) still ends cleanly synced even when the hint marked the record dirty first", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 0, dirty: false });
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "uploaded", revision: 1 });
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(0);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+    });
+    it("a hinted reconcile's conflict prompt answered 'Use cloud' clears the remembered payload, so a background re-flush later can't resurrect the discarded local edits", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      h.answers.push("primary");
+      expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+
+      // Simulate the slot becoming dirty again through an unrelated path, to prove the discarded
+      // payload is actually gone from lastPayload rather than merely "not currently dirty".
+      h.state.writeRecord("u1", "campaign", { revision: 5, dirty: true });
+      h.store.mockClear();
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).not.toHaveBeenCalled();
+    });
+  });
+  it("store()'s conflict prompt answered 'Use cloud' clears the remembered payload so a later background re-flush sends nothing for that slot", async () => {
+    const h = harness();
+    const conflict = ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
+    h.store.mockResolvedValueOnce(conflict);
+    h.load.mockResolvedValueOnce(ok(200, row(7, { ...campaign, coins: 70 })));
+    h.answers.push("primary");
+    expect(await h.client.store("campaign", campaign)).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: { ...campaign, coins: 70 }, updatedAt: row(7).updatedAt } });
+
+    h.state.writeRecord("u1", "campaign", { revision: 7, dirty: true });
+    h.store.mockClear();
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).not.toHaveBeenCalled();
+  });
+  it("reconcile's unhinted use_cloud also clears the remembered payload", async () => {
+    const h = harness();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 3, updatedAt: "t0" }));
+    expect(await h.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 3, updatedAt: "t0" });
+
+    h.load.mockResolvedValueOnce(ok(200, row(5)));
+    expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+
+    h.state.writeRecord("u1", "campaign", { revision: 5, dirty: true });
+    h.store.mockClear();
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).not.toHaveBeenCalled();
+  });
 });
 
 describe("background re-flush", () => {
@@ -343,5 +527,220 @@ describe("background re-flush", () => {
 
     expect(h.store).toHaveBeenCalledTimes(1); // no second PUT from the stale queued re-flush
     expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+  });
+  it("never sends one account's remembered payload under another account's session, even though the client instance outlives sign-out/sign-in (cross-user repro)", async () => {
+    const h = harness(); // starts as u1
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    expect(await h.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 1, updatedAt: "t" });
+    // u1's payload is now remembered for background re-flush.
+
+    h.setSession({ access_token: "tok2", user: { id: "u2" } });
+    // u2 has a dirty record but never called store() on this client instance — write it directly
+    // through state so u1's remembered payload is the only thing a re-flush could possibly send.
+    h.state.writeRecord("u2", "campaign", { revision: 0, dirty: true });
+
+    h.store.mockReset();
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).not.toHaveBeenCalled();
+  });
+  it("re-flushes an account's own payload again once it signs back in, after a background re-flush while another account was active correctly did nothing", async () => {
+    const h = harness(); // starts as u1
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+
+    h.setSession({ access_token: "tok2", user: { id: "u2" } });
+    h.store.mockReset();
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).not.toHaveBeenCalled(); // nothing dirty for u2, and u1's payload must not leak
+
+    h.setSession({ access_token: "tok", user: { id: "u1" } });
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t2" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][2]).toBe("tok"); // sent under u1's token
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+  });
+  it("re-checks the payload's owner at the moment it actually runs: an account switch while a quiet re-flush is queued behind other work for the slot must not send user A's payload under user B's session", async () => {
+    const h = harness(); // starts as u1
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t0" }));
+    expect(await h.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 1, updatedAt: "t0" });
+    // u1 is dirty again, with payload A ("campaign") still remembered from the store() above.
+    h.state.writeRecord("u1", "campaign", { revision: 1, dirty: true });
+
+    // Block the slot's serialized chain with a pending reconcile whose load we control.
+    let resolveLoad!: (r: TransportResult) => void;
+    h.load.mockImplementationOnce(() => new Promise((resolve) => { resolveLoad = resolve; }));
+    const blocking = h.client.reconcile("campaign", null);
+
+    // An online event fires while the chain is blocked: this queues quietFlush(slot, A, "u1")
+    // behind the still-running reconcile in the slot's serialized queue.
+    window.dispatchEvent(new Event("online"));
+    await flush();
+
+    // The account switches to U2 while the quiet flush is still queued, not yet running.
+    h.setSession({ access_token: "tok2", user: { id: "u2" } });
+    h.state.writeRecord("u2", "campaign", { revision: 5, dirty: true });
+
+    h.store.mockClear();
+    resolveLoad(ok(404, { error: "no_save" })); // release the blocked reconcile
+    await blocking;
+    await flush(); // let the queued quiet re-flush actually run
+
+    expect(h.store).not.toHaveBeenCalled(); // A never sent under U2's session
+    expect(h.state.readRecord("u2", "campaign")).toEqual({ revision: 5, dirty: true }); // untouched
+  });
+});
+
+describe("store is bound to the user who made it (foreground debounce, not just background re-flush)", () => {
+  it("drops the flush when a different user is signed in by the time the debounce timer fires", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId with a real u1 session
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.state.writeRecord("u2", "campaign", { revision: 8, dirty: false });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const pending = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok2", user: { id: "u2" } }); // switch inside the debounce window
+    expect(await pending).toEqual({ status: "signed_out" });
+    expect(h.store).not.toHaveBeenCalled();
+    expect(h.state.readRecord("u2", "campaign")).toEqual({ revision: 8, dirty: false });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+    expect(warn).toHaveBeenCalledWith("[account-kit] dropped a store made by a different user");
+    warn.mockRestore();
+
+    // Prove the dropped commit never reached lastPayload under u2's key either: force u2's record
+    // dirty through an unrelated path and confirm a background re-flush still sends nothing.
+    h.state.writeRecord("u2", "campaign", { revision: 8, dirty: true });
+    h.store.mockClear();
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).not.toHaveBeenCalled();
+  });
+
+  it("still flushes when the same user's session is merely refreshed (new token, same id) inside the debounce window", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+
+    const pending = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok-refreshed", user: { id: "u1" } }); // token refresh, same user
+    expect(await pending).toEqual({ status: "stored", revision: 1, updatedAt: "t" });
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][2]).toBe("tok-refreshed");
+  });
+
+  it("a commit made while signed out is attributed to the last known user: a DIFFERENT sign-in before the timer fires drops it", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    h.setSession(null); // signs out
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const pending = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok2", user: { id: "u2" } }); // a DIFFERENT user signs in before the timer fires
+    expect(await pending).toEqual({ status: "signed_out" });
+    expect(h.store).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith("[account-kit] dropped a store made by a different user");
+    warn.mockRestore();
+  });
+
+  it("a commit made while signed out goes through once the SAME user signs back in before the timer fires", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    h.setSession(null); // signs out
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+
+    const pending = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok", user: { id: "u1" } }); // the SAME user signs back in before the timer fires
+    expect(await pending).toEqual({ status: "stored", revision: 1, updatedAt: "t" });
+    expect(h.store).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesced store() calls keep the FIRST caller's forUser when the session merely changed without this client OBSERVING it yet: a user switch between the two calls still drops the single flush, for both waiters", async () => {
+    // setSession() alone does not update lastKnownUserId — only an actual session() call inside
+    // this client does (see load()/reconcile()/flush()). Since neither store() call below causes
+    // one, lastKnownUserId is still "u1" when the second call happens, so it coalesces into the
+    // SAME pending entry as the first (forUser stays "u1"); the single resulting flush then finds
+    // u2 signed in and drops for both waiters. Contrast with the tests below, where an explicit
+    // load() between the two store() calls DOES observe u2 first.
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const first = h.client.store("campaign", campaign);
+    h.setSession({ access_token: "tok2", user: { id: "u2" } }); // switch between the two coalescing calls
+    const second = h.client.store("campaign", { ...campaign, coins: 9 });
+
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toEqual({ status: "signed_out" });
+    expect(b).toEqual({ status: "signed_out" });
+    expect(h.store).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1); // one flush, one drop, both waiters settled from it
+    warn.mockRestore();
+  });
+
+  it("does NOT coalesce across an OBSERVED user switch: the stale entry is dropped for its own waiter and a fresh entry starts for the new caller — dropped again if the session moves on before its own timer fires", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const first = h.client.store("campaign", campaign); // pending entry: forUser = u1
+
+    h.setSession({ access_token: "tok2", user: { id: "u2" } });
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // this client now OBSERVES u2: lastKnownUserId becomes u2
+
+    // Not coalesced: lastKnownUserId (u2) !== the pending entry's forUser (u1). The stale entry is
+    // dropped for `first` right here, and a fresh entry (forUser: u2) starts for `second`.
+    const second = h.client.store("campaign", { ...campaign, coins: 9 });
+    expect(await first).toEqual({ status: "signed_out" });
+    expect(h.store).not.toHaveBeenCalled();
+
+    h.setSession({ access_token: "tok", user: { id: "u1" } }); // switches back before second's own timer fires
+    expect(await second).toEqual({ status: "signed_out" }); // second's flush runs under u1 ≠ forUser u2
+    expect(h.store).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(2); // one drop-on-create (first), one drop-at-flush-time (second)
+    warn.mockRestore();
+  });
+
+  it("does NOT coalesce across an OBSERVED user switch, but the new caller's own flush goes through normally when the session stays with them", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const first = h.client.store("campaign", campaign); // pending entry: forUser = u1
+
+    h.setSession({ access_token: "tok2", user: { id: "u2" } });
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // observe u2
+
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    const second = h.client.store("campaign", { ...campaign, coins: 9 }); // fresh entry: forUser = u2
+    expect(await first).toEqual({ status: "signed_out" });
+
+    expect(await second).toEqual({ status: "stored", revision: 1, updatedAt: "t" });
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][1].payload).toEqual({ ...campaign, coins: 9 });
+    expect(h.store.mock.calls[0][2]).toBe("tok2");
+    warn.mockRestore();
+  });
+
+  it("the very first store() before any session has ever resolved has no captured user and proceeds under whoever is signed in when the timer fires (documented residual)", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    // Nothing has called load()/store()/reconcile() yet on this client, so lastKnownUserId is
+    // still null: there is no prior user for this first commit to be checked against.
+    expect(await h.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 1, updatedAt: "t" });
+    expect(h.store).toHaveBeenCalledTimes(1);
   });
 });
