@@ -725,6 +725,127 @@ describe("background re-flush", () => {
   });
 });
 
+// The per-SLOT ownership record is shared by every tab and every account on this browser, and
+// decideReconcile trusts it: owner === self plus a record at the cloud revision answers `current`,
+// and the local save is handed back as this user's own. So a send that finishes AFTER another
+// account claimed the slot must still write its own per-user sync record (truthful: the request
+// that succeeded was this user's) while leaving that newer claim alone. Otherwise the first user
+// returns to this device, the kit sees owner === self, trusts the OTHER account's progress as
+// theirs, and their next commit uploads it into their cloud row.
+describe("a store or background re-flush never overwrites another account's claim on the slot", () => {
+  it("a background re-flush that succeeds after another tab claimed the slot records the revision for this user and leaves the claim alone", async () => {
+    const h = harness(); // u1
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t0" }));
+    expect(await h.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 1, updatedAt: "t0" });
+    expect(h.state.readOwner("campaign")).toBe("u1");
+    // Dirty again, with u1's payload still remembered from the store() above.
+    h.state.writeRecord("u1", "campaign", { revision: 1, dirty: true });
+
+    // Hold the PUT open: the quiet flush has already passed its owner check (still u1 at that
+    // point) and is now awaiting the transport.
+    let resolveStore!: (r: TransportResult) => void;
+    h.store.mockImplementationOnce(() => new Promise((resolve) => { resolveStore = resolve; }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(2);
+
+    // Another tab signs in as u2 and its reconcile claims the slot while the PUT is in flight.
+    h.state.writeOwner("campaign", "u2");
+    resolveStore(ok(200, { revision: 2, updatedAt: "t1" }));
+    await flush();
+
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 2, dirty: false }); // truthful for u1's row
+    expect(h.state.readOwner("campaign")).toBe("u2"); // the newer claim survives
+  });
+
+  it("a foreground store() that succeeds after another tab claimed the slot records the revision for this user and leaves the claim alone", async () => {
+    const h = harness(); // u1
+    h.state.writeOwner("campaign", "u1");
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    let resolveStore!: (r: TransportResult) => void;
+    h.store.mockImplementationOnce(() => new Promise((resolve) => { resolveStore = resolve; }));
+    const pending = h.client.store("campaign", campaign);
+    await flush(); // debounce fires; the PUT is in flight under u1's captured session
+
+    h.state.writeOwner("campaign", "u2"); // another tab's reconcile claims the slot mid-send
+    resolveStore(ok(200, { revision: 4, updatedAt: "t" }));
+
+    expect(await pending).toEqual({ status: "stored", revision: 4, updatedAt: "t" });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+    expect(h.state.readOwner("campaign")).toBe("u2");
+  });
+
+  it("control: a store success claims an UNSET slot for this user, and a second one leaves an already-self claim in place", async () => {
+    const h = harness();
+    expect(h.state.readOwner("campaign")).toBeNull();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    expect((await h.client.store("campaign", campaign)).status).toBe("stored");
+    expect(h.state.readOwner("campaign")).toBe("u1"); // unset → claimed
+    h.store.mockResolvedValueOnce(ok(200, { revision: 2, updatedAt: "t2" }));
+    expect((await h.client.store("campaign", campaign)).status).toBe("stored");
+    expect(h.state.readOwner("campaign")).toBe("u1"); // already this user → stays this user
+  });
+
+  it("control: a background re-flush success claims an UNSET slot for this user", async () => {
+    const h = harness();
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+    expect(h.state.readOwner("campaign")).toBeNull(); // a failed send never claimed it
+
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+    expect(h.state.readOwner("campaign")).toBe("u1");
+  });
+
+  it("take-over still works: the ownership prompt's 'Upload' claims the slot from the other account", async () => {
+    const h = harness();
+    h.state.writeOwner("campaign", "u2");
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    h.answers.push("primary"); // "Upload"
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "uploaded", revision: 1 });
+    expect(h.asked).toEqual([OWNERSHIP_COPY]);
+    expect(h.state.readOwner("campaign")).toBe("u1");
+  });
+
+  it("take-over still works: the conflict prompt's 'Keep this one' on a slot owned by another account claims it", async () => {
+    const h = harness();
+    h.state.writeOwner("campaign", "u2");
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.load.mockResolvedValueOnce(ok(200, row(3)));
+    h.answers.push("secondary"); // "Keep this one"
+    h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+    expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "stored", revision: 4 });
+    expect(h.asked).toEqual([CONFLICT_COPY]);
+    expect(h.state.readOwner("campaign")).toBe("u1");
+  });
+
+  it("take-over still works: the conflict prompt's 'Use cloud' on a slot owned by another account claims it", async () => {
+    const h = harness();
+    h.state.writeOwner("campaign", "u2");
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.load.mockResolvedValueOnce(ok(200, row(5)));
+    h.answers.push("primary"); // "Use cloud"
+    expect(await h.client.reconcile("campaign", campaign)).toMatchObject({ status: "use_cloud" });
+    expect(h.asked).toEqual([CONFLICT_COPY]);
+    expect(h.state.readOwner("campaign")).toBe("u1");
+    expect(h.store).not.toHaveBeenCalled();
+  });
+
+  it("take-over still works: an outright use_cloud claims the slot", async () => {
+    const h = harness();
+    h.state.writeOwner("campaign", "u2");
+    h.load.mockResolvedValueOnce(ok(200, row(3)));
+    expect(await h.client.reconcile("campaign", null)).toMatchObject({ status: "use_cloud" });
+    expect(h.asked).toEqual([]);
+    expect(h.state.readOwner("campaign")).toBe("u1");
+  });
+});
+
 describe("store is bound to the user who made it (foreground debounce, not just background re-flush)", () => {
   it("drops the flush when a different user is signed in by the time the debounce timer fires", async () => {
     const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);

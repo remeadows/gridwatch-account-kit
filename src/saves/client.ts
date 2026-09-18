@@ -175,20 +175,52 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     return { kind: "error", error, dirty };
   }
 
-  function confirmed(slot: string, s: Session, revision: number): void {
+  /** What a successful send writes — and the two records are NOT the same kind of thing.
+   *
+   *  The SYNC RECORD is per (user, slot) and describes that user's own cloud row. The request
+   *  that just succeeded was this user's, so writing it is always truthful no matter what else
+   *  happened on this browser in the meantime. It is written unconditionally.
+   *
+   *  The OWNER RECORD is per SLOT, shared by every tab and every account on this browser, and it
+   *  answers a different question: whose progress the local save on this device is.
+   *  decideReconcile TRUSTS it — with owner === this user, a record equal to the cloud revision
+   *  answers `current` and the local save is handed back as this user's own. So it is only ever
+   *  changed by a path that actually settled the ownership question inside this slot's serialized
+   *  chain: `claim: true`, used by the reconcile decisions that are take-overs by design
+   *  (`use_cloud`, both conflict-prompt answers, the ownership prompt's "Upload" and "Start
+   *  fresh"). Every other successful send — a store()/flush() and a background quietFlush() —
+   *  passes `claim: false` and writes the owner only while it is unset or already names this
+   *  user. Those paths check (or checked) the owner BEFORE their transport call awaited, and in
+   *  that window another tab can sign in as a different account and claim the slot; writing it
+   *  back afterwards would leave the kit trusting THAT account's progress as this user's the
+   *  next time they return to this device, and their next commit would upload it into their own
+   *  cloud row. Leaving a newer claim alone costs nothing: the sync record is still recorded, and
+   *  whose save this is goes back to being the foreground ownership prompt's question. */
+  function confirmed(slot: string, s: Session, revision: number, opts: { claim: boolean }): void {
     state.writeRecord(s.userId, slot, { revision, dirty: false });
-    state.writeOwner(slot, s.userId);
+    if (opts.claim) {
+      state.writeOwner(slot, s.userId);
+      return;
+    }
+    const owner = state.readOwner(slot);
+    if (owner === null || owner === s.userId) state.writeOwner(slot, s.userId);
   }
 
   /** Send, and on 409 run the conflict prompt until the player's choice lands. Bounded: a peer
    *  that keeps winning every round for MAX_CONFLICT_PROMPTS rounds ends the loop with a
-   *  terminal error instead of prompting forever (the record is left dirty either way). */
-  async function sendWithConflicts(slot: string, payload: SavePayload, baseRevision: number, s: Session): Promise<StoreResult> {
+   *  terminal error instead of prompting forever (the record is left dirty either way).
+   *
+   *  `claim` comes from the CALLER, because this function is shared: reconcile's upload /
+   *  restore_dirty / keep-this-one paths are take-overs and claim the slot, while a store()
+   *  flush must not overwrite another account's claim (see confirmed() above). It is threaded
+   *  through both places a send here can confirm — the plain success and the conflict prompt's
+   *  "Use cloud" — so one caller's intent covers every outcome of its own send. */
+  async function sendWithConflicts(slot: string, payload: SavePayload, baseRevision: number, s: Session, claim: boolean): Promise<StoreResult> {
     let base = baseRevision;
     let conflictRounds = 0;
     for (;;) {
       const outcome = await sendOnce(slot, payload, base, s);
-      if (outcome.kind === "stored") { confirmed(slot, s, outcome.revision); return { status: "stored", revision: outcome.revision, updatedAt: outcome.updatedAt }; }
+      if (outcome.kind === "stored") { confirmed(slot, s, outcome.revision, { claim }); return { status: "stored", revision: outcome.revision, updatedAt: outcome.updatedAt }; }
       if (outcome.kind === "error") {
         if (outcome.dirty) state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
         return { status: "error", error: outcome.error };
@@ -203,7 +235,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       if (answer === "primary") {
         const loaded = await loadWith(slot, s);
         if (loaded.status !== "ok") return { status: "error", error: loaded.status === "error" ? loaded.error : { code: "http", status: 404, message: "cloud row vanished" } };
-        confirmed(slot, s, loaded.save.revision);
+        confirmed(slot, s, loaded.save.revision, { claim });
         // The player chose "Use cloud": the local payload they were about to send is discarded,
         // so it must not be resurrected by a later background re-flush, and any store or
         // re-flush this user had already queued for the slot must be dropped rather than sent on
@@ -275,7 +307,10 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     // once the session is known, rather than at the top of store() (see payloadKey above).
     lastPayload.set(payloadKey(s.userId, slot), payload);
     const base = state.readRecord(s.userId, slot)?.revision ?? 0;
-    return sendWithConflicts(slot, payload, base, s);
+    // claim: false — a store is not an ownership decision. This flush made no owner check at all,
+    // and its send can outlast an account switch in another tab, so it may only claim a slot that
+    // is unset or already this user's (see confirmed()).
+    return sendWithConflicts(slot, payload, base, s, false);
   }
 
   function store(slot: string, payload: SavePayload): Promise<StoreResult> {
@@ -401,7 +436,10 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         const asReconcile = (result: StoreResult): ReconcileResult =>
           result.status === "stored" ? { status: "stored", revision: result.revision } : result;
         const upload = async (): Promise<ReconcileResult> => {
-          const result = await sendWithConflicts(slot, local as SavePayload, 0, s);
+          // claim: true — this is either the table's own `upload` (the slot is unset or already
+          // this user's) or the ownership prompt's "Upload", which is a deliberate take-over.
+          // Both are ownership decisions made here, at the front of this slot's chain.
+          const result = await sendWithConflicts(slot, local as SavePayload, 0, s, true);
           return result.status === "stored" ? { status: "uploaded", revision: result.revision } : result;
         };
         switch (decision) {
@@ -412,6 +450,9 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             const answer = await prompt.ask(OWNERSHIP_COPY);
             if (disposed) return { status: "error", error: disposedError() };
             if (answer === "primary") return upload();
+            // "Start fresh" claims the slot outright (the direct equivalent of confirmed()'s
+            // claim: true): the player just told us the local save is no longer anyone else's
+            // progress to protect, and the game is about to replace it with defaults.
             state.writeOwner(slot, s.userId);
             // "Start fresh" always discards the local payload the player just rejected, no matter
             // why the record was dirty (a hinted reconcile seeding it above, or an unrelated
@@ -424,7 +465,9 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             return { status: "fresh" };
           }
           case "use_cloud":
-            confirmed(slot, s, (cloud as CloudSave).revision);
+            // claim: true — the local save on this device is being replaced by THIS user's cloud
+            // row, so this user is now demonstrably whose progress it is. A take-over by design.
+            confirmed(slot, s, (cloud as CloudSave).revision, { claim: true });
             // The player had nothing local worth keeping, or the table already decided the cloud
             // row wins outright: either way there is no local payload left to protect.
             lastPayload.delete(payloadKey(s.userId, slot));
@@ -438,7 +481,9 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             const answer = await prompt.ask(CONFLICT_COPY);
             if (disposed) return { status: "error", error: disposedError() };
             if (answer === "primary") {
-              confirmed(slot, s, current.revision);
+              // claim: true — the player answered the ownership question just now, in this chain:
+              // this device's local save becomes this user's cloud row.
+              confirmed(slot, s, current.revision, { claim: true });
               // The player chose "Use cloud": the local edits are discarded, so a background
               // re-flush must not later resurrect them, and neither must a store this user had
               // already queued for the slot behind this reconcile.
@@ -446,11 +491,16 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
               noteDiscard(s.userId, slot);
               return { status: "use_cloud", save: current };
             }
-            return asReconcile(await sendWithConflicts(slot, local as SavePayload, current.revision, s));
+            // claim: true — "Keep this one" is the take-over answer: the player said the local
+            // save is theirs and it is going up as their cloud row.
+            return asReconcile(await sendWithConflicts(slot, local as SavePayload, current.revision, s, true));
           }
           case "current": return { status: "current" };
           case "restore_dirty":
-            return asReconcile(await sendWithConflicts(slot, local as SavePayload, state.readRecord(s.userId, slot)?.revision ?? 0, s));
+            // claim: true — the table only reaches restore_dirty when the slot is unset or already
+            // this user's (decideReconcile sends ownedByOther to conflict_prompt instead), and it
+            // is a reconcile decision made here, at the front of this slot's chain.
+            return asReconcile(await sendWithConflicts(slot, local as SavePayload, state.readRecord(s.userId, slot)?.revision ?? 0, s, true));
         }
       } catch (thrown) {
         // reconcile() never rejects (same contract as load()/store()): a caller-supplied
@@ -507,7 +557,11 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       const base = state.readRecord(s.userId, slot)?.revision ?? 0;
       const outcome = await sendOnce(slot, payload, base, s);
       if (disposed) return;
-      if (outcome.kind === "stored") { confirmed(slot, s, outcome.revision); return; }
+      // claim: false — and this is the path the rule exists for. The owner check above ran BEFORE
+      // sendOnce awaited; while the transport was pending, another tab could sign in as a
+      // different account and claim the slot. Recording the revision for this user stays
+      // truthful; re-asserting the ownership would silently overwrite that newer claim.
+      if (outcome.kind === "stored") { confirmed(slot, s, outcome.revision, { claim: false }); return; }
       if (outcome.kind === "conflict") return; // never prompt; record is already dirty
       if (outcome.kind === "error" && outcome.dirty) {
         state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
@@ -581,6 +635,18 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     //     pre-discard entry: store() refuses to coalesce into an entry whose epoch (or slot
     //     generation, when it has no owner) has moved, dropping that entry for its own waiters and
     //     starting a fresh one stamped with the current values.
+    //
+    // Third invariant, and the one that separates the two kinds of local state: the per-slot
+    // ownership record is only ever changed by a reconcile decision, never by a store or a
+    // background re-flush that finishes after another account claimed the slot. The per-user sync
+    // record has no such rule — it describes the row of the user whose request just succeeded, so
+    // writing it is always truthful — but the owner record is shared by every tab and every
+    // account on this browser and says whose progress the LOCAL save is, a question only the
+    // foreground's ownership prompt (or an explicit use_cloud/conflict answer) can answer. Both
+    // send paths check the owner, if at all, before their transport call awaits, and an account
+    // switch in another tab inside that window is exactly the case: re-asserting the ownership on
+    // success would overwrite the newer claim and leave the kit trusting the OTHER account's
+    // progress as this user's the next time they come back to this device. See confirmed().
     for (const slot of game.slots) {
       const payload = lastPayload.get(payloadKey(s.userId, slot));
       if (payload !== undefined && state.readRecord(s.userId, slot)?.dirty) void quietFlush(slot, payload, s.userId, epochOf(s.userId, slot));
