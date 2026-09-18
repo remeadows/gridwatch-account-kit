@@ -22,7 +22,8 @@ export interface StoreOk {
     updatedAt: string;
 }
 export interface CloudSummary {
-    schemaVersion: number;
+    /** `null` when the server reports a conflict with no cloud row to summarize. */
+    schemaVersion: number | null;
     sizeBytes: number;
     payloadDigest: string;
     deviceId: string | null;

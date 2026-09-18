@@ -176,7 +176,7 @@ export function createSavesClient(deps) {
             pending.set(slot, entry);
         });
     }
-    function reconcile(slot, local) {
+    function reconcile(slot, local, options) {
         assertSlot(slot);
         return serialized(slot, async () => {
             if (disposed)
@@ -196,11 +196,21 @@ export function createSavesClient(deps) {
                     return { status: "error", error: disposedError() };
                 if (!s)
                     return { status: "signed_out" };
+                // The game may hold local edits without ever calling store() (signed out, or stores held
+                // while offline), leaving a clean { revision, dirty: false } record that no longer matches
+                // what's on screen. `localChanged` tells us so: mark the record dirty BEFORE the cloud
+                // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
+                // row, and so a crash or a failed load still leaves the slot protected.
+                let record = state.readRecord(s.userId, slot);
+                if (options?.localChanged === true && local !== null && record !== null && !record.dirty) {
+                    record = { revision: record.revision, dirty: true };
+                    state.writeRecord(s.userId, slot, record);
+                }
                 const loaded = await loadWith(slot, s);
                 if (loaded.status === "error")
                     return loaded;
                 const cloud = loaded.status === "ok" ? loaded.save : null;
-                const decision = decideReconcile({ signedIn: true, cloud, local, record: state.readRecord(s.userId, slot), owner: state.readOwner(slot), userId: s.userId });
+                const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });
                 const asReconcile = (result) => result.status === "stored" ? { status: "stored", revision: result.revision } : result;
                 const upload = async () => {
                     const result = await sendWithConflicts(slot, local, 0, s);

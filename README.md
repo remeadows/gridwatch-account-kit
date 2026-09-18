@@ -9,7 +9,7 @@ Add to your `package.json`:
 ```json
 {
   "dependencies": {
-    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.2.0"
+    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.2.1"
   }
 }
 ```
@@ -45,6 +45,16 @@ await kit.saves!.store("campaign", localCampaign);                      // on ev
 
 A background re-flush — triggered by the `online` event or the tab becoming visible again, for any slot the kit already knows is dirty — never prompts the player. If it hits a 409, the record is simply left dirty for the next foreground `store()` or `reconcile()` call to resolve normally with a prompt; a background flush is not the moment to interrupt play with a "use cloud or keep this one" decision.
 
+Pass `{ localChanged: true }` as a third argument to `reconcile` when the game knows this slot's
+local payload has changes that were never confirmed in the cloud — e.g. the player made edits
+while signed out, or `store` calls were held while offline and never flushed. Without it, a sync
+record that isn't marked dirty is trusted at face value: if another device has since moved the
+cloud forward, `reconcile` silently returns `use_cloud` and replaces the unsynced local progress.
+With the hint, a cloud row that's newer than the local record produces a `conflict_prompt`
+instead, so the player is asked rather than losing work; at equal revisions, the local copy is
+uploaded (the same as any other dirty, in-sync record). The hint is ignored when there's no local
+payload to protect (`local === null`) or no prior record to compare against.
+
 Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SPA): it removes the `online`/`visibilitychange` listeners, closes any prompt dialog that's on screen, settles calls still waiting on the debounce timer or on a prompt immediately, and marks the client disposed so a call that is mid-request settles with `{ status: "error", error: { code: "http", message: "disposed" } }` as soon as its current transport attempt returns (the deadline below bounds that wait); no state is written after `dispose()`.
 
 ### Runtime requirements
@@ -53,7 +63,7 @@ Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SP
 
 ## Exports
 
-- **`.`** — Core utilities: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `PLAY_ALIASES`, `NEXUS_ORIGIN`, `HANDLE_RE`, `validateHandle`, `validateReturnPath`, `signInUrl`, `createAccountKit`, `mountAccountHeader`, plus the full saves client surface: `createSavesClient`, `CONFLICT_COPY`, `OWNERSHIP_COPY`, `createDomPromptHost`, `createSaveStateStore`, `createTransport`, `withRetry`, `decideReconcile`, and their types (`SaveGameConfig`, `SavesClient`, `LoadResult`, `StoreResult`, `ReconcileResult`, `CloudSave`, `SaveError`, `PromptHost`, `PromptCopy`, `PromptAnswer`, `SaveStateStore`, `SyncRecord`, `Transport`, `TransportResult`, `ReconcileDecision`, `ReconcileInputs`) — enough to assemble a `SavesClient` yourself with a custom transport or prompt host, not just through `createAccountKit`.
+- **`.`** — Core utilities: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `PLAY_ALIASES`, `NEXUS_ORIGIN`, `HANDLE_RE`, `validateHandle`, `validateReturnPath`, `signInUrl`, `createAccountKit`, `mountAccountHeader`, plus the full saves client surface: `createSavesClient`, `CONFLICT_COPY`, `OWNERSHIP_COPY`, `createDomPromptHost`, `createSaveStateStore`, `createTransport`, `withRetry`, `decideReconcile`, and their types (`SaveGameConfig`, `SavesClient`, `LoadResult`, `StoreResult`, `ReconcileResult`, `ReconcileOptions`, `CloudSave`, `SaveError`, `PromptHost`, `PromptCopy`, `PromptAnswer`, `SaveStateStore`, `SyncRecord`, `Transport`, `TransportResult`, `ReconcileDecision`, `ReconcileInputs`) — enough to assemble a `SavesClient` yourself with a custom transport or prompt host, not just through `createAccountKit`.
 - **`./react`** — the `useAccount(kit)` React hook (same shape as the apps' former `useAuth`).
 - **`./saves-schema`** — the `/api/saves` wire contract shared by the Nexus worker and the kit client: `SAVE_GAMES`, `resolveSaveGame`, `payloadSchemas`, `validatePayload`, `validateAgainst`, `findDeniedKey`, `DENYLIST`, `canonicalJson`, `requestHash`, `sha256Hex`, `MAX_BODY_BYTES`, `UUID_RE`, `SLOT_RE`, `ALIAS_RE`, and the wire types. DOM-free, dependency-free.
 - **`./header.css`** — Shared styles for the account header.
