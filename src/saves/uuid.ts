@@ -3,6 +3,9 @@
 // it's absent (older browsers, some SSR/test runtimes) instead of failing outright.
 export function uuidV4(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  if (typeof crypto === "undefined" || typeof crypto.getRandomValues !== "function") {
+    throw new Error("[account-kit] crypto.getRandomValues is required for cloud saves");
+  }
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   bytes[6] = (bytes[6]! & 0x0f) | 0x40; // version 4
