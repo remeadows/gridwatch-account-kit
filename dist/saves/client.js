@@ -11,6 +11,12 @@ const MAX_CONFLICT_PROMPTS = 5;
 function disposedError() {
     return { code: "http", message: "disposed" };
 }
+/** One warning, one result, wherever a commit is dropped because the cloud copy won for its slot:
+ *  at the top of flush(), or at store() time when a new call replaces a now-stale pending entry. */
+function discardedStore() {
+    console.warn("[account-kit] dropped a store the player discarded");
+    return { status: "error", error: { code: "http", message: "discarded" } };
+}
 // lastPayload is keyed by user AND slot, never slot alone: a single SavesClient instance
 // outlives a sign-out/sign-in (createAccountKit builds it once), so a slot-only key would let a
 // background re-flush send one account's remembered payload into another account's cloud row.
@@ -45,8 +51,24 @@ export function createSavesClient(deps) {
     // lastPayload (user AND slot), so one account's discard never drops another account's work.
     const discardEpoch = new Map();
     const epochOf = (userId, slot) => discardEpoch.get(payloadKey(userId, slot)) ?? 0;
-    const bumpEpoch = (userId, slot) => discardEpoch.set(payloadKey(userId, slot), epochOf(userId, slot) + 1);
+    // Keyed by SLOT alone, and bumped at every discard beside the per-user epoch. It exists for the
+    // one commit the per-user epoch cannot cover: a store() made before this client has observed any
+    // session at all has no user to key an epoch by (forUser === null), and that is the COMMON
+    // startup shape — the game kicks off its first reconcile() and the player commits while that
+    // reconcile's session lookup or cloud request is still in flight. Without this, that commit
+    // skipped both the owner gate and the epoch gate and flushed on the revision the reconcile had
+    // just confirmed, silently overwriting the cloud copy. Deliberately conservative: ANY user's
+    // discard on the slot drops such an entry, since there is no owner to compare it against.
+    const slotDiscardGen = new Map();
+    const slotGenOf = (slot) => slotDiscardGen.get(slot) ?? 0;
+    const noteDiscard = (userId, slot) => {
+        discardEpoch.set(payloadKey(userId, slot), epochOf(userId, slot) + 1);
+        slotDiscardGen.set(slot, slotGenOf(slot) + 1);
+    };
     const pending = new Map();
+    /** True once a discard has landed for what this entry was stamped with, so it may neither flush
+     *  nor absorb a new store() call. */
+    const staleByDiscard = (e, slot) => e.forUser === null ? e.slotGen !== slotGenOf(slot) : e.epoch !== epochOf(e.forUser, slot);
     const running = new Map();
     // Set by dispose(); checked at the start of every serialized callback and immediately after
     // each await of session()/withRetry/prompt.ask so in-flight work started before dispose()
@@ -156,7 +178,7 @@ export function createSavesClient(deps) {
                 // we were reached from a store()'s own flush, that flush already made its epoch check at
                 // its top, before this call — so it still reports its legitimate use_cloud result.
                 lastPayload.delete(payloadKey(s.userId, slot));
-                bumpEpoch(s.userId, slot);
+                noteDiscard(s.userId, slot);
                 return { status: "use_cloud", save: loaded.save };
             }
             base = outcome.cloudRevision;
@@ -168,7 +190,7 @@ export function createSavesClient(deps) {
         running.set(slot, next);
         return next;
     }
-    async function flush(slot, payload, forUser, epoch) {
+    async function flush(slot, payload, forUser, epoch, slotGen) {
         if (disposed)
             return { status: "error", error: disposedError() };
         const s = await session();
@@ -201,12 +223,15 @@ export function createSavesClient(deps) {
         // The record now sits clean at the cloud revision, so sending would succeed with no 409 and
         // replace the copy they chose with the one they threw away. Checked here, before lastPayload
         // and before any state read/write or transport call, so nothing of this commit survives; every
-        // waiter coalesced into the entry learns the store was dropped rather than stored. (epoch is
-        // null only for the very first store() before any session resolved — see store() below.)
-        if (epoch !== null && epochOf(s.userId, slot) !== epoch) {
-            console.warn("[account-kit] dropped a store the player discarded");
-            return { status: "error", error: { code: "http", message: "discarded" } };
-        }
+        // waiter coalesced into the entry learns the store was dropped rather than stored.
+        if (epoch !== null && epochOf(s.userId, slot) !== epoch)
+            return discardedStore();
+        // The same rule for a commit this client could not attribute to any user (no session had been
+        // observed when store() was called, so there is no epoch to check): any discard on the slot
+        // since then drops it. The OWNER gate above does not apply to such a commit — that residual is
+        // documented and unchanged — but the DISCARD rule has no exception.
+        if (forUser === null && slotGen !== slotGenOf(slot))
+            return discardedStore();
         // store() can't know the signed-in user synchronously, so the payload is remembered here,
         // once the session is known, rather than at the top of store() (see payloadKey above).
         lastPayload.set(payloadKey(s.userId, slot), payload);
@@ -222,36 +247,54 @@ export function createSavesClient(deps) {
         }
         return new Promise((settle) => {
             const existing = pending.get(slot);
-            if (existing && existing.forUser === lastKnownUserId) {
-                // Same observed owner as the pending entry: coalesce as usual, keeping the first caller's
-                // forUser and epoch (a later call here never changes whose commit this is, nor which
-                // discards it predates — a discard between the two calls would have been for this same
-                // user and slot, so the whole coalesced entry is rightly dropped at flush time).
+            if (existing && existing.forUser === lastKnownUserId && !staleByDiscard(existing, slot)) {
+                // Same observed owner as the pending entry, and no discard has landed since it was
+                // created: coalesce as usual, keeping the first caller's forUser, epoch and slotGen (a
+                // later call here never changes whose commit this is, nor which discards it predates).
                 existing.payload = payload;
                 existing.settle.push(settle);
                 return;
             }
             if (existing) {
-                // A different user has been observed since the pending entry was created: it is not safe
-                // to coalesce this payload into that entry (the wrong user's commit would ride along
-                // either way). Drop the stale entry for its own waiters right now, the same way a
-                // mismatched flush() would, and start a fresh entry for this call.
+                // The entry can no longer take this call, and cannot be left to flush either. Drop it for
+                // its own waiters right now, telling them the same thing its own flush() would have —
+                // which is why the discard check comes first for an UNOWNED entry (flush's owner gate
+                // never applies to one, so its only possible drop reason is a discard) and second for an
+                // owned one (flush checks the owner before the epoch).
                 clearTimeout(existing.timer);
                 pending.delete(slot);
-                console.warn("[account-kit] dropped a store made by a different user");
-                existing.settle.forEach((fn) => fn({ status: "signed_out" }));
+                if (staleByDiscard(existing, slot) && existing.forUser === null) {
+                    // A discard landed while this unattributed commit was still waiting. One warning for the
+                    // drop, not one per waiter, so a coalesced entry does not warn twice.
+                    const dropped = discardedStore();
+                    existing.settle.forEach((fn) => fn(dropped));
+                }
+                else if (existing.forUser !== lastKnownUserId) {
+                    // A different user has been observed since the entry was created: it is not safe to
+                    // coalesce this payload into it (the wrong user's commit would ride along either way).
+                    console.warn("[account-kit] dropped a store made by a different user");
+                    existing.settle.forEach((fn) => fn({ status: "signed_out" }));
+                }
+                else {
+                    // Same owner, but their discard epoch moved: the entry predates a choice for the cloud
+                    // copy. THIS call does not — it was made after the discard, so it gets a fresh entry
+                    // below and proceeds normally, exactly as the README promises. One warning per drop.
+                    const dropped = discardedStore();
+                    existing.settle.forEach((fn) => fn(dropped));
+                }
             }
             // Stamp the entry with whoever is (or was last) signed in right now — a later store() call
             // that coalesces into this same entry does not change whose commit this is — and with that
             // user's current discard epoch, so a discard raised between now and the flush drops this
-            // commit instead of overwriting the copy the player chose. No epoch when there is no
-            // observed user to key one by: that is the same documented first-ever-store residual as
-            // forUser === null (there is no prior user, and so no prior discard, to check against).
+            // commit instead of overwriting the copy the player chose. With no observed user there is no
+            // epoch to key by, so such an entry carries the slot's discard generation instead and is
+            // dropped by any discard on the slot (see slotDiscardGen above).
             const forUser = lastKnownUserId;
             const epoch = forUser === null ? null : epochOf(forUser, slot);
-            const entry = { payload, forUser, epoch, settle: [settle], timer: setTimeout(() => {
+            const slotGen = forUser === null ? slotGenOf(slot) : null;
+            const entry = { payload, forUser, epoch, slotGen, settle: [settle], timer: setTimeout(() => {
                     pending.delete(slot);
-                    void serialized(slot, () => flush(slot, entry.payload, entry.forUser, entry.epoch))
+                    void serialized(slot, () => flush(slot, entry.payload, entry.forUser, entry.epoch, entry.slotGen))
                         .then((result) => entry.settle.forEach((fn) => fn(result)))
                         .catch((thrown) => {
                         const message = thrown instanceof Error ? thrown.message : String(thrown);
@@ -332,7 +375,7 @@ export function createSavesClient(deps) {
                         if (record !== null)
                             state.writeRecord(s.userId, slot, { revision: record.revision, dirty: false });
                         lastPayload.delete(payloadKey(s.userId, slot));
-                        bumpEpoch(s.userId, slot);
+                        noteDiscard(s.userId, slot);
                         return { status: "fresh" };
                     }
                     case "use_cloud":
@@ -340,7 +383,7 @@ export function createSavesClient(deps) {
                         // The player had nothing local worth keeping, or the table already decided the cloud
                         // row wins outright: either way there is no local payload left to protect.
                         lastPayload.delete(payloadKey(s.userId, slot));
-                        bumpEpoch(s.userId, slot);
+                        noteDiscard(s.userId, slot);
                         return { status: "use_cloud", save: cloud };
                     case "conflict_prompt": {
                         // The table already decided a prompt is due: never send first (a send on the cloud
@@ -356,7 +399,7 @@ export function createSavesClient(deps) {
                             // re-flush must not later resurrect them, and neither must a store this user had
                             // already queued for the slot behind this reconcile.
                             lastPayload.delete(payloadKey(s.userId, slot));
-                            bumpEpoch(s.userId, slot);
+                            noteDiscard(s.userId, slot);
                             return { status: "use_cloud", save: current };
                         }
                         return asReconcile(await sendWithConflicts(slot, local, current.revision, s));
@@ -469,9 +512,19 @@ export function createSavesClient(deps) {
         // re-flush (just below), re-checked at the moment of use (flush()'s epoch gate, before
         // lastPayload or any state/transport touch, resolving an error "discarded" for every waiter of
         // that entry; quietFlush()'s, which simply returns), and bumped at every discard next to the
-        // lastPayload.delete that accompanies it. It is per user for the same reason lastPayload is:
-        // one account's discard must not drop another account's queued work for that slot. A store
-        // made AFTER the discard captures the new epoch and proceeds normally.
+        // lastPayload.delete that accompanies it (noteDiscard). It is per user for the same reason
+        // lastPayload is: one account's discard must not drop another account's queued work for that
+        // slot. Two consequences worth stating, because both were once wrong:
+        //   - Unlike the owner invariant above, the discard rule has NO first-store exception. A
+        //     commit made before this client observed any session has no user to key an epoch by, so
+        //     it carries the slot's discard generation instead (slotDiscardGen) and any discard on the
+        //     slot drops it — that is the ordinary startup race (a commit made while the game's first
+        //     reconcile() is still in flight), not an exotic one. Only the OWNER check keeps its
+        //     documented exemption for such a commit.
+        //   - A store made AFTER a discard proceeds normally, which means it must not inherit a
+        //     pre-discard entry: store() refuses to coalesce into an entry whose epoch (or slot
+        //     generation, when it has no owner) has moved, dropping that entry for its own waiters and
+        //     starting a fresh one stamped with the current values.
         for (const slot of game.slots) {
             const payload = lastPayload.get(payloadKey(s.userId, slot));
             if (payload !== undefined && state.readRecord(s.userId, slot)?.dirty)
