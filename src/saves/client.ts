@@ -368,14 +368,27 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         let record = state.readRecord(s.userId, slot);
         if (options?.localChanged === true && local !== null) {
           // A background re-flush of this slot must send the player's actual local payload, never
-          // an older one — and never skip the slot for want of one. Seeded on EVERY hinted call
-          // with a local payload, independent of the record: if the record is already dirty (an
-          // earlier failed store() or reconcile() left it so), lastPayload is either unset, in
-          // which case the re-flush would skip this slot entirely, or holds an older payload from
-          // that earlier attempt, which is exactly the stale content this seed exists to replace.
-          lastPayload.set(payloadKey(s.userId, slot), local);
-          // The dirty flag itself is only forced on a CLEAN record: an already-dirty record needs
-          // no help being prompted for, and rewriting it here would gain nothing.
+          // an older one — and never skip the slot for want of one. So this seeds on a hinted
+          // call independent of the record: if the record is already dirty (an earlier failed
+          // store() or reconcile() left it so), lastPayload is either unset, in which case the
+          // re-flush would skip this slot entirely, or holds an older payload from that earlier
+          // attempt, which is exactly the stale content this seed exists to replace.
+          //
+          // But ONLY when the slot is this user's or unclaimed. On a shared device `local` can be
+          // the OTHER account's progress: the owner record names U2 while U1 is signed in, and the
+          // question of whose save this is belongs to decideReconcile's ownedByOther prompt, a few
+          // lines below. Caching it under U1's key before that prompt has been answered — or, as
+          // here, before a failed cloud load returns and the prompt never runs at all — hands a
+          // later background re-flush U2's progress to upload into U1's cloud row, at U1's own
+          // base revision, with no conflict and no prompt. With another owner this seeds nothing.
+          // Anything already remembered for this user+slot is left alone: that is U1's own earlier
+          // payload, and quietFlush's owner guard keeps it from being sent while the slot is
+          // someone else's.
+          const owner = state.readOwner(slot);
+          if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), local);
+          // The dirty flag itself is only forced on a CLEAN record, and is safe regardless of the
+          // owner: decideReconcile raises ownership_prompt on ownedByOther whether or not the
+          // record is dirty, so marking it cannot turn a prompt into a silent upload.
           if (record !== null && !record.dirty) {
             record = { revision: record.revision, dirty: true };
             state.writeRecord(s.userId, slot, record);
@@ -476,6 +489,15 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       // selected for this re-flush. The dirty re-read below usually catches that too (a discard
       // confirms the record clean), but not if something marked the slot dirty again in between.
       if (epochOf(s.userId, slot) !== epoch) return;
+      // Whose slot this is, is a question the foreground answers with a prompt (decideReconcile's
+      // ownedByOther → ownership_prompt, "Start fresh" or take over). A background flush must
+      // never answer it by uploading, so it stops here while the slot is recorded to another
+      // account — defence in depth behind the seeding rule in reconcile()'s hint block: even if
+      // something did cache a payload that is not this user's, it cannot leave the client this
+      // way. A record left dirty by this simply stays dirty until a foreground reconcile settles
+      // the ownership; nothing is lost, it only waits.
+      const slotOwner = state.readOwner(slot);
+      if (slotOwner !== null && slotOwner !== ownerUserId) return;
       // A foreground conflict prompt (store()/reconcile()) may have been running when this quiet
       // flush was queued behind it; by the time it's our turn, the player may already have
       // resolved that conflict and cleared dirty. Re-read it now, inside the serialized callback,
@@ -523,6 +545,15 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     // caller made the call. That's the intended contract (it's why the usage example calls
     // reconcile() once the session is already known), and it's exactly the case the per-slot
     // ownership record and its take-over prompt ("fresh") exist to handle.
+    //
+    // One exception, and the reason it is narrow: a hinted reconcile DOES remember its `local`
+    // payload, so that a re-flush of an already-dirty slot sends what the player actually has
+    // rather than an older attempt. That seed is therefore restricted to a slot this user owns or
+    // that nobody owns — on a shared device `local` can be the other account's progress, and
+    // whose save it is belongs to the ownership prompt, not to a cache written before that prompt
+    // has run (or before a failed cloud load returns and it never runs at all). quietFlush()
+    // carries the matching guard: it stops while the slot is recorded to another account, so a
+    // background path never settles an ownership question by uploading.
     //
     // Second invariant, on the same delayed paths and for the same reason (something captured now,
     // used after other async work has run): once the player DISCARDS a slot's local copy — the

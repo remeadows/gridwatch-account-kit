@@ -433,6 +433,72 @@ describe("reconcile", () => {
       expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
       expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
     });
+    it("seeds NOTHING when the slot belongs to another account, so a later background re-flush cannot upload that account's progress", async () => {
+      const h = harness();
+      h.state.writeOwner("campaign", "u2"); // shared device: the local save is U2's
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true }); // U1 dirty from an earlier failed store
+      const u2Local = { ...campaign, coins: 77 };
+
+      // The load fails, so the call returns before decideReconcile could raise the ownership or
+      // conflict prompt that is supposed to settle who owns this slot.
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      expect(await h.client.reconcile("campaign", u2Local, { localChanged: true })).toMatchObject({ status: "error", error: { code: "network" } });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+
+      h.store.mockResolvedValue(ok(200, { revision: 4, updatedAt: "t" }));
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).not.toHaveBeenCalled();
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+    });
+    it("leaves this user's OWN remembered payload untouched when the slot turns out to belong to another account", async () => {
+      const h = harness();
+      const a = { ...campaign, coins: 11 };
+      const u2Local = { ...campaign, coins: 77 };
+      // U1's own store fails: the record goes dirty and payload A is remembered under U1's key.
+      h.store.mockResolvedValue({ kind: "network", message: "offline" });
+      expect((await h.client.store("campaign", a)).status).toBe("error");
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+
+      h.state.writeOwner("campaign", "u2"); // the slot turns out to be U2's
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      expect(await h.client.reconcile("campaign", u2Local, { localChanged: true })).toMatchObject({ status: "error", error: { code: "network" } });
+
+      h.store.mockReset();
+      h.store.mockResolvedValue(ok(200, { revision: 1, updatedAt: "t" }));
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).not.toHaveBeenCalled(); // a background path never settles an ownership question
+
+      // A's survival is proved by handing the slot back to U1: the re-flush then carries A, never U2's.
+      h.state.writeOwner("campaign", "u1");
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][1].payload).toEqual(a);
+    });
+    it("still seeds on an UNCLAIMED slot (no owner record), so the re-flush carries the hinted payload", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+      const newerLocalEdits = { ...campaign, coins: 99 };
+      expect(h.state.readOwner("campaign")).toBeNull();
+
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      expect(await h.client.reconcile("campaign", newerLocalEdits, { localChanged: true })).toMatchObject({ status: "error", error: { code: "network" } });
+
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][1].payload).toEqual(newerLocalEdits);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
+    });
     it("'Start fresh' after a hinted reconcile clears the pre-load dirty seed instead of leaving the discarded local payload flagged for background upload", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
@@ -573,6 +639,24 @@ describe("background re-flush", () => {
 
     expect(h.store).toHaveBeenCalledTimes(1); // no second PUT from the stale queued re-flush
     expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+  });
+  it("stops when the slot turns out to belong to another account, even with this user's own payload remembered and its own record dirty", async () => {
+    const h = harness();
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+
+    // Another account claims the slot before the retry window (a shared device, or a foreground
+    // reconcile under the other account). Who owns this slot is a question the foreground answers
+    // with a prompt; a background flush must not answer it by uploading.
+    h.state.writeOwner("campaign", "u2");
+    h.store.mockReset();
+    h.store.mockResolvedValue(ok(200, { revision: 1, updatedAt: "t" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+
+    expect(h.store).not.toHaveBeenCalled();
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true }); // still dirty, waiting for the foreground
   });
   it("never sends one account's remembered payload under another account's session, even though the client instance outlives sign-out/sign-in (cross-user repro)", async () => {
     const h = harness(); // starts as u1
