@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { canonicalJson, requestHash, sha256Hex } from "../src/saves-schema/canonical";
 
@@ -38,6 +39,22 @@ describe("canonicalJson", () => {
     expect(() => canonicalJson("\uD800")).toThrow(TypeError);
     expect(() => canonicalJson({ "\uDC00": 1 })).toThrow(TypeError);
     expect(() => canonicalJson("😀")).not.toThrow();
+  });
+  it("rejects a trailing high surrogate with nothing after it", () => {
+    expect(() => canonicalJson("a\uD83D")).toThrow(/canonicalJson: lone surrogate at \$/);
+  });
+  it("rejects a leading low surrogate with nothing before it", () => {
+    expect(() => canonicalJson("\uDE00a")).toThrow(/canonicalJson: lone surrogate at \$/);
+  });
+  it("rejects a high surrogate immediately followed by a valid surrogate pair (the first one is lone)", () => {
+    expect(() => canonicalJson("\uD83D😀")).toThrow(/canonicalJson: lone surrogate at \$/);
+  });
+  it("accepts a valid surrogate pair in the middle of a longer string", () => {
+    expect(() => canonicalJson("before😀after")).not.toThrow();
+  });
+  it("builds without a regex lookbehind, so the module still parses on engines that lack it (e.g. Safari < 16.4)", () => {
+    const source = readFileSync(new URL("../src/saves-schema/canonical.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/\(\?<[!=]/);
   });
 });
 

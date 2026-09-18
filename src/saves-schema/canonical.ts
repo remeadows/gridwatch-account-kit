@@ -5,10 +5,28 @@ import { LIMITS } from "./validate.js";
 // RFC 8785 rejects a string containing an unpaired UTF-16 surrogate; JSON.stringify silently
 // escapes it instead of rejecting it, so this must be checked explicitly for every string that
 // goes through canonicalJson, values and object keys alike.
-const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+//
+// This is a manual code-unit scan rather than a regex lookbehind assertion: lookbehind is a
+// PARSE-time feature, so having one anywhere in this module would fail to even load on an
+// engine that lacks it (Safari < 16.4), taking the whole saves-schema module down with it.
+function hasLoneSurrogate(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      // High surrogate: must be immediately followed by a low surrogate.
+      const next = text.charCodeAt(i + 1);
+      if (Number.isNaN(next) || next < 0xdc00 || next > 0xdfff) return true;
+      i++; // consume the valid pair
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      // A low surrogate reached without having consumed a preceding high surrogate is lone.
+      return true;
+    }
+  }
+  return false;
+}
 
 function assertWellFormedString(value: string, path: string): void {
-  if (LONE_SURROGATE_RE.test(value)) throw new TypeError(`canonicalJson: lone surrogate at ${path}`);
+  if (hasLoneSurrogate(value)) throw new TypeError(`canonicalJson: lone surrogate at ${path}`);
 }
 
 function assertJsonValue(value: unknown, path: string): void {

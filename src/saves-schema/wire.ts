@@ -8,7 +8,13 @@ export type SavePayload = Record<string, unknown>;
 export interface SaveRow { slot: string; schemaVersion: number; revision: number; payload: SavePayload; updatedAt: string }
 export interface StoreRequest { schemaVersion: number; baseRevision: number; payload: SavePayload; deviceId: string; idempotencyKey: string }
 export interface StoreOk { revision: number; updatedAt: string }
-export interface CloudSummary { schemaVersion: number; sizeBytes: number; payloadDigest: string; deviceId: string | null }
+export interface CloudSummary {
+  /** `null` when the server reports a conflict with no cloud row to summarize. */
+  schemaVersion: number | null;
+  sizeBytes: number;
+  payloadDigest: string;
+  deviceId: string | null;
+}
 export interface ConflictBody { error: "conflict"; cloud: { revision: number; updatedAt: string; summary: CloudSummary } }
 export type SaveErrorCode =
   | "no_save" | "conflict" | "unknown_game" | "unknown_slot" | "not_found" | "method_not_allowed"
