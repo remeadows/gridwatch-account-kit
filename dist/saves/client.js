@@ -197,16 +197,23 @@ export function createSavesClient(deps) {
     async function flush(slot, payload, forUser, epoch, slotGen) {
         if (disposed)
             return { status: "error", error: disposedError() };
+        // Precedence, applied identically at every exit that can produce an outcome for a captured
+        // commit: disposed > discarded > everything else. The stamp check needs no session, so it runs
+        // before the session is even resolved — deps.getSession is caller-supplied and may reject (an
+        // expired refresh token, a network hiccup), and a commit the player's choice already
+        // invalidated must not be reported as a transient session failure the caller will retry. The
+        // same reasoning covers the signed_out return below: the choice outranks the state of the
+        // session, and signed_out is precisely the result the README says a caller may retry after the
+        // next sign-in — which would resurrect the save the cloud copy replaced.
+        const stamp = { forUser, epoch, slotGen };
+        if (staleByDiscard(stamp, slot))
+            return discardedStore();
         const s = await session();
         if (disposed)
             return { status: "error", error: disposedError() };
-        // Judged before the signed-out return below, because the player's choice outranks the state of
-        // the session: if a discard landed for what this commit was stamped with, it is dead whether or
-        // not anyone is signed in now. Reporting signed_out here instead would tell the caller the
-        // ordinary "nothing was sent, try again later" story, and the README asks callers to retry
-        // exactly that — resurrecting, after the next sign-in, the very save the cloud copy replaced.
-        // Only the disposed checks outrank this: after dispose() the client says nothing else.
-        if (staleByDiscard({ forUser, epoch, slotGen }, slot))
+        // Again after the await: a discard can land DURING it (the session lookup is asynchronous, and
+        // a reconcile at the front of this slot's chain can resolve in that window).
+        if (staleByDiscard(stamp, slot))
             return discardedStore();
         if (!s)
             return { status: "signed_out" };
@@ -269,24 +276,23 @@ export function createSavesClient(deps) {
                 // owned one (flush checks the owner before the epoch).
                 clearTimeout(existing.timer);
                 pending.delete(slot);
-                if (staleByDiscard(existing, slot) && existing.forUser === null) {
-                    // A discard landed while this unattributed commit was still waiting. One warning for the
-                    // drop, not one per waiter, so a coalesced entry does not warn twice.
+                if (staleByDiscard(existing, slot)) {
+                    // A discard landed for what that entry was stamped with — whoever made it, and whoever
+                    // is signed in now. Same precedence as flush(): the player's choice is reported ahead of
+                    // any session or owner reason, because it is the one outcome that must never be retried,
+                    // while signed_out invites exactly that. THIS call is not affected: it was made after
+                    // the discard, so it gets a fresh entry below and proceeds normally, as the README
+                    // promises. One warning for the drop, not one per coalesced waiter.
                     const dropped = discardedStore();
                     existing.settle.forEach((fn) => fn(dropped));
-                }
-                else if (existing.forUser !== lastKnownUserId) {
-                    // A different user has been observed since the entry was created: it is not safe to
-                    // coalesce this payload into it (the wrong user's commit would ride along either way).
-                    console.warn("[account-kit] dropped a store made by a different user");
-                    existing.settle.forEach((fn) => fn({ status: "signed_out" }));
                 }
                 else {
-                    // Same owner, but their discard epoch moved: the entry predates a choice for the cloud
-                    // copy. THIS call does not — it was made after the discard, so it gets a fresh entry
-                    // below and proceeds normally, exactly as the README promises. One warning per drop.
-                    const dropped = discardedStore();
-                    existing.settle.forEach((fn) => fn(dropped));
+                    // Not stale, so the only remaining reason is that a different user has been observed
+                    // since the entry was created: it is not safe to coalesce this payload into it (the
+                    // wrong user's commit would ride along either way), and its own flush would have said
+                    // signed_out too.
+                    console.warn("[account-kit] dropped a store made by a different user");
+                    existing.settle.forEach((fn) => fn({ status: "signed_out" }));
                 }
             }
             // Stamp the entry with whoever is (or was last) signed in right now — a later store() call
@@ -431,6 +437,13 @@ export function createSavesClient(deps) {
         return serialized(slot, async () => {
             if (disposed)
                 return;
+            // Same precedence as flush(), for the same reason and in the same position: the stamp this
+            // re-flush was selected under needs no session, so it is checked before one is resolved.
+            // This path has no caller to inform — the only question is whether it can SEND a payload the
+            // player discarded — but keeping the order identical means a rejecting or slow getSession
+            // cannot get between the discard and the check, and one rule covers both paths.
+            if (epochOf(ownerUserId, slot) !== epoch)
+                return;
             const s = await session();
             if (disposed)
                 return;
@@ -444,11 +457,10 @@ export function createSavesClient(deps) {
             // ownerUserId's payload, record, or revision.
             if (s.userId !== ownerUserId)
                 return;
-            // Same window, different loss: the player may have DISCARDED this slot's local copy while
-            // this re-flush sat in the queue, in which case the payload selected for it is exactly the
-            // work they threw away. The dirty re-read below usually catches that (a discard confirms the
-            // record clean), but not if something marked the slot dirty again in between — so check the
-            // epoch it was selected under before touching anything.
+            // The discard check again, now against the session that actually resolved: a discard can
+            // land DURING the session lookup, and the player may have thrown away exactly the payload
+            // selected for this re-flush. The dirty re-read below usually catches that too (a discard
+            // confirms the record clean), but not if something marked the slot dirty again in between.
             if (epochOf(s.userId, slot) !== epoch)
                 return;
             // A foreground conflict prompt (store()/reconcile()) may have been running when this quiet

@@ -1154,6 +1154,87 @@ describe("a store made after a discard never coalesces into the pre-discard entr
     warn.mockRestore();
   });
 
+  it("an OWNED entry a discard invalidated reports discarded even when a DIFFERENT user is observed before the timer", async () => {
+    const h = harness({ access_token: "tok", user: { id: "u1" } }, 200);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.state.writeOwner("campaign", "u1");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const byU1 = h.client.store("campaign", { ...campaign, coins: 1 });
+    h.load.mockResolvedValueOnce(ok(200, row(5)));
+    expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "use_cloud", save: cloud5 });
+
+    // U2 signs in, is OBSERVED, and commits for the same slot while U1's entry is still pending.
+    h.setSession({ access_token: "tok2", user: { id: "u2" } });
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign");
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t2" }));
+    const byU2 = h.client.store("campaign", { ...campaign, coins: 2 });
+
+    // The discard invalidated U1's entry before the user switch made it unsendable: the player
+    // must be told it was discarded (never retry) rather than signed_out (retryable).
+    expect(await byU1).toEqual(discarded);
+    expect(await byU2).toEqual({ status: "stored", revision: 1, updatedAt: "t2" });
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][2]).toBe("tok2");
+    expect(warn.mock.calls.filter((c) => c[0] === "[account-kit] dropped a store the player discarded")).toHaveLength(1);
+    expect(warn).not.toHaveBeenCalledWith("[account-kit] dropped a store made by a different user");
+    warn.mockRestore();
+  });
+
+  // A client whose session provider can be made to reject, the way a caller-supplied
+  // getSession (network hiccup, expired refresh token) can at any moment.
+  function failableHarness(debounceMs: number) {
+    localStorage.clear();
+    const load = vi.fn<Transport["load"]>();
+    const store = vi.fn<Transport["store"]>();
+    const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
+    const state = createSaveStateStore(game.gameSlug);
+    let rejecting = false;
+    const client = createSavesClient({
+      game,
+      getSession: async () => { if (rejecting) throw new Error("boom"); return { access_token: "tok", user: { id: "u1" } }; },
+      state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs,
+    });
+    clients.push(client);
+    return { client, load, store, state, startRejecting: () => { rejecting = true; } };
+  }
+
+  it("a discard-invalidated store reports discarded even when the session provider itself rejects", async () => {
+    const h = failableHarness(200);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.state.writeOwner("campaign", "u1");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const pending = h.client.store("campaign", { ...campaign, coins: 1 });
+    h.load.mockResolvedValueOnce(ok(200, row(5)));
+    expect(await h.client.reconcile("campaign", campaign)).toEqual({ status: "use_cloud", save: cloud5 });
+    h.startRejecting(); // the session provider starts failing before the debounce window elapses
+
+    expect(await pending).toEqual(discarded);
+    expect(h.store).not.toHaveBeenCalled();
+    expect(warn.mock.calls.filter((c) => c[0] === "[account-kit] dropped a store the player discarded")).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it("a rejecting session provider with NO discard behind it still reports the session error", async () => {
+    const h = failableHarness(200);
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    await h.client.load("campaign"); // prime lastKnownUserId = u1
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const pending = h.client.store("campaign", campaign);
+    h.startRejecting();
+
+    expect(await pending).toEqual({ status: "error", error: { code: "http", message: "boom" } });
+    expect(h.store).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it("a queued store with NO discard behind it still reports signed_out when the user signs out before the flush", async () => {
     const h = harness({ access_token: "tok", user: { id: "u1" } }, 200);
     h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
