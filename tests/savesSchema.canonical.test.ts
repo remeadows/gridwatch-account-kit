@@ -75,11 +75,12 @@ describe("canonicalJson", () => {
   });
   it("hasLoneSurrogate agrees with an independent reference implementation across thousands of random strings (differential test)", () => {
     const rand = mulberry32(20260917);
-    // 'a' (plain), a lone high surrogate, a lone low surrogate, and a valid pair — random
-    // concatenations of these cover lone surrogates in every position (start/middle/end,
-    // adjacent to another lone surrogate, adjacent to a valid pair) far more thoroughly than
-    // the handful of cases spelled out above.
-    const alphabet = ["a", "\uD83D", "\uDE00", "😀"];
+    // 'a' (plain), the surrogate range endpoints (0xD800/0xDBFF for high, 0xDC00/0xDFFF for low —
+    // off-by-one errors at a range boundary are exactly what a handful of hand-picked mid-range
+    // examples would miss), an arbitrary high/low pair, and a valid pair. Random concatenations of
+    // these cover lone surrogates in every position (start/middle/end, adjacent to another lone
+    // surrogate, adjacent to a valid pair) far more thoroughly than the cases spelled out above.
+    const alphabet = ["a", "\uD800", "\uDBFF", "\uDC00", "\uDFFF", "\uD83D", "\uDE00", "😀"];
     for (let trial = 0; trial < 5000; trial++) {
       const length = Math.floor(rand() * 8);
       let s = "";
