@@ -391,11 +391,12 @@ export function createSavesClient(deps) {
                         return { status: "error", error: { code: "invalid_payload", message: valid.detail } };
                     }
                 }
-                const s = await session();
+                const resolved = await session();
                 if (disposed)
                     return { status: "error", error: disposedError() };
-                if (!s)
+                if (!resolved)
                     return { status: "signed_out" };
+                let s = resolved; // re-assigned only to the SAME user's refreshed session, below
                 let record = state.readRecord(s.userId, slot);
                 /** Everything the `localChanged` hint does, in one place, because `current` (below) has to
                  *  do exactly the same thing when its re-read comes back different — the whole point of
@@ -486,6 +487,9 @@ export function createSavesClient(deps) {
                         return { status: "error", error: disposedError() };
                     if (!now || now.userId !== s.userId)
                         return { status: "signed_out" };
+                    // Same user: carry the freshly resolved session forward, so a token that refreshed while
+                    // the GET was pending is what any send below uses.
+                    s = now;
                     let fresh;
                     let reread = false;
                     try {

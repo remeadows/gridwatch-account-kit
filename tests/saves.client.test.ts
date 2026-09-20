@@ -790,6 +790,21 @@ describe("reconcile", () => {
       expect(await pending).toEqual({ status: "current" });
     });
 
+    it("sends with the token it re-resolved, not the one captured before the GET", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+      const pending = h.client.reconcile("campaign", L0, { current: () => L1 }); // moved, cloud unmoved → upload
+      await flush();
+      h.setSession({ access_token: "tok-refreshed", user: { id: "u1" } });
+      releaseLoad(ok(200, row(3)));
+      expect(await pending).toEqual({ status: "stored", revision: 4 });
+      expect(h.store.mock.calls[0][2]).toBe("tok-refreshed");
+    });
+
     it("a `current` that returns the same payload leaves today's behavior byte for byte", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
