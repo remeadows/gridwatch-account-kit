@@ -805,6 +805,20 @@ describe("reconcile", () => {
       expect(h.store.mock.calls[0][2]).toBe("tok-refreshed");
     });
 
+    it("settles the dirty flag on the record as it is NOW, not as it was before the cloud load", async () => {
+      const h = harness(undefined, 0);
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+      h.state.writeOwner("campaign", "u1");
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      const pending = h.client.reconcile("campaign", L0, { current: () => null });
+      await flush();
+      h.state.writeRecord("u1", "campaign", { revision: 7, dirty: true }); // another tab confirmed newer revisions meanwhile
+      releaseLoad(ok(404, { error: "no_save" }));
+      expect(await pending).toEqual({ status: "nothing" });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false }); // not rolled back to 3
+    });
+
     it("a `current` that returns the same payload leaves today's behavior byte for byte", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });

@@ -482,9 +482,15 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         const noteLocalGone = (): void => {
           lastPayload.delete(payloadKey(s.userId, slot));
           noteDiscard(s.userId, slot);
-          if (record !== null && record.dirty) {
-            record = { revision: record.revision, dirty: false };
+          // Re-read rather than reuse `record`: it was captured before the awaited cloud load, and
+          // another tab sharing this storage may have confirmed a newer revision since. Writing the
+          // old one back would roll the record behind the cloud row.
+          const latest = state.readRecord(s.userId, slot);
+          if (latest !== null && latest.dirty) {
+            record = { revision: latest.revision, dirty: false };
             state.writeRecord(s.userId, slot, record);
+          } else {
+            record = latest;
           }
         };
         // The game may hold local edits without ever calling store() (signed out, or stores held
