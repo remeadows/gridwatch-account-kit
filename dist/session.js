@@ -72,6 +72,7 @@ export function createAccountKit(input) {
             state: createSaveStateStore(input.game.gameSlug),
             transport: createTransport(`${config.nexusOrigin.replace(/\/+$/, "")}/api/saves/${input.game.routeAlias}`),
             prompt: createDomPromptHost(),
+            onBackgroundStored: input.onBackgroundStored,
         })
         : undefined;
     return {

@@ -1,3 +1,4 @@
+import { canonicalJson } from "../saves-schema/canonical.js";
 import { validatePayload } from "../saves-schema/games.js";
 import { MAX_BODY_BYTES } from "../saves-schema/wire.js";
 import type { ConflictBody, SavePayload, SaveRow, StoreRequest } from "../saves-schema/wire.js";
@@ -17,6 +18,17 @@ export interface SavesClientDeps {
   sleep?: (ms: number) => Promise<void>;
   debounceMs?: number;
   windowRef?: Window | null;
+  /** Called after a background re-flush (online / visibilitychange) stored a slot successfully,
+   *  so a game that keeps its own "unsynced" marker can clear it — that flush has no caller to
+   *  resolve. Only that path fires it: never a foreground store()/reconcile(), never a flush that
+   *  conflicted, errored, was discarded, stopped at another account's claim, or raced dispose().
+   *  A throw is contained with one warning. */
+  /** `userId` is the account whose cloud row the payload landed in. A background send can outlast a
+   *  sign-out or an account switch, so a game whose bookkeeping is not per-user must compare it to
+   *  whoever is signed in now before acting on the notification. It reports that THIS payload
+   *  landed, not that the slot is up to date — a newer store() may be queued behind it — so compare
+   *  `payload` to the slot's current state before clearing any "unsynced" marker. */
+  onBackgroundStored?: (slot: string, payload: SavePayload, revision: number, userId: string) => void;
 }
 
 type Session = { token: string; userId: string };
@@ -55,6 +67,13 @@ function isSaveRow(value: unknown, slot: string): value is SaveRow {
 
 function toCloudSave(row: SaveRow): CloudSave {
   return { revision: row.revision, schemaVersion: row.schemaVersion, payload: row.payload, updatedAt: row.updatedAt };
+}
+
+/** True for anything with a callable `then`. Used only to contain a caller-supplied callback that
+ *  turns out to be async: the declared return type is void, but a game can hand us an `async`
+ *  function whose rejection would otherwise escape a synchronous try/catch. */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return typeof (value as PromiseLike<unknown> | null | undefined)?.then === "function";
 }
 
 function errorFor(result: TransportResult): SaveError {
@@ -380,6 +399,20 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
 
   function reconcile(slot: string, local: SavePayload | null, options?: ReconcileOptions): Promise<ReconcileResult> {
     assertSlot(slot);
+    // What `current()` is later compared against is the payload AS IT WAS at this call, taken here,
+    // synchronously, before the slot's queue or any request is awaited. A game that keeps one
+    // mutable save object and returns it from current() hands us the same reference twice: compared
+    // live, a payload mutated in place while the GET was pending would always look "unchanged" —
+    // the exact window the option exists to close. Only computed when the option is used; a value
+    // that cannot be canonicalized is reported where the comparison would have happened.
+    let passedCanonical: { ok: true; json: string } | { ok: false; message: string } | null = null;
+    if (options?.current !== undefined) {
+      try {
+        passedCanonical = { ok: true, json: canonicalJson(local) };
+      } catch (thrown) {
+        passedCanonical = { ok: false, message: thrown instanceof Error ? thrown.message : String(thrown) };
+      }
+    }
     return serialized(slot, async () => {
       if (disposed) return { status: "error", error: disposedError() };
       try {
@@ -392,35 +425,35 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             return { status: "error", error: { code: "invalid_payload", message: valid.detail } };
           }
         }
-        const s = await session();
+        const resolved = await session();
         if (disposed) return { status: "error", error: disposedError() };
-        if (!s) return { status: "signed_out" };
-        // The game may hold local edits without ever calling store() (signed out, or stores held
-        // while offline), leaving a clean { revision, dirty: false } record that no longer matches
-        // what's on screen. `localChanged` tells us so: mark the record dirty BEFORE the cloud
-        // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
-        // row, and so a crash or a failed load still leaves the slot protected.
+        if (!resolved) return { status: "signed_out" };
+        let s: Session = resolved; // re-assigned only to the SAME user's refreshed session, below
         let record = state.readRecord(s.userId, slot);
-        if (options?.localChanged === true && local !== null) {
-          // A background re-flush of this slot must send the player's actual local payload, never
-          // an older one — and never skip the slot for want of one. So this seeds on a hinted
-          // call independent of the record: if the record is already dirty (an earlier failed
-          // store() or reconcile() left it so), lastPayload is either unset, in which case the
-          // re-flush would skip this slot entirely, or holds an older payload from that earlier
-          // attempt, which is exactly the stale content this seed exists to replace.
-          //
-          // But ONLY when the slot is this user's or unclaimed. On a shared device `local` can be
-          // the OTHER account's progress: the owner record names U2 while U1 is signed in, and the
-          // question of whose save this is belongs to decideReconcile's ownedByOther prompt, a few
-          // lines below. Caching it under U1's key before that prompt has been answered — or, as
-          // here, before a failed cloud load returns and the prompt never runs at all — hands a
-          // later background re-flush U2's progress to upload into U1's cloud row, at U1's own
-          // base revision, with no conflict and no prompt. With another owner this seeds nothing.
-          // Anything already remembered for this user+slot is left alone: that is U1's own earlier
-          // payload, and quietFlush's owner guard keeps it from being sent while the slot is
-          // someone else's.
+        /** Everything the `localChanged` hint does, in one place, because `current` (below) has to
+         *  do exactly the same thing when its re-read comes back different — the whole point of
+         *  that option is that a moved local payload is indistinguishable from a caller-hinted one.
+         *
+         *  A background re-flush of this slot must send the player's actual local payload, never
+         *  an older one — and never skip the slot for want of one. So this seeds on a hinted
+         *  call independent of the record: if the record is already dirty (an earlier failed
+         *  store() or reconcile() left it so), lastPayload is either unset, in which case the
+         *  re-flush would skip this slot entirely, or holds an older payload from that earlier
+         *  attempt, which is exactly the stale content this seed exists to replace.
+         *
+         *  But ONLY when the slot is this user's or unclaimed. On a shared device `local` can be
+         *  the OTHER account's progress: the owner record names U2 while U1 is signed in, and the
+         *  question of whose save this is belongs to decideReconcile's ownedByOther prompt, a few
+         *  lines below. Caching it under U1's key before that prompt has been answered — or,
+         *  before a failed cloud load returns and the prompt never runs at all — hands a
+         *  later background re-flush U2's progress to upload into U1's cloud row, at U1's own
+         *  base revision, with no conflict and no prompt. With another owner this seeds nothing.
+         *  Anything already remembered for this user+slot is left alone: that is U1's own earlier
+         *  payload, and quietFlush's owner guard keeps it from being sent while the slot is
+         *  someone else's. */
+        const noteLocalChanged = (payload: SavePayload): void => {
           const owner = state.readOwner(slot);
-          if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), local);
+          if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), payload);
           // The dirty flag itself is only forced on a CLEAN record, and is safe regardless of the
           // owner: decideReconcile raises ownership_prompt on ownedByOther whether or not the
           // record is dirty, so marking it cannot turn a prompt into a silent upload.
@@ -428,10 +461,155 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             record = { revision: record.revision, dirty: true };
             state.writeRecord(s.userId, slot, record);
           }
-        }
+        };
+        /** The mirror image, for a `current` that reports the local payload is GONE (below). Every
+         *  piece of per-user state this client holds for a slot describes one thing — that slot's
+         *  unsynced local save for this user — so when the game says there is no such save any
+         *  more, none of it may survive to be uploaded later:
+         *    - the remembered payload, whether this call's own hint seeded it moments ago or an
+         *      earlier failed store() left it, is a snapshot of exactly what was disowned;
+         *    - the discard epoch is bumped for the same reason the prompts' "Use cloud" bumps it:
+         *      a store still inside its debounce window, or one whose flush is already queued
+         *      behind this reconcile, carries its own copy of that payload and would otherwise
+         *      flush it on top of whatever the cloud holds;
+         *    - the dirty flag is what keeps the slot queued for a background re-flush at all, and
+         *      with no payload left to protect it is simply false. The revision is kept (it still
+         *      describes this user's cloud row), and a slot this user never synced keeps its null
+         *      record rather than gaining a fabricated one.
+         *  The OWNER record is deliberately untouched: whose progress the local save on this
+         *  device is remains a question only the foreground's ownership prompt answers, and "the
+         *  game has no local payload right now" is not an answer to it. */
+        const noteLocalGone = (): void => {
+          lastPayload.delete(payloadKey(s.userId, slot));
+          noteDiscard(s.userId, slot);
+          // Re-read rather than reuse `record`: it was captured before the awaited cloud load, and
+          // another tab sharing this storage may have confirmed a newer revision since. Writing the
+          // old one back would roll the record behind the cloud row.
+          const latest = state.readRecord(s.userId, slot);
+          if (latest !== null && latest.dirty) {
+            record = { revision: latest.revision, dirty: false };
+            state.writeRecord(s.userId, slot, record);
+          } else {
+            record = latest;
+          }
+        };
+        // The game may hold local edits without ever calling store() (signed out, or stores held
+        // while offline), leaving a clean { revision, dirty: false } record that no longer matches
+        // what's on screen. `localChanged` tells us so: mark the record dirty BEFORE the cloud
+        // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
+        // row, and so a crash or a failed load still leaves the slot protected.
+        if (options?.localChanged === true && local !== null) noteLocalChanged(local);
         const loaded = await loadWith(slot, s);
         if (loaded.status === "error") return loaded;
         const cloud = loaded.status === "ok" ? loaded.save : null;
+        // The cloud GET above can take seconds, and the game's save for this slot can move inside
+        // that window. Deciding on the payload the caller handed us before the GET would then let
+        // an automatic use_cloud replace a change the game has already made — silent loss the game
+        // cannot repair afterwards, because by then this call has confirmed the cloud revision.
+        // `current` is the re-read, and it happens HERE: after the cloud row is known and with no
+        // await between it and the decision, so nothing can move in between. Once per reconcile,
+        // and only on a call that actually reaches a decision.
+        if (options?.current !== undefined) {
+          // The re-read looks at the game's live state, and this client outlives a sign-out and
+          // sign-in: if the account changed while the GET above was pending, that state may now
+          // be ANOTHER account's, while the decision and any send below still carry the session
+          // captured for this one. Re-resolve it first and stop if it is no longer the same user
+          // — before current() runs, so there is still no await between the re-read and the
+          // decision. Nothing has been written for this call yet (the `localChanged` hint's
+          // seed-and-dirty is this user's own and stays truthful).
+          const now = await session();
+          if (disposed) return { status: "error", error: disposedError() };
+          if (!now || now.userId !== s.userId) return { status: "signed_out" };
+          // Same user: carry the freshly resolved session forward, so a token that refreshed while
+          // the GET was pending is what any send below uses.
+          s = now;
+          let fresh: SavePayload | null | undefined;
+          let reread = false;
+          try {
+            fresh = options.current();
+            reread = true;
+          } catch (thrown) {
+            // Contained, not reported: a re-read the game could not answer is not a reason to fail
+            // a reconcile, and the passed payload is still a truthful (if older) snapshot. One
+            // warning, then today's behavior exactly.
+            const message = thrown instanceof Error ? thrown.message : String(thrown);
+            console.warn(`[account-kit] current() for ${slot} threw, deciding on the payload passed to reconcile: ${message}`);
+            // "The payload passed to reconcile" is a live reference the game may have mutated in
+            // place since the call. Run it through the same comparison against the call-time
+            // snapshot, so that move is still noticed; an untouched payload compares equal and
+            // gets today's behavior exactly.
+            fresh = local;
+          }
+          // `undefined` means "no re-read": a contained throw above, or a caller that returned
+          // nothing at all. It is deliberately NOT treated like `null`, which is the game telling
+          // us this slot has no local save any more.
+          if (fresh !== undefined) {
+            let moved: boolean;
+            try {
+              // The kit's own canonical JSON (RFC 8785: recursively sorted keys, no whitespace),
+              // so a re-read that merely rebuilt the object in a different key order is not a
+              // move. It throws on a value it cannot canonicalize (a lone surrogate, a non-finite
+              // number, a class instance) — an invalid fresh payload by definition, which resolves
+              // the error below rather than being mistaken for "unchanged".
+              if (passedCanonical === null || !passedCanonical.ok) throw new Error(passedCanonical?.message ?? "payload cannot be canonicalized");
+              moved = canonicalJson(fresh) !== passedCanonical.json;
+            } catch (thrown) {
+              const message = thrown instanceof Error ? thrown.message : String(thrown);
+              console.warn(`[account-kit] refusing to reconcile ${slot}: ${message}`);
+              return { status: "error", error: { code: "invalid_payload", message } };
+            }
+            if (moved) {
+              // Validated the same way the passed payload was at the top of this call: the fresh
+              // value is about to be decided on and sent, so an invalid one must resolve the same
+              // error an invalid `local` gives, not reach a request.
+              if (fresh !== null) {
+                const valid = validatePayload(game.gameSlug, game.schemaVersion, slot, fresh);
+                if (!valid.ok) {
+                  console.warn(`[account-kit] refusing to reconcile ${slot}: ${valid.detail}`);
+                  return { status: "error", error: { code: "invalid_payload", message: valid.detail } };
+                }
+              }
+              // From here on the fresh value IS the local payload, for the decision, for whatever
+              // gets sent, and for what a later background re-flush remembers. Either way the
+              // record is settled before the decision below, and `record` itself is updated so the
+              // decision reads what was just written, never the pre-call value.
+              //
+              // A payload: exactly the hint's seed-and-dirty, which is what turns every automatic
+              // `use_cloud` row into a prompt or an upload (see the table in decideReconcile:
+              // record.revision < cloud.revision with a dirty record is conflict_prompt, and a
+              // null record already was).
+              //
+              // `null`: the opposite, and not merely "seed nothing" — whatever was already
+              // remembered or queued for this user+slot has to go, or the very next online event
+              // uploads the save the game just told us no longer exists. Neither reachable row
+              // consults the record here (`local === null` answers `nothing` with no cloud row and
+              // `use_cloud` with one, both regardless of dirty), so this settles state without
+              // changing any decision.
+              local = fresh;
+              if (local !== null) noteLocalChanged(local);
+              else noteLocalGone();
+            } else if (fresh === null && reread) {
+              // Nothing moved — the call passed null and the re-read confirms null — but the game
+              // has now told us twice that this slot has no local save. A payload remembered from
+              // an earlier failed store() is a snapshot of that disowned save: left in place, the
+              // next background re-flush would upload it into a slot the game considers empty.
+              // Only an actual re-read counts; the throw fallback above asserts nothing.
+              noteLocalGone();
+            } else if (fresh !== null && reread) {
+              // Equal to the call-time snapshot — but `local` is a reference the game may have
+              // mutated since, and a successful re-read is the authority on what the slot holds
+              // NOW. Decide on and send the re-read itself, never a detached copy that only used to
+              // match it. Validated like any payload about to reach a request (the check at the top
+              // of this call saw `local` after the queue wait, not as it was when passed).
+              const valid = validatePayload(game.gameSlug, game.schemaVersion, slot, fresh);
+              if (!valid.ok) {
+                console.warn(`[account-kit] refusing to reconcile ${slot}: ${valid.detail}`);
+                return { status: "error", error: { code: "invalid_payload", message: valid.detail } };
+              }
+              local = fresh;
+            }
+          }
+        }
         const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });
         const asReconcile = (result: StoreResult): ReconcileResult =>
           result.status === "stored" ? { status: "stored", revision: result.revision } : result;
@@ -555,13 +733,49 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       // still uploads the stale in-memory `payload` on top of the just-confirmed revision.
       if (!state.readRecord(s.userId, slot)?.dirty) return;
       const base = state.readRecord(s.userId, slot)?.revision ?? 0;
-      const outcome = await sendOnce(slot, payload, base, s);
+      // A copy of what is actually sent: `payload` is the object the game handed store()/reconcile(),
+      // which it may mutate while this request is in flight. onBackgroundStored must describe what
+      // the cloud now holds, or a game comparing it to its current save could clear an "unsynced"
+      // marker for content that was never stored.
+      //
+      // And it is what is remembered NOW, not what this closure captured when it was queued: a
+      // foreground store()/reconcile() ahead of it in the chain may have remembered a newer payload
+      // and then failed to send it, leaving the record dirty. Sending the captured one would land
+      // stale content on the confirmed revision and mark the slot clean over the latest save.
+      // Nothing remembered any more means it was disowned or sent: there is nothing to do.
+      const latest = lastPayload.get(payloadKey(s.userId, slot));
+      if (latest === undefined) return;
+      const sent = JSON.parse(JSON.stringify(latest)) as SavePayload;
+      const outcome = await sendOnce(slot, sent, base, s);
       if (disposed) return;
       // claim: false — and this is the path the rule exists for. The owner check above ran BEFORE
       // sendOnce awaited; while the transport was pending, another tab could sign in as a
       // different account and claim the slot. Recording the revision for this user stays
       // truthful; re-asserting the ownership would silently overwrite that newer claim.
-      if (outcome.kind === "stored") { confirmed(slot, s, outcome.revision, { claim: false }); return; }
+      if (outcome.kind === "stored") {
+        confirmed(slot, s, outcome.revision, { claim: false });
+        // After confirmed(), never before: the callback tells the game its payload IS the cloud
+        // row now, so the kit's own record must already say so. Contained, because a game's
+        // marker bookkeeping throwing must not turn a successful re-flush into the warning
+        // quietFlush's own catch would log for a failed one, nor leave the slot looking unsynced.
+        const warnCallback = (thrown: unknown) => {
+          const message = thrown instanceof Error ? thrown.message : String(thrown);
+          console.warn(`[account-kit] onBackgroundStored for ${slot} threw: ${message}`);
+        };
+        try {
+          const returned: unknown = deps.onBackgroundStored?.(slot, sent, outcome.revision, s.userId);
+          // The declared type is void, but a game can pass an `async` function: its rejection
+          // would escape the catch below and surface as an unhandled rejection in the host page.
+          // Attach a handler so it reports through the same single warning instead. Deliberately
+          // not awaited — a background re-flush does not wait on the game's bookkeeping — and
+          // deliberately not done for `current`, which is documented synchronous and returns a
+          // payload, never a promise.
+          if (isThenable(returned)) returned.then(undefined, warnCallback);
+        } catch (thrown) {
+          warnCallback(thrown);
+        }
+        return;
+      }
       if (outcome.kind === "conflict") return; // never prompt; record is already dirty
       if (outcome.kind === "error" && outcome.dirty) {
         state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });

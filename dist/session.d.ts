@@ -1,4 +1,5 @@
 import type { Session } from "@supabase/supabase-js";
+import { type SavesClientDeps } from "./saves/client.js";
 import type { SaveGameConfig, SavesClient } from "./saves/types.js";
 export type Provider = "google" | "github";
 export interface SignInOptions {
@@ -13,6 +14,10 @@ export interface AccountKitConfig {
     nexusOrigin?: string;
     /** Spec §3.2 constants; enables kit.saves. */
     game?: SaveGameConfig;
+    /** Optional hook on the saves client, passed straight through (ignored without `game`): fires
+     *  after a background re-flush stored a slot, for games that keep their own "unsynced" marker.
+     *  Kept out of `game`, which is the registry-checked wire config, not a place for callbacks. */
+    onBackgroundStored?: SavesClientDeps["onBackgroundStored"];
 }
 export interface AccountKit {
     readonly config: Readonly<{
