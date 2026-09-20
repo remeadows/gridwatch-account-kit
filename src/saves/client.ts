@@ -499,8 +499,10 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         // and only on a call that actually reaches a decision.
         if (options?.current !== undefined) {
           let fresh: SavePayload | null | undefined;
+          let reread = false;
           try {
             fresh = options.current();
+            reread = true;
           } catch (thrown) {
             // Contained, not reported: a re-read the game could not answer is not a reason to fail
             // a reconcile, and the passed payload is still a truthful (if older) snapshot. One
@@ -561,6 +563,13 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
               local = fresh;
               if (local !== null) noteLocalChanged(local);
               else noteLocalGone();
+            } else if (fresh === null && reread) {
+              // Nothing moved — the call passed null and the re-read confirms null — but the game
+              // has now told us twice that this slot has no local save. A payload remembered from
+              // an earlier failed store() is a snapshot of that disowned save: left in place, the
+              // next background re-flush would upload it into a slot the game considers empty.
+              // Only an actual re-read counts; the throw fallback above asserts nothing.
+              noteLocalGone();
             }
           }
         }

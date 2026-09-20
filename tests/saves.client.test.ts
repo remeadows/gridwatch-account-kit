@@ -726,6 +726,23 @@ describe("reconcile", () => {
       warn.mockRestore();
     });
 
+    it("a `current` that confirms null drops a payload remembered from an earlier failed store, even though nothing moved", async () => {
+      const h = harness(undefined, 0);
+      h.store.mockResolvedValue({ kind: "network", message: "offline" });
+      expect((await h.client.store("campaign", campaign)).status).toBe("error"); // remembered + dirty
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+
+      h.store.mockReset();
+      h.store.mockResolvedValue(ok(200, { revision: 1, updatedAt: "t" }));
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      // The game has since dropped the save: it passes null AND confirms null at decision time.
+      expect(await h.client.reconcile("campaign", null, { current: () => null })).toEqual({ status: "nothing" });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false });
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).not.toHaveBeenCalled(); // the disowned save is not resurrected into the empty slot
+    });
+
     it("a `current` that returns the same payload leaves today's behavior byte for byte", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
