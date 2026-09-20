@@ -758,6 +758,38 @@ describe("reconcile", () => {
       expect(h.store.mock.calls[0][1].payload).toEqual(campaign); // A, what the re-read reported — not the detached B
     });
 
+    it("does not re-read, decide or send when the account changed while the cloud GET was pending", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      const current = vi.fn(() => L1); // by now the shared save reference holds the OTHER account's state
+      const pending = h.client.reconcile("campaign", L0, { current });
+      await flush();
+      h.setSession({ access_token: "tok2", user: { id: "u2" } });
+      releaseLoad(ok(200, row(3)));
+
+      expect(await pending).toEqual({ status: "signed_out" });
+      expect(current).not.toHaveBeenCalled();
+      expect(h.store).not.toHaveBeenCalled(); // nothing of u2's goes up under u1's captured token
+      expect(h.asked).toEqual([]);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+    });
+
+    it("a token refresh for the SAME user while the GET is pending changes nothing", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      const pending = h.client.reconcile("campaign", L0, { current: () => L0 });
+      await flush();
+      h.setSession({ access_token: "tok-refreshed", user: { id: "u1" } });
+      releaseLoad(ok(200, row(3)));
+      expect(await pending).toEqual({ status: "current" });
+    });
+
     it("a `current` that returns the same payload leaves today's behavior byte for byte", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });

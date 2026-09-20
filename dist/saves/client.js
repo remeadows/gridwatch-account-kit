@@ -474,6 +474,18 @@ export function createSavesClient(deps) {
                 // await between it and the decision, so nothing can move in between. Once per reconcile,
                 // and only on a call that actually reaches a decision.
                 if (options?.current !== undefined) {
+                    // The re-read looks at the game's live state, and this client outlives a sign-out and
+                    // sign-in: if the account changed while the GET above was pending, that state may now
+                    // be ANOTHER account's, while the decision and any send below still carry the session
+                    // captured for this one. Re-resolve it first and stop if it is no longer the same user
+                    // — before current() runs, so there is still no await between the re-read and the
+                    // decision. Nothing has been written for this call yet (the `localChanged` hint's
+                    // seed-and-dirty is this user's own and stays truthful).
+                    const now = await session();
+                    if (disposed)
+                        return { status: "error", error: disposedError() };
+                    if (!now || now.userId !== s.userId)
+                        return { status: "signed_out" };
                     let fresh;
                     let reread = false;
                     try {
