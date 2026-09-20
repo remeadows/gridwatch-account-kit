@@ -18,6 +18,12 @@ export interface SavesClientDeps {
   sleep?: (ms: number) => Promise<void>;
   debounceMs?: number;
   windowRef?: Window | null;
+  /** Called after a background re-flush (online / visibilitychange) stored a slot successfully,
+   *  so a game that keeps its own "unsynced" marker can clear it — that flush has no caller to
+   *  resolve. Only that path fires it: never a foreground store()/reconcile(), never a flush that
+   *  conflicted, errored, was discarded, stopped at another account's claim, or raced dispose().
+   *  A throw is contained with one warning. */
+  onBackgroundStored?: (slot: string, payload: SavePayload, revision: number) => void;
 }
 
 type Session = { token: string; userId: string };
@@ -625,7 +631,20 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       // sendOnce awaited; while the transport was pending, another tab could sign in as a
       // different account and claim the slot. Recording the revision for this user stays
       // truthful; re-asserting the ownership would silently overwrite that newer claim.
-      if (outcome.kind === "stored") { confirmed(slot, s, outcome.revision, { claim: false }); return; }
+      if (outcome.kind === "stored") {
+        confirmed(slot, s, outcome.revision, { claim: false });
+        // After confirmed(), never before: the callback tells the game its payload IS the cloud
+        // row now, so the kit's own record must already say so. Contained, because a game's
+        // marker bookkeeping throwing must not turn a successful re-flush into the warning
+        // quietFlush's own catch would log for a failed one, nor leave the slot looking unsynced.
+        try {
+          deps.onBackgroundStored?.(slot, payload, outcome.revision);
+        } catch (thrown) {
+          const message = thrown instanceof Error ? thrown.message : String(thrown);
+          console.warn(`[account-kit] onBackgroundStored for ${slot} threw: ${message}`);
+        }
+        return;
+      }
       if (outcome.kind === "conflict") return; // never prompt; record is already dirty
       if (outcome.kind === "error" && outcome.dirty) {
         state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });

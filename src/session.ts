@@ -5,7 +5,7 @@ import { validateHandle } from "./handle.js";
 import { signInUrl } from "./returnPath.js";
 import { payloadSchemas, resolveSaveGame } from "./saves-schema/games.js";
 import { ALIAS_RE, SLOT_RE } from "./saves-schema/wire.js";
-import { createSavesClient } from "./saves/client.js";
+import { createSavesClient, type SavesClientDeps } from "./saves/client.js";
 import { createDomPromptHost } from "./saves/prompt.js";
 import { createSaveStateStore } from "./saves/state.js";
 import { createTransport } from "./saves/transport.js";
@@ -43,6 +43,10 @@ export interface AccountKitConfig {
   nexusOrigin?: string;
   /** Spec §3.2 constants; enables kit.saves. */
   game?: SaveGameConfig;
+  /** Optional hook on the saves client, passed straight through (ignored without `game`): fires
+   *  after a background re-flush stored a slot, for games that keep their own "unsynced" marker.
+   *  Kept out of `game`, which is the registry-checked wire config, not a place for callbacks. */
+  onBackgroundStored?: SavesClientDeps["onBackgroundStored"];
 }
 
 /** True when `e` carries a string `code` field (e.g. a PostgrestError), narrowing its type. */
@@ -96,6 +100,7 @@ export function createAccountKit(input: AccountKitConfig): AccountKit {
         state: createSaveStateStore(input.game.gameSlug),
         transport: createTransport(`${config.nexusOrigin.replace(/\/+$/, "")}/api/saves/${input.game.routeAlias}`),
         prompt: createDomPromptHost(),
+        onBackgroundStored: input.onBackgroundStored,
       })
     : undefined;
 

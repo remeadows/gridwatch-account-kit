@@ -624,6 +624,17 @@ export function createSavesClient(deps) {
             // truthful; re-asserting the ownership would silently overwrite that newer claim.
             if (outcome.kind === "stored") {
                 confirmed(slot, s, outcome.revision, { claim: false });
+                // After confirmed(), never before: the callback tells the game its payload IS the cloud
+                // row now, so the kit's own record must already say so. Contained, because a game's
+                // marker bookkeeping throwing must not turn a successful re-flush into the warning
+                // quietFlush's own catch would log for a failed one, nor leave the slot looking unsynced.
+                try {
+                    deps.onBackgroundStored?.(slot, payload, outcome.revision);
+                }
+                catch (thrown) {
+                    const message = thrown instanceof Error ? thrown.message : String(thrown);
+                    console.warn(`[account-kit] onBackgroundStored for ${slot} threw: ${message}`);
+                }
                 return;
             }
             if (outcome.kind === "conflict")

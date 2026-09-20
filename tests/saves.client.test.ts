@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createSavesClient } from "../src/saves/client";
+import { createSavesClient, type SavesClientDeps } from "../src/saves/client";
 import { CONFLICT_COPY, OWNERSHIP_COPY, createDomPromptHost, type PromptAnswer, type PromptCopy } from "../src/saves/prompt";
 import { createSaveStateStore } from "../src/saves/state";
 import type { Transport, TransportResult } from "../src/saves/transport";
@@ -13,7 +13,12 @@ const ok = (status: number, body: unknown): TransportResult => ({ kind: "ok", st
 const clients: Array<{ dispose(): void }> = [];
 afterEach(() => { for (const c of clients.splice(0)) c.dispose(); });
 
-function harness(session: { access_token: string; user: { id: string } } | null = { access_token: "tok", user: { id: "u1" } }, debounceMs = 0) {
+function harness(
+  session: { access_token: string; user: { id: string } } | null = { access_token: "tok", user: { id: "u1" } },
+  debounceMs = 0,
+  // Optional deps a test wants to opt into (e.g. onBackgroundStored), merged over the defaults.
+  extra: Partial<SavesClientDeps> = {},
+) {
   localStorage.clear();
   let currentSession = session;
   const load = vi.fn<Transport["load"]>();
@@ -22,7 +27,7 @@ function harness(session: { access_token: string; user: { id: string } } | null 
   const asked: PromptCopy[] = [];
   const prompt = { ask: vi.fn(async (copy: PromptCopy) => { asked.push(copy); return answers.shift() ?? "primary"; }), dispose: vi.fn() };
   const state = createSaveStateStore(game.gameSlug);
-  const client = createSavesClient({ game, getSession: async () => currentSession, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs });
+  const client = createSavesClient({ game, getSession: async () => currentSession, state, transport: { load, store }, prompt, sleep: async () => undefined, debounceMs, ...extra });
   clients.push(client);
   const setSession = (next: { access_token: string; user: { id: string } } | null) => { currentSession = next; };
   return { client, load, store, prompt, answers, asked, state, setSession };
@@ -967,6 +972,142 @@ describe("background re-flush", () => {
 
     expect(h.store).not.toHaveBeenCalled(); // A never sent under U2's session
     expect(h.state.readRecord("u2", "campaign")).toEqual({ revision: 5, dirty: true }); // untouched
+  });
+});
+
+// A game that keeps its own "unsynced" marker has no way to learn that a background re-flush
+// landed: the flush has no caller to resolve. onBackgroundStored is that notification, and it
+// fires on exactly one path — a quietFlush whose send succeeded and was confirmed.
+describe("onBackgroundStored", () => {
+  const stored = () => vi.fn<NonNullable<SavesClientDeps["onBackgroundStored"]>>();
+
+  it("fires once with the remembered payload and the new revision after a successful background re-flush", async () => {
+    const onBackgroundStored = stored();
+    const h = harness(undefined, 0, { onBackgroundStored });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+    expect(onBackgroundStored).not.toHaveBeenCalled(); // a foreground store() is not a background one
+
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+    expect(onBackgroundStored).toHaveBeenCalledTimes(1);
+    expect(onBackgroundStored).toHaveBeenCalledWith("campaign", campaign, 1);
+  });
+
+  it("never fires for a foreground store() or reconcile() that succeeds", async () => {
+    const onBackgroundStored = stored();
+    const h = harness(undefined, 0, { onBackgroundStored });
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    expect((await h.client.store("campaign", campaign)).status).toBe("stored");
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    h.store.mockResolvedValueOnce(ok(200, { revision: 2, updatedAt: "t2" }));
+    expect((await h.client.reconcile("campaign", campaign)).status).toBe("uploaded");
+    expect(onBackgroundStored).not.toHaveBeenCalled();
+  });
+
+  it("does not fire when the re-flush hits a 409", async () => {
+    const onBackgroundStored = stored();
+    const h = harness(undefined, 0, { onBackgroundStored });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(409, { error: "conflict", cloud: { revision: 5, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(onBackgroundStored).not.toHaveBeenCalled();
+  });
+
+  it("does not fire when the re-flush errors", async () => {
+    const onBackgroundStored = stored();
+    const h = harness(undefined, 0, { onBackgroundStored });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+
+    h.store.mockClear();
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).toHaveBeenCalled();
+    expect(onBackgroundStored).not.toHaveBeenCalled();
+  });
+
+  it("does not fire when the slot belongs to another account (nothing is sent at all)", async () => {
+    const onBackgroundStored = stored();
+    const h = harness(undefined, 0, { onBackgroundStored });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+
+    h.state.writeOwner("campaign", "u2");
+    h.store.mockReset();
+    h.store.mockResolvedValue(ok(200, { revision: 1, updatedAt: "t" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).not.toHaveBeenCalled();
+    expect(onBackgroundStored).not.toHaveBeenCalled();
+  });
+
+  it("does not fire for a re-flush the player's 'Use cloud' already discarded", async () => {
+    const onBackgroundStored = stored();
+    const h = harness(undefined, 0, { onBackgroundStored });
+    const conflict = ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
+    h.store.mockResolvedValueOnce(conflict);
+    h.load.mockResolvedValueOnce(ok(200, row(7, { ...campaign, coins: 70 })));
+    let resolveAsk!: (a: PromptAnswer) => void;
+    h.prompt.ask.mockImplementationOnce((copy: PromptCopy) => {
+      h.asked.push(copy);
+      return new Promise<PromptAnswer>((resolve) => { resolveAsk = resolve; });
+    });
+    const pending = h.client.store("campaign", campaign);
+    await flush(); // the flush is now parked on the open conflict prompt
+    window.dispatchEvent(new Event("online")); // queues a quiet re-flush behind it
+    resolveAsk("primary"); // "Use cloud" — the local payload is discarded
+    expect((await pending).status).toBe("use_cloud");
+    await flush(); // let the queued quiet re-flush run (and drop itself)
+
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(onBackgroundStored).not.toHaveBeenCalled();
+  });
+
+  it("does not fire when the client was disposed while the re-flush was in flight", async () => {
+    const onBackgroundStored = stored();
+    const h = harness(undefined, 0, { onBackgroundStored });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+
+    h.store.mockReset();
+    let resolveStore!: (r: TransportResult) => void;
+    h.store.mockImplementationOnce(() => new Promise((resolve) => { resolveStore = resolve; }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(1);
+
+    h.client.dispose();
+    resolveStore(ok(200, { revision: 1, updatedAt: "t" }));
+    await flush();
+    expect(onBackgroundStored).not.toHaveBeenCalled();
+  });
+
+  it("contains a throwing callback with one warning, leaving the confirmed record intact", async () => {
+    const onBackgroundStored = vi.fn(() => { throw new Error("marker update failed"); });
+    const h = harness(undefined, 0, { onBackgroundStored });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(onBackgroundStored).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+    expect(h.state.readOwner("campaign")).toBe("u1");
   });
 });
 
