@@ -394,6 +394,20 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
 
   function reconcile(slot: string, local: SavePayload | null, options?: ReconcileOptions): Promise<ReconcileResult> {
     assertSlot(slot);
+    // What `current()` is later compared against is the payload AS IT WAS at this call, taken here,
+    // synchronously, before the slot's queue or any request is awaited. A game that keeps one
+    // mutable save object and returns it from current() hands us the same reference twice: compared
+    // live, a payload mutated in place while the GET was pending would always look "unchanged" —
+    // the exact window the option exists to close. Only computed when the option is used; a value
+    // that cannot be canonicalized is reported where the comparison would have happened.
+    let passedCanonical: { ok: true; json: string } | { ok: false; message: string } | null = null;
+    if (options?.current !== undefined) {
+      try {
+        passedCanonical = { ok: true, json: canonicalJson(local) };
+      } catch (thrown) {
+        passedCanonical = { ok: false, message: thrown instanceof Error ? thrown.message : String(thrown) };
+      }
+    }
     return serialized(slot, async () => {
       if (disposed) return { status: "error", error: disposedError() };
       try {
@@ -505,7 +519,8 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
               // move. It throws on a value it cannot canonicalize (a lone surrogate, a non-finite
               // number, a class instance) — an invalid fresh payload by definition, which resolves
               // the error below rather than being mistaken for "unchanged".
-              moved = canonicalJson(fresh) !== canonicalJson(local);
+              if (passedCanonical === null || !passedCanonical.ok) throw new Error(passedCanonical?.message ?? "payload cannot be canonicalized");
+              moved = canonicalJson(fresh) !== passedCanonical.json;
             } catch (thrown) {
               const message = thrown instanceof Error ? thrown.message : String(thrown);
               console.warn(`[account-kit] refusing to reconcile ${slot}: ${message}`);
@@ -667,7 +682,12 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       // still uploads the stale in-memory `payload` on top of the just-confirmed revision.
       if (!state.readRecord(s.userId, slot)?.dirty) return;
       const base = state.readRecord(s.userId, slot)?.revision ?? 0;
-      const outcome = await sendOnce(slot, payload, base, s);
+      // A copy of what is actually sent: `payload` is the object the game handed store()/reconcile(),
+      // which it may mutate while this request is in flight. onBackgroundStored must describe what
+      // the cloud now holds, or a game comparing it to its current save could clear an "unsynced"
+      // marker for content that was never stored.
+      const sent = JSON.parse(JSON.stringify(payload)) as SavePayload;
+      const outcome = await sendOnce(slot, sent, base, s);
       if (disposed) return;
       // claim: false — and this is the path the rule exists for. The owner check above ran BEFORE
       // sendOnce awaited; while the transport was pending, another tab could sign in as a
@@ -684,7 +704,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
           console.warn(`[account-kit] onBackgroundStored for ${slot} threw: ${message}`);
         };
         try {
-          const returned: unknown = deps.onBackgroundStored?.(slot, payload, outcome.revision);
+          const returned: unknown = deps.onBackgroundStored?.(slot, sent, outcome.revision);
           // The declared type is void, but a game can pass an `async` function: its rejection
           // would escape the catch below and surface as an unhandled rejection in the host page.
           // Attach a handler so it reports through the same single warning instead. Deliberately

@@ -685,6 +685,25 @@ describe("reconcile", () => {
       expect(h.store).not.toHaveBeenCalled();
     });
 
+    it("compares against a snapshot taken at the call, so a payload mutated IN PLACE still counts as moved", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const live = { ...campaign, boosters: { ...campaign.boosters } }; // the game's one mutable object
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 6, updatedAt: "t" }));
+      h.answers.push("secondary"); // "Keep this one"
+      const pending = h.client.reconcile("campaign", live, { current: () => live });
+      await flush();
+      live.coins = 42; // mutated in place while the GET is pending: `local` and current() are the SAME object
+      releaseLoad(ok(200, row(5)));
+
+      expect(await pending).toEqual({ status: "stored", revision: 6 });
+      expect(h.asked).toEqual([CONFLICT_COPY]); // not the silent use_cloud a same-object compare gives
+      expect(h.store.mock.calls[0][1].payload).toEqual({ ...campaign, coins: 42 });
+    });
+
     it("a `current` that returns the same payload leaves today's behavior byte for byte", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
@@ -1105,6 +1124,26 @@ describe("onBackgroundStored", () => {
     expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
     expect(onBackgroundStored).toHaveBeenCalledTimes(1);
     expect(onBackgroundStored).toHaveBeenCalledWith("campaign", campaign, 1);
+  });
+
+  it("hands the callback a copy of what was SENT, not the live object the game may have mutated since", async () => {
+    const onBackgroundStored = stored();
+    const h = harness(undefined, 0, { onBackgroundStored });
+    const live = { ...campaign };
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", live)).status).toBe("error");
+
+    h.store.mockReset();
+    let release!: (r: TransportResult) => void;
+    h.store.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    live.coins = 999; // mutated while the background PUT is in flight
+    release(ok(200, { revision: 1, updatedAt: "t" }));
+    await flush();
+    expect(onBackgroundStored).toHaveBeenCalledTimes(1);
+    expect(onBackgroundStored.mock.calls[0][1]).toEqual(campaign); // coins: 5, as sent
+    expect(h.store.mock.calls[0][1].payload).toEqual(campaign);
   });
 
   it("never fires for a foreground store() or reconcile() that succeeds", async () => {
