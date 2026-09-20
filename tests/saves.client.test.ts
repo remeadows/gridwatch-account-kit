@@ -1915,3 +1915,97 @@ describe("a store made after a discard never coalesces into the pre-discard entr
     warn.mockRestore();
   });
 });
+
+// Every other cross-account test in this file simulates the second tab by writing state directly
+// while a transport promise is held. This section does it for real: TWO createSavesClient
+// instances, each with its own session, transport and prompt host, over ONE storage — which is
+// what two tabs of the same browser actually share (the per-slot owner record, the per-user sync
+// records and the device id all live there). Nothing here pokes at state to make the scenario
+// happen; the only thing the test controls is when each tab's transport answers.
+function sharedStorage(): Storage {
+  const map = new Map<string, string>();
+  return {
+    get length() { return map.size; },
+    clear: () => map.clear(),
+    getItem: (k) => map.get(k) ?? null,
+    key: (i) => [...map.keys()][i] ?? null,
+    removeItem: (k) => { map.delete(k); },
+    setItem: (k, v) => { map.set(k, String(v)); },
+  };
+}
+
+function tab(userId: string, token: string, backing: Storage, windowRef: Window | null, extra: Partial<SavesClientDeps> = {}) {
+  const load = vi.fn<Transport["load"]>();
+  const store = vi.fn<Transport["store"]>();
+  const answers: PromptAnswer[] = [];
+  const asked: PromptCopy[] = [];
+  const prompt = { ask: vi.fn(async (copy: PromptCopy) => { asked.push(copy); return answers.shift() ?? "primary"; }), dispose: vi.fn() };
+  const state = createSaveStateStore(game.gameSlug, backing);
+  const client = createSavesClient({
+    game,
+    getSession: async () => ({ access_token: token, user: { id: userId } }),
+    state,
+    transport: { load, store },
+    prompt,
+    sleep: async () => undefined,
+    debounceMs: 0,
+    windowRef, // only the tab under test listens for `online`, as only one tab gets the event here
+    ...extra,
+  });
+  clients.push(client);
+  return { client, load, store, prompt, answers, asked, state };
+}
+
+describe("two real clients over one storage", () => {
+  it("tab 1's in-flight background re-flush lands after tab 2 claimed the slot: u1's record is updated, the owner record still names u2", async () => {
+    const backing = sharedStorage();
+    const onBackgroundStored = vi.fn<NonNullable<SavesClientDeps["onBackgroundStored"]>>();
+    const t1 = tab("u1", "tok1", backing, window, { onBackgroundStored });
+    const t2 = tab("u2", "tok2", backing, null);
+    const b = { ...campaign, coins: 61 };
+
+    // Tab 1 (u1) uploads a first save: the cloud row is at revision 1 and u1 owns the slot.
+    t1.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t1" }));
+    expect(await t1.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 1, updatedAt: "t1" });
+    expect(t1.state.readOwner("campaign")).toBe("u1");
+    expect(t2.state.readOwner("campaign")).toBe("u1"); // one storage: tab 2 sees it too
+
+    // u1's next commit fails offline: the record goes dirty with payload B remembered for a
+    // background re-flush.
+    t1.store.mockReset();
+    t1.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await t1.client.store("campaign", b)).status).toBe("error");
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: true });
+
+    // The network comes back: u1's re-flush passes its owner check (still u1) and is now parked on
+    // the transport, holding the PUT open.
+    t1.store.mockReset();
+    let releasePut!: (r: TransportResult) => void;
+    t1.store.mockImplementationOnce(() => new Promise((resolve) => { releasePut = resolve; }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).toHaveBeenCalledTimes(1);
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 1, payload: b });
+
+    // Tab 2 (u2) reconciles while that PUT is in flight. The slot is recorded to u1, so u2 is
+    // asked who the local save belongs to; "Use cloud" claims the slot for u2 without sending.
+    t2.load.mockResolvedValueOnce(ok(200, row(1)));
+    t2.answers.push("primary");
+    expect(await t2.client.reconcile("campaign", { ...campaign, coins: 12 })).toEqual({ status: "use_cloud", save: { revision: 1, schemaVersion: 1, payload: campaign, updatedAt: row(1).updatedAt } });
+    expect(t2.asked).toEqual([CONFLICT_COPY]);
+    expect(t2.store).not.toHaveBeenCalled();
+    expect(t1.state.readOwner("campaign")).toBe("u2"); // the claim is visible to tab 1's store too
+    expect(t2.state.readRecord("u2", "campaign")).toEqual({ revision: 1, dirty: false });
+
+    // Tab 1's held PUT now succeeds on the revision it was sent for.
+    releasePut(ok(200, { revision: 2, updatedAt: "t2" }));
+    await flush();
+
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 2, dirty: false }); // truthful for u1's row
+    expect(t1.state.readOwner("campaign")).toBe("u2"); // u2's newer claim survives
+    expect(t2.state.readOwner("campaign")).toBe("u2");
+    expect(t2.state.readRecord("u2", "campaign")).toEqual({ revision: 1, dirty: false }); // untouched
+    expect(onBackgroundStored).toHaveBeenCalledTimes(1);
+    expect(onBackgroundStored).toHaveBeenCalledWith("campaign", b, 2);
+  });
+});
