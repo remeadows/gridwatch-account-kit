@@ -49,6 +49,18 @@ Treat a `discarded` store as **dropped, not failed**: never retry it, and never 
 
 A background re-flush — triggered by the `online` event or the tab becoming visible again, for any slot the kit already knows is dirty — never prompts the player. If it hits a 409, the record is simply left dirty for the next foreground `store()` or `reconcile()` call to resolve normally with a prompt; a background flush is not the moment to interrupt play with a "use cloud or keep this one" decision. For the same reason it never settles an *ownership* question: while the slot's ownership record names a different account, a background re-flush sends nothing and the record simply stays dirty until a foreground `reconcile` asks the player who the local save belongs to (nothing is lost; it waits). A `store` or a background re-flush claims the slot only while its ownership record is unset or already names that account; taking a slot over from another account is always a `reconcile` decision. So a send that finishes after another account claimed the slot still records its own user's new revision, which is truthful for that account's cloud row, but leaves the newer claim in place. A payload the client itself *remembered* — debounced by `store()`, coalesced across `store()` calls, or held for a background re-flush — is never sent under a different user's session than the one that supplied it, on the foreground debounce path above or on a background re-flush, even though this `SavesClient` instance outlives a sign-out/sign-in. `reconcile` is different: the `local` payload is supplied fresh by the caller on every call, not remembered by the client, and `reconcile` resolves its session as late as possible — once that call reaches the front of the slot's queue — so it is sent under whoever is signed in *at that point*, which is why the usage example above calls `reconcile` once the session is already known; the per-slot ownership record and its take-over prompt (`fresh` above) exist precisely for the case where that turns out to be a different account.
 
+A background re-flush has no caller to resolve, so if your game keeps its own "unsynced" marker, pass `onBackgroundStored` to learn when one landed:
+
+```ts
+const kit = createAccountKit({
+  returnPath: "/play/match/",
+  game: { /* … */ },
+  onBackgroundStored: (slot, payload, revision) => clearUnsyncedMarker(slot, revision),
+});
+```
+
+It fires once per successful background re-flush, with the payload the kit sent and the new revision, right after the kit has recorded that revision itself. It does *not* fire for a foreground `store`/`reconcile` (those resolve to you already), nor for a re-flush that conflicted, errored, was dropped because the player's choice discarded it, stopped at another account's claim on the slot, or raced `dispose()`. A callback that throws is contained with one warning and changes nothing the kit recorded.
+
 Pass `{ localChanged: true }` as a third argument to `reconcile` when the game knows this slot's
 local payload has changes that were never confirmed in the cloud — e.g. the player made edits
 while signed out, or `store` calls were held while offline and never flushed. Without it, a sync
@@ -68,6 +80,33 @@ question for the take-over prompt, not for a cache: with another owner on record
 remembers nothing and anything already remembered for this account is left untouched. So a hinted
 `reconcile` that fails before it can prompt — a cloud load that exhausts its retries, say — can
 never leave another account's progress queued for upload.
+
+Pass `current` when the game's save for a slot can change while `reconcile` is still running. The
+cloud GET in the middle of the call can take seconds, and `reconcile` otherwise decides on the
+snapshot you handed it: if the player (or the game) changes that slot inside that window and the
+decision is an automatic `use_cloud`, the cloud payload is applied over the change and the loss is
+unrecoverable, because by then the kit has confirmed the cloud revision. `current` is a re-read at
+decision time — called once, after the cloud row is known and immediately before the decision:
+
+```ts
+const saveRef = useRef(localCampaign);                  // whatever the game writes its save into
+const result = await kit.saves!.reconcile("campaign", project(saveRef.current), {
+  current: () => project(saveRef.current),              // re-read, synchronous, must not throw
+});
+```
+
+It must be synchronous and must not throw. If what it returns differs from the payload you passed
+(compared by the kit's canonical JSON, so a rebuilt object with the same contents is *not* a
+change), the fresh value is what the kit decides on, sends, and remembers for a later background
+re-flush, and the call behaves exactly as if you had also passed `localChanged: true`. In practice
+that means every decision that would have silently applied the cloud row becomes a question or an
+upload instead: a moved local payload plus a cloud row that moved too resolves to the conflict
+prompt, and with the cloud row unmoved the *fresh* payload is what goes up. Returning `null` says
+this slot has no local save any more, and the cloud row is applied as usual. A fresh payload that
+fails validation resolves `{ status: "error", error: { code: "invalid_payload", ... } }` without
+sending anything, exactly as an invalid `local` does; a `current` that throws is contained with one
+warning and the call decides on the payload you passed. Omit it and nothing changes. Out of scope
+by design: a change made while a *prompt* is open — the player's explicit answer wins.
 
 Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SPA): it removes the `online`/`visibilitychange` listeners, closes any prompt dialog that's on screen, settles calls still waiting on the debounce timer or on a prompt immediately, and marks the client disposed so a call that is mid-request settles with `{ status: "error", error: { code: "http", message: "disposed" } }` as soon as its current transport attempt returns (the deadline below bounds that wait); no state is written after `dispose()`.
 

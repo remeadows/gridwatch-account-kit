@@ -1,6 +1,6 @@
 {
   "name": "@gridwatch/account-kit",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Shared account bar, single Supabase session, and sign-in flow for GridWatch games.",
   "type": "module",
   "license": "MIT",
