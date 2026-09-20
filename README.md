@@ -102,7 +102,12 @@ re-flush, and the call behaves exactly as if you had also passed `localChanged: 
 that means every decision that would have silently applied the cloud row becomes a question or an
 upload instead: a moved local payload plus a cloud row that moved too resolves to the conflict
 prompt, and with the cloud row unmoved the *fresh* payload is what goes up. Returning `null` says
-this slot has no local save any more, and the cloud row is applied as usual. A fresh payload that
+this slot has no local save any more (the game reset it to pristine, say), and the cloud row is
+applied as usual — but it also means there is nothing left for this account to protect on that
+slot, so the kit forgets any payload it was holding for a background re-flush, clears the slot's
+dirty flag (keeping its revision), and drops any `store` of that slot this account had already
+queued — those resolve `discarded`, exactly as they do after a "Use cloud"/"Start fresh" choice
+(see above). The slot's *ownership* record is left alone; that stays a foreground question. A fresh payload that
 fails validation resolves `{ status: "error", error: { code: "invalid_payload", ... } }` without
 sending anything, exactly as an invalid `local` does; a `current` that throws is contained with one
 warning and the call decides on the payload you passed. Omit it and nothing changes. Out of scope

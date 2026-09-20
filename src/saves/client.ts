@@ -435,6 +435,31 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             state.writeRecord(s.userId, slot, record);
           }
         };
+        /** The mirror image, for a `current` that reports the local payload is GONE (below). Every
+         *  piece of per-user state this client holds for a slot describes one thing — that slot's
+         *  unsynced local save for this user — so when the game says there is no such save any
+         *  more, none of it may survive to be uploaded later:
+         *    - the remembered payload, whether this call's own hint seeded it moments ago or an
+         *      earlier failed store() left it, is a snapshot of exactly what was disowned;
+         *    - the discard epoch is bumped for the same reason the prompts' "Use cloud" bumps it:
+         *      a store still inside its debounce window, or one whose flush is already queued
+         *      behind this reconcile, carries its own copy of that payload and would otherwise
+         *      flush it on top of whatever the cloud holds;
+         *    - the dirty flag is what keeps the slot queued for a background re-flush at all, and
+         *      with no payload left to protect it is simply false. The revision is kept (it still
+         *      describes this user's cloud row), and a slot this user never synced keeps its null
+         *      record rather than gaining a fabricated one.
+         *  The OWNER record is deliberately untouched: whose progress the local save on this
+         *  device is remains a question only the foreground's ownership prompt answers, and "the
+         *  game has no local payload right now" is not an answer to it. */
+        const noteLocalGone = (): void => {
+          lastPayload.delete(payloadKey(s.userId, slot));
+          noteDiscard(s.userId, slot);
+          if (record !== null && record.dirty) {
+            record = { revision: record.revision, dirty: false };
+            state.writeRecord(s.userId, slot, record);
+          }
+        };
         // The game may hold local edits without ever calling store() (signed out, or stores held
         // while offline), leaving a clean { revision, dirty: false } record that no longer matches
         // what's on screen. `localChanged` tells us so: mark the record dirty BEFORE the cloud
@@ -491,14 +516,24 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
                 }
               }
               // From here on the fresh value IS the local payload, for the decision, for whatever
-              // gets sent, and for what a later background re-flush remembers. The record-dirtying
-              // runs before the decision below, exactly as the hint's does — which is what turns
-              // every automatic `use_cloud` row into a prompt or an upload (see the table in
-              // decideReconcile: record.revision < cloud.revision with a dirty record is
-              // conflict_prompt, and a null record already was). A move to `null` seeds nothing,
-              // for the same reason the hint ignores a null local: there is nothing to protect.
+              // gets sent, and for what a later background re-flush remembers. Either way the
+              // record is settled before the decision below, and `record` itself is updated so the
+              // decision reads what was just written, never the pre-call value.
+              //
+              // A payload: exactly the hint's seed-and-dirty, which is what turns every automatic
+              // `use_cloud` row into a prompt or an upload (see the table in decideReconcile:
+              // record.revision < cloud.revision with a dirty record is conflict_prompt, and a
+              // null record already was).
+              //
+              // `null`: the opposite, and not merely "seed nothing" — whatever was already
+              // remembered or queued for this user+slot has to go, or the very next online event
+              // uploads the save the game just told us no longer exists. Neither reachable row
+              // consults the record here (`local === null` answers `nothing` with no cloud row and
+              // `use_cloud` with one, both regardless of dirty), so this settles state without
+              // changing any decision.
               local = fresh;
               if (local !== null) noteLocalChanged(local);
+              else noteLocalGone();
             }
           }
         }

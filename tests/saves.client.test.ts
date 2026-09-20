@@ -797,6 +797,115 @@ describe("reconcile", () => {
       expect(m.calls).toBe(0);
     });
 
+    // A move to `null` is the game reporting that this slot has NO local save any more. Anything
+    // the client was still holding for this user+slot — a payload remembered for a background
+    // re-flush (seeded by this very call's `localChanged` hint, or left by an earlier failed
+    // store()), the dirty flag that keeps the slot queued, and any store already queued behind
+    // this reconcile — is a snapshot of exactly the thing the game just disowned, so none of it
+    // may survive to be uploaded later. The owner record is NOT touched: whose save this device
+    // holds stays a foreground prompt's question.
+    describe("a move to null", () => {
+      it("drops the hint's own seed, so the next re-flush cannot resurrect the payload the game reported gone", async () => {
+        const h = harness();
+        h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+        h.state.writeOwner("campaign", "u1");
+        h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+        expect(await h.client.reconcile("campaign", L0, { localChanged: true, current: () => null })).toEqual({ status: "nothing" });
+        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+        expect(h.state.readOwner("campaign")).toBe("u1"); // untouched
+
+        h.store.mockResolvedValue(ok(200, { revision: 4, updatedAt: "t" }));
+        window.dispatchEvent(new Event("online"));
+        await flush();
+        expect(h.store).not.toHaveBeenCalled();
+      });
+
+      it("drops state that pre-dates the call (an earlier failed store), with no hint passed at all", async () => {
+        const h = harness();
+        const a = { ...campaign, coins: 11 };
+        h.store.mockResolvedValue({ kind: "network", message: "offline" });
+        expect((await h.client.store("campaign", a)).status).toBe("error");
+        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+
+        h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+        expect(await h.client.reconcile("campaign", L0, { current: () => null })).toEqual({ status: "nothing" });
+        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false });
+
+        h.store.mockReset();
+        h.store.mockResolvedValue(ok(200, { revision: 1, updatedAt: "t" }));
+        window.dispatchEvent(new Event("online"));
+        await flush();
+        expect(h.store).not.toHaveBeenCalled();
+      });
+
+      it("drops a store this user had already queued for the slot: it resolves discarded and never reaches the transport", async () => {
+        const h = harness({ access_token: "tok", user: { id: "u1" } }, 40);
+        h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+        await h.client.load("campaign"); // prime lastKnownUserId with a real u1 session
+        h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        // A transport that would happily accept the queued commit: the point is that it is never
+        // asked, not that the send failed.
+        h.store.mockResolvedValue(ok(200, { revision: 4, updatedAt: "t" }));
+
+        const queued = h.client.store("campaign", L0); // still inside its debounce window
+        h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+        expect(await h.client.reconcile("campaign", L0, { current: () => null })).toEqual({ status: "nothing" });
+
+        await expect(queued).resolves.toEqual({ status: "error", error: { code: "http", message: "discarded" } });
+        await flushDebounce();
+        expect(h.store).not.toHaveBeenCalled();
+        expect(warn).toHaveBeenCalledWith("[account-kit] dropped a store the player discarded");
+        warn.mockRestore();
+        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+      });
+
+      it("with an existing cloud row still resolves use_cloud, and leaves nothing for a later re-flush", async () => {
+        const h = harness();
+        h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+        h.state.writeOwner("campaign", "u1");
+        h.load.mockResolvedValueOnce(ok(200, row(5)));
+        expect(await h.client.reconcile("campaign", L0, { localChanged: true, current: () => null })).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+        expect(h.asked).toEqual([]);
+        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 5, dirty: false });
+
+        // Force the slot dirty again through an unrelated path: proves the remembered payload is
+        // gone, not merely "not currently dirty".
+        h.state.writeRecord("u1", "campaign", { revision: 5, dirty: true });
+        h.store.mockResolvedValue(ok(200, { revision: 6, updatedAt: "t" }));
+        window.dispatchEvent(new Event("online"));
+        await flush();
+        expect(h.store).not.toHaveBeenCalled();
+      });
+
+      it("writes no record where there was none (a slot this user never synced)", async () => {
+        const h = harness();
+        expect(h.state.readRecord("u1", "campaign")).toBeNull();
+        h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+        expect(await h.client.reconcile("campaign", L0, { localChanged: true, current: () => null })).toEqual({ status: "nothing" });
+        expect(h.state.readRecord("u1", "campaign")).toBeNull();
+        expect(h.state.readOwner("campaign")).toBeNull();
+      });
+
+      it("control: a `current` that returns the same payload leaves the hint's seed and dirty flag exactly as they were", async () => {
+        const h = harness();
+        h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+        h.state.writeOwner("campaign", "u1");
+        h.load.mockResolvedValueOnce(ok(200, row(3)));
+        h.store.mockResolvedValue({ kind: "network", message: "offline" });
+        // restore_dirty (the hint marked it dirty), and its send fails: dirty stays, L0 remembered.
+        expect(await h.client.reconcile("campaign", L0, { localChanged: true, current: () => ({ ...L0 }) })).toMatchObject({ status: "error", error: { code: "network" } });
+        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+
+        h.store.mockReset();
+        h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+        window.dispatchEvent(new Event("online"));
+        await flush();
+        expect(h.store).toHaveBeenCalledTimes(1);
+        expect(h.store.mock.calls[0][1].payload).toEqual(L0);
+      });
+    });
+
     it("combines with localChanged: true without prompting twice", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
