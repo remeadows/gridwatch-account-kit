@@ -56,13 +56,15 @@ const kit = createAccountKit({
   returnPath: "/play/match/",
   game: { /* … */ },
   onBackgroundStored: (slot, payload, revision, userId) => {
-    // The send may have outlasted an account switch: only act for whoever is signed in now.
-    if (userId === currentUserId()) clearUnsyncedMarker(slot, revision);
+    // The send may have outlasted an account switch, and the player may have moved on since it
+    // was queued: only clear the marker for whoever is signed in now, and only if what landed is
+    // still what the slot holds.
+    if (userId === currentUserId() && sameSave(payload, project(currentSave(), slot))) clearUnsyncedMarker(slot);
   },
 });
 ```
 
-It fires once per successful background re-flush, with the payload the kit sent, the new revision and the id of the account whose cloud row it landed in, right after the kit has recorded that revision itself. It does *not* fire for a foreground `store`/`reconcile` (those resolve to you already), nor for a re-flush that conflicted, errored, was dropped because the player's choice discarded it, stopped at another account's claim on the slot, or raced `dispose()`. A callback that throws is contained with one warning and changes nothing the kit recorded; so is an `async` callback that rejects, though the kit never waits on it — a background re-flush does not block on the game's bookkeeping, so do the work synchronously if you need it done before the kit moves on.
+The notification says that *this payload* reached *this account's* row — not that the slot is up to date: a newer `store()` for the same slot may be queued right behind it and can still fail, so match the payload (and the user) before clearing anything. It fires once per successful background re-flush, with the payload the kit sent, the new revision and the id of the account whose cloud row it landed in, right after the kit has recorded that revision itself. It does *not* fire for a foreground `store`/`reconcile` (those resolve to you already), nor for a re-flush that conflicted, errored, was dropped because the player's choice discarded it, stopped at another account's claim on the slot, or raced `dispose()`. A callback that throws is contained with one warning and changes nothing the kit recorded; so is an `async` callback that rejects, though the kit never waits on it — a background re-flush does not block on the game's bookkeeping, so do the work synchronously if you need it done before the kit moves on.
 
 Pass `{ localChanged: true }` as a third argument to `reconcile` when the game knows this slot's
 local payload has changes that were never confirmed in the cloud — e.g. the player made edits
