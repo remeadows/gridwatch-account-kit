@@ -562,6 +562,251 @@ describe("reconcile", () => {
       expect(h.store).not.toHaveBeenCalled();
     });
   });
+
+  // `current` closes the window between the caller's snapshot and the decision: the cloud GET can
+  // take seconds, and a local save that moved inside it must not be replaced by an automatic
+  // use_cloud. Every test here holds the transport's load promise open, moves the local payload
+  // while it is held, and then releases it — so the re-read demonstrably happens after the cloud
+  // row is known, which is the only point at which it is worth anything.
+  describe("current (re-read at decision time)", () => {
+    const L0 = campaign;
+    const L1 = { ...campaign, coins: 42 };
+
+    /** A held load, plus a `current` whose return value the test controls after the fact. */
+    function moving(initial: { value: typeof campaign | null }) {
+      let calls = 0;
+      let loadResolved = false;
+      const seenLoadResolved: boolean[] = [];
+      const current = () => { calls += 1; seenLoadResolved.push(loadResolved); return initial.value; };
+      return {
+        current,
+        get calls() { return calls; },
+        get seenLoadResolved() { return seenLoadResolved; },
+        markLoadResolved: () => { loadResolved = true; },
+      };
+    }
+
+    it("turns a would-be silent use_cloud into a conflict prompt when the local payload moved during the cloud GET", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const ref = { value: L0 as typeof campaign | null };
+      const m = moving(ref);
+
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 6, updatedAt: "t" }));
+      h.answers.push("secondary"); // "Keep this one"
+      const pending = h.client.reconcile("campaign", L0, { current: m.current });
+      await flush();
+      expect(m.calls).toBe(0); // not called before the cloud row is known
+
+      ref.value = L1; // the game's save for this slot moves while the GET is in flight
+      m.markLoadResolved();
+      releaseLoad(ok(200, row(5)));
+
+      expect(await pending).toEqual({ status: "stored", revision: 6 });
+      expect(h.asked).toEqual([CONFLICT_COPY]); // NOT use_cloud
+      expect(h.store.mock.calls[0][1].payload).toEqual(L1); // the fresh value is what goes up
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(5);
+    });
+
+    it("with the cloud unmoved and the record clean, the FRESH payload is what gets PUT", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const ref = { value: L0 as typeof campaign | null };
+      const m = moving(ref);
+
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+      const pending = h.client.reconcile("campaign", L0, { current: m.current });
+      await flush();
+      ref.value = L1;
+      m.markLoadResolved();
+      releaseLoad(ok(200, row(3))); // same revision as the record: today this is `current`
+
+      expect(await pending).toEqual({ status: "stored", revision: 4 });
+      expect(h.asked).toEqual([]); // restore_dirty, not a prompt
+      expect(h.store.mock.calls[0][1].payload).toEqual(L1); // L1, never L0
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+    });
+
+    it("a pristine null local that became a payload prompts instead of applying the existing cloud row", async () => {
+      const h = harness();
+      const ref = { value: null as typeof campaign | null };
+      const m = moving(ref);
+
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+      h.answers.push("secondary"); // "Keep this one"
+      const pending = h.client.reconcile("campaign", null, { current: m.current });
+      await flush();
+      ref.value = L1; // the game created a save for this slot while the GET was in flight
+      m.markLoadResolved();
+      releaseLoad(ok(200, row(3)));
+
+      expect(await pending).toEqual({ status: "stored", revision: 4 });
+      expect(h.asked).toEqual([CONFLICT_COPY]); // NOT the silent use_cloud the null row gives today
+      expect(h.store.mock.calls[0][1].payload).toEqual(L1);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(3);
+    });
+
+    it("a null local that became a payload with NO cloud row is a first upload", async () => {
+      const h = harness();
+      const ref = { value: null as typeof campaign | null };
+      const m = moving(ref);
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+      ref.value = L1;
+      expect(await h.client.reconcile("campaign", null, { current: m.current })).toEqual({ status: "uploaded", revision: 1 });
+      expect(h.asked).toEqual([]);
+      expect(h.store.mock.calls[0][1].payload).toEqual(L1);
+      expect(h.store.mock.calls[0][1].baseRevision).toBe(0);
+      expect(h.state.readOwner("campaign")).toBe("u1");
+    });
+
+    it("a payload that became null hands back the cloud row, sending nothing", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const ref = { value: null as typeof campaign | null };
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      expect(await h.client.reconcile("campaign", L0, { current: () => ref.value })).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+      expect(h.asked).toEqual([]);
+      expect(h.store).not.toHaveBeenCalled();
+    });
+
+    it("a `current` that returns the same payload leaves today's behavior byte for byte", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const m = moving({ value: L0 as typeof campaign | null });
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      expect(await h.client.reconcile("campaign", L0, { current: m.current })).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+      expect(h.asked).toEqual([]);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 5, dirty: false });
+      expect(m.calls).toBe(1);
+    });
+
+    it("equality is canonical, not identity: a re-read that only reorders keys is not a move", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const reordered = { intelSeen: {}, areaRewards: {}, levels: {}, tutorialReplayRequested: false, completedTutorial: true, selectedHeroId: "rusty", boosters: { rocket: 1 }, coins: 5 };
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      expect((await h.client.reconcile("campaign", L0, { current: () => reordered })).status).toBe("use_cloud");
+      expect(h.asked).toEqual([]);
+    });
+
+    it("calls `current` exactly once, and only after the cloud load has returned", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const m = moving({ value: L0 as typeof campaign | null });
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      const pending = h.client.reconcile("campaign", L0, { current: m.current });
+      await flush();
+      expect(m.calls).toBe(0);
+      m.markLoadResolved();
+      releaseLoad(ok(200, row(3)));
+      expect(await pending).toEqual({ status: "current" });
+      expect(m.calls).toBe(1);
+      expect(m.seenLoadResolved).toEqual([true]);
+    });
+
+    it("contains a throwing `current` with one warning and decides on the payload it was passed", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const result = await h.client.reconcile("campaign", L0, { current: () => { throw new Error("read failed"); } });
+      expect(result).toEqual({ status: "use_cloud", save: { revision: 5, schemaVersion: 1, payload: campaign, updatedAt: row(5).updatedAt } });
+      expect(h.asked).toEqual([]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+    });
+
+    it("resolves the same invalid_payload error an invalid `local` gives when the fresh payload is invalid, without sending", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const result = await h.client.reconcile("campaign", L0, { current: () => ({ ...campaign, coins: -1 }) });
+      expect(result).toMatchObject({ status: "error", error: { code: "invalid_payload" } });
+      expect(h.store).not.toHaveBeenCalled();
+      expect(h.asked).toEqual([]);
+      warn.mockRestore();
+    });
+
+    it("a moved local on a slot owned by another account still asks who the save belongs to, and seeds nothing for a background re-flush", async () => {
+      const h = harness();
+      h.state.writeOwner("campaign", "u9"); // shared device: the local save may be u9's
+      const ref = { value: L0 as typeof campaign | null };
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      h.answers.push("secondary"); // "Start fresh"
+      ref.value = L1;
+      expect(await h.client.reconcile("campaign", L0, { current: () => ref.value })).toEqual({ status: "fresh" });
+      expect(h.asked).toEqual([OWNERSHIP_COPY]);
+
+      h.state.writeRecord("u1", "campaign", { revision: 0, dirty: true });
+      h.store.mockClear();
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).not.toHaveBeenCalled();
+    });
+
+    it("seeds the FRESH payload for a background re-flush, exactly as the localChanged hint does", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const ref = { value: L0 as typeof campaign | null };
+      h.load.mockResolvedValueOnce(ok(200, row(3)));
+      h.store.mockResolvedValue({ kind: "network", message: "offline" });
+      ref.value = L1;
+      // restore_dirty, and its send fails: the record stays dirty with L1 remembered.
+      expect(await h.client.reconcile("campaign", L0, { current: () => ref.value })).toMatchObject({ status: "error", error: { code: "network" } });
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: true });
+
+      h.store.mockReset();
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+      window.dispatchEvent(new Event("online"));
+      await flush();
+      expect(h.store).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][1].payload).toEqual(L1);
+    });
+
+    it("is not consulted at all when the call never reaches a decision (a failed cloud load)", async () => {
+      const h = harness();
+      const m = moving({ value: L1 as typeof campaign | null });
+      h.load.mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" })
+        .mockResolvedValueOnce({ kind: "network", message: "down" });
+      expect(await h.client.reconcile("campaign", L0, { current: m.current })).toMatchObject({ status: "error", error: { code: "network" } });
+      expect(m.calls).toBe(0);
+    });
+
+    it("combines with localChanged: true without prompting twice", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const ref = { value: L0 as typeof campaign | null };
+      h.load.mockResolvedValueOnce(ok(200, row(5)));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 6, updatedAt: "t" }));
+      h.answers.push("secondary");
+      ref.value = L1;
+      expect(await h.client.reconcile("campaign", L0, { localChanged: true, current: () => ref.value })).toEqual({ status: "stored", revision: 6 });
+      expect(h.asked).toEqual([CONFLICT_COPY]);
+      expect(h.store.mock.calls[0][1].payload).toEqual(L1);
+    });
+  });
+
   it("store()'s conflict prompt answered 'Use cloud' clears the remembered payload so a later background re-flush sends nothing for that slot", async () => {
     const h = harness();
     const conflict = ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });

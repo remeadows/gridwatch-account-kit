@@ -65,6 +65,10 @@ export interface ReconcileOptions {
     /** The game knows this slot's local payload has changes that were never confirmed in the
      *  cloud (e.g. edits made while signed out). */
     localChanged?: boolean;
+    /** Re-read at decision time, after the cloud row is known. If it returns a payload that differs
+     *  from the one passed to reconcile(), the fresh value is what the kit decides on and sends, and
+     *  the call is treated as `localChanged: true`. Must be synchronous and must not throw. */
+    current?: () => SavePayload | null;
 }
 export interface SavesClient {
     readonly game: SaveGameConfig;

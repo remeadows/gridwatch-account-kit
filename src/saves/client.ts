@@ -1,3 +1,4 @@
+import { canonicalJson } from "../saves-schema/canonical.js";
 import { validatePayload } from "../saves-schema/games.js";
 import { MAX_BODY_BYTES } from "../saves-schema/wire.js";
 import type { ConflictBody, SavePayload, SaveRow, StoreRequest } from "../saves-schema/wire.js";
@@ -395,32 +396,31 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         const s = await session();
         if (disposed) return { status: "error", error: disposedError() };
         if (!s) return { status: "signed_out" };
-        // The game may hold local edits without ever calling store() (signed out, or stores held
-        // while offline), leaving a clean { revision, dirty: false } record that no longer matches
-        // what's on screen. `localChanged` tells us so: mark the record dirty BEFORE the cloud
-        // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
-        // row, and so a crash or a failed load still leaves the slot protected.
         let record = state.readRecord(s.userId, slot);
-        if (options?.localChanged === true && local !== null) {
-          // A background re-flush of this slot must send the player's actual local payload, never
-          // an older one — and never skip the slot for want of one. So this seeds on a hinted
-          // call independent of the record: if the record is already dirty (an earlier failed
-          // store() or reconcile() left it so), lastPayload is either unset, in which case the
-          // re-flush would skip this slot entirely, or holds an older payload from that earlier
-          // attempt, which is exactly the stale content this seed exists to replace.
-          //
-          // But ONLY when the slot is this user's or unclaimed. On a shared device `local` can be
-          // the OTHER account's progress: the owner record names U2 while U1 is signed in, and the
-          // question of whose save this is belongs to decideReconcile's ownedByOther prompt, a few
-          // lines below. Caching it under U1's key before that prompt has been answered — or, as
-          // here, before a failed cloud load returns and the prompt never runs at all — hands a
-          // later background re-flush U2's progress to upload into U1's cloud row, at U1's own
-          // base revision, with no conflict and no prompt. With another owner this seeds nothing.
-          // Anything already remembered for this user+slot is left alone: that is U1's own earlier
-          // payload, and quietFlush's owner guard keeps it from being sent while the slot is
-          // someone else's.
+        /** Everything the `localChanged` hint does, in one place, because `current` (below) has to
+         *  do exactly the same thing when its re-read comes back different — the whole point of
+         *  that option is that a moved local payload is indistinguishable from a caller-hinted one.
+         *
+         *  A background re-flush of this slot must send the player's actual local payload, never
+         *  an older one — and never skip the slot for want of one. So this seeds on a hinted
+         *  call independent of the record: if the record is already dirty (an earlier failed
+         *  store() or reconcile() left it so), lastPayload is either unset, in which case the
+         *  re-flush would skip this slot entirely, or holds an older payload from that earlier
+         *  attempt, which is exactly the stale content this seed exists to replace.
+         *
+         *  But ONLY when the slot is this user's or unclaimed. On a shared device `local` can be
+         *  the OTHER account's progress: the owner record names U2 while U1 is signed in, and the
+         *  question of whose save this is belongs to decideReconcile's ownedByOther prompt, a few
+         *  lines below. Caching it under U1's key before that prompt has been answered — or,
+         *  before a failed cloud load returns and the prompt never runs at all — hands a
+         *  later background re-flush U2's progress to upload into U1's cloud row, at U1's own
+         *  base revision, with no conflict and no prompt. With another owner this seeds nothing.
+         *  Anything already remembered for this user+slot is left alone: that is U1's own earlier
+         *  payload, and quietFlush's owner guard keeps it from being sent while the slot is
+         *  someone else's. */
+        const noteLocalChanged = (payload: SavePayload): void => {
           const owner = state.readOwner(slot);
-          if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), local);
+          if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), payload);
           // The dirty flag itself is only forced on a CLEAN record, and is safe regardless of the
           // owner: decideReconcile raises ownership_prompt on ownedByOther whether or not the
           // record is dirty, so marking it cannot turn a prompt into a silent upload.
@@ -428,10 +428,74 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             record = { revision: record.revision, dirty: true };
             state.writeRecord(s.userId, slot, record);
           }
-        }
+        };
+        // The game may hold local edits without ever calling store() (signed out, or stores held
+        // while offline), leaving a clean { revision, dirty: false } record that no longer matches
+        // what's on screen. `localChanged` tells us so: mark the record dirty BEFORE the cloud
+        // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
+        // row, and so a crash or a failed load still leaves the slot protected.
+        if (options?.localChanged === true && local !== null) noteLocalChanged(local);
         const loaded = await loadWith(slot, s);
         if (loaded.status === "error") return loaded;
         const cloud = loaded.status === "ok" ? loaded.save : null;
+        // The cloud GET above can take seconds, and the game's save for this slot can move inside
+        // that window. Deciding on the payload the caller handed us before the GET would then let
+        // an automatic use_cloud replace a change the game has already made — silent loss the game
+        // cannot repair afterwards, because by then this call has confirmed the cloud revision.
+        // `current` is the re-read, and it happens HERE: after the cloud row is known and with no
+        // await between it and the decision, so nothing can move in between. Once per reconcile,
+        // and only on a call that actually reaches a decision.
+        if (options?.current !== undefined) {
+          let fresh: SavePayload | null | undefined;
+          try {
+            fresh = options.current();
+          } catch (thrown) {
+            // Contained, not reported: a re-read the game could not answer is not a reason to fail
+            // a reconcile, and the passed payload is still a truthful (if older) snapshot. One
+            // warning, then today's behavior exactly.
+            const message = thrown instanceof Error ? thrown.message : String(thrown);
+            console.warn(`[account-kit] current() for ${slot} threw, deciding on the payload passed to reconcile: ${message}`);
+          }
+          // `undefined` means "no re-read": a contained throw above, or a caller that returned
+          // nothing at all. It is deliberately NOT treated like `null`, which is the game telling
+          // us this slot has no local save any more.
+          if (fresh !== undefined) {
+            let moved: boolean;
+            try {
+              // The kit's own canonical JSON (RFC 8785: recursively sorted keys, no whitespace),
+              // so a re-read that merely rebuilt the object in a different key order is not a
+              // move. It throws on a value it cannot canonicalize (a lone surrogate, a non-finite
+              // number, a class instance) — an invalid fresh payload by definition, which resolves
+              // the error below rather than being mistaken for "unchanged".
+              moved = canonicalJson(fresh) !== canonicalJson(local);
+            } catch (thrown) {
+              const message = thrown instanceof Error ? thrown.message : String(thrown);
+              console.warn(`[account-kit] refusing to reconcile ${slot}: ${message}`);
+              return { status: "error", error: { code: "invalid_payload", message } };
+            }
+            if (moved) {
+              // Validated the same way the passed payload was at the top of this call: the fresh
+              // value is about to be decided on and sent, so an invalid one must resolve the same
+              // error an invalid `local` gives, not reach a request.
+              if (fresh !== null) {
+                const valid = validatePayload(game.gameSlug, game.schemaVersion, slot, fresh);
+                if (!valid.ok) {
+                  console.warn(`[account-kit] refusing to reconcile ${slot}: ${valid.detail}`);
+                  return { status: "error", error: { code: "invalid_payload", message: valid.detail } };
+                }
+              }
+              // From here on the fresh value IS the local payload, for the decision, for whatever
+              // gets sent, and for what a later background re-flush remembers. The record-dirtying
+              // runs before the decision below, exactly as the hint's does — which is what turns
+              // every automatic `use_cloud` row into a prompt or an upload (see the table in
+              // decideReconcile: record.revision < cloud.revision with a dirty record is
+              // conflict_prompt, and a null record already was). A move to `null` seeds nothing,
+              // for the same reason the hint ignores a null local: there is nothing to protect.
+              local = fresh;
+              if (local !== null) noteLocalChanged(local);
+            }
+          }
+        }
         const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });
         const asReconcile = (result: StoreResult): ReconcileResult =>
           result.status === "stored" ? { status: "stored", revision: result.revision } : result;
