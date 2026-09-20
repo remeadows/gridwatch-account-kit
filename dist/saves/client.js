@@ -553,6 +553,19 @@ export function createSavesClient(deps) {
                             // Only an actual re-read counts; the throw fallback above asserts nothing.
                             noteLocalGone();
                         }
+                        else if (fresh !== null && reread) {
+                            // Equal to the call-time snapshot — but `local` is a reference the game may have
+                            // mutated since, and a successful re-read is the authority on what the slot holds
+                            // NOW. Decide on and send the re-read itself, never a detached copy that only used to
+                            // match it. Validated like any payload about to reach a request (the check at the top
+                            // of this call saw `local` after the queue wait, not as it was when passed).
+                            const valid = validatePayload(game.gameSlug, game.schemaVersion, slot, fresh);
+                            if (!valid.ok) {
+                                console.warn(`[account-kit] refusing to reconcile ${slot}: ${valid.detail}`);
+                                return { status: "error", error: { code: "invalid_payload", message: valid.detail } };
+                            }
+                            local = fresh;
+                        }
                     }
                 }
                 const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });

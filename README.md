@@ -95,7 +95,7 @@ const result = await kit.saves!.reconcile("campaign", project(saveRef.current), 
 });
 ```
 
-It must be synchronous and must not throw. If what it returns differs from the payload you passed
+It must be synchronous and must not throw. Treat payloads as immutable: hand `store()`, `reconcile()` and `current()` a fresh object for each state rather than one object you mutate in place — the kit compares against a snapshot taken at the call and tolerates in-place mutation on the paths it can see, but a payload that changes under a request in flight is not something it can fully defend. If what it returns differs from the payload you passed
 (compared by the kit's canonical JSON, so a rebuilt object with the same contents is *not* a
 change), the fresh value is what the kit decides on, sends, and remembers for a later background
 re-flush, and the call behaves exactly as if you had also passed `localChanged: true`. In practice

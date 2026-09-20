@@ -743,6 +743,21 @@ describe("reconcile", () => {
       expect(h.store).not.toHaveBeenCalled(); // the disowned save is not resurrected into the empty slot
     });
 
+    it("decides on and sends the re-read itself, even when it compares equal to the call-time snapshot", async () => {
+      const h = harness();
+      const live = { ...campaign }; // A at the call
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+      const pending = h.client.reconcile("campaign", live, { current: () => ({ ...campaign }) }); // the game's state is A again, in a new object
+      await flush();
+      live.coins = 42; // the object that was passed is now a detached B
+      releaseLoad(ok(404, { error: "no_save" }));
+
+      expect(await pending).toEqual({ status: "uploaded", revision: 1 });
+      expect(h.store.mock.calls[0][1].payload).toEqual(campaign); // A, what the re-read reported — not the detached B
+    });
+
     it("a `current` that returns the same payload leaves today's behavior byte for byte", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
