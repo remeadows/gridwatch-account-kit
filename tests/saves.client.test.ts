@@ -1247,6 +1247,34 @@ describe("onBackgroundStored", () => {
     expect(h.store.mock.calls[0][1].payload).toEqual(campaign);
   });
 
+  it("a re-flush queued behind a reconcile sends what is remembered when its turn comes, not what it captured", async () => {
+    const onBackgroundStored = stored();
+    const h = harness(undefined, 0, { onBackgroundStored });
+    const A = campaign;
+    const C = { ...campaign, coins: 77 };
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", A)).status).toBe("error"); // A remembered, record dirty
+
+    let releaseLoad!: (r: TransportResult) => void;
+    h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+    const pending = h.client.reconcile("campaign", A, { current: () => C });
+    await flush();
+    window.dispatchEvent(new Event("online")); // queues a background re-flush that captured A
+    await flush();
+
+    h.store.mockReset();
+    for (let attempt = 0; attempt < 3; attempt++) h.store.mockResolvedValueOnce({ kind: "network", message: "offline" }); // the reconcile's send of C fails (all retries)…
+    h.store.mockResolvedValue(ok(200, { revision: 1, updatedAt: "t" })); // …the queued re-flush then succeeds
+    releaseLoad(ok(404, { error: "no_save" }));
+    expect((await pending).status).toBe("error");
+    await flush();
+
+    const sentPayloads = h.store.mock.calls.map((c) => c[1].payload);
+    expect(sentPayloads.at(-1)).toEqual(C); // never the stale A over the latest save
+    expect(sentPayloads).not.toContainEqual(A);
+    expect(onBackgroundStored).toHaveBeenCalledWith("campaign", C, 1, "u1");
+  });
+
   it("never fires for a foreground store() or reconcile() that succeeds", async () => {
     const onBackgroundStored = stored();
     const h = harness(undefined, 0, { onBackgroundStored });

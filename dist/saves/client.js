@@ -722,7 +722,16 @@ export function createSavesClient(deps) {
             // which it may mutate while this request is in flight. onBackgroundStored must describe what
             // the cloud now holds, or a game comparing it to its current save could clear an "unsynced"
             // marker for content that was never stored.
-            const sent = JSON.parse(JSON.stringify(payload));
+            //
+            // And it is what is remembered NOW, not what this closure captured when it was queued: a
+            // foreground store()/reconcile() ahead of it in the chain may have remembered a newer payload
+            // and then failed to send it, leaving the record dirty. Sending the captured one would land
+            // stale content on the confirmed revision and mark the slot clean over the latest save.
+            // Nothing remembered any more means it was disowned or sent: there is nothing to do.
+            const latest = lastPayload.get(payloadKey(s.userId, slot));
+            if (latest === undefined)
+                return;
+            const sent = JSON.parse(JSON.stringify(latest));
             const outcome = await sendOnce(slot, sent, base, s);
             if (disposed)
                 return;
