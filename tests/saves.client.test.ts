@@ -1177,7 +1177,7 @@ describe("onBackgroundStored", () => {
     await flush();
     expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
     expect(onBackgroundStored).toHaveBeenCalledTimes(1);
-    expect(onBackgroundStored).toHaveBeenCalledWith("campaign", campaign, 1);
+    expect(onBackgroundStored).toHaveBeenCalledWith("campaign", campaign, 1, "u1"); // whose row it landed in
   });
 
   it("hands the callback a copy of what was SENT, not the live object the game may have mutated since", async () => {
@@ -2260,6 +2260,6 @@ describe("two real clients over one storage", () => {
     expect(t2.state.readOwner("campaign")).toBe("u2");
     expect(t2.state.readRecord("u2", "campaign")).toEqual({ revision: 1, dirty: false }); // untouched
     expect(onBackgroundStored).toHaveBeenCalledTimes(1);
-    expect(onBackgroundStored).toHaveBeenCalledWith("campaign", b, 2);
+    expect(onBackgroundStored).toHaveBeenCalledWith("campaign", b, 2, "u1");
   });
 });

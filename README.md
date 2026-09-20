@@ -55,11 +55,14 @@ A background re-flush has no caller to resolve, so if your game keeps its own "u
 const kit = createAccountKit({
   returnPath: "/play/match/",
   game: { /* … */ },
-  onBackgroundStored: (slot, payload, revision) => clearUnsyncedMarker(slot, revision),
+  onBackgroundStored: (slot, payload, revision, userId) => {
+    // The send may have outlasted an account switch: only act for whoever is signed in now.
+    if (userId === currentUserId()) clearUnsyncedMarker(slot, revision);
+  },
 });
 ```
 
-It fires once per successful background re-flush, with the payload the kit sent and the new revision, right after the kit has recorded that revision itself. It does *not* fire for a foreground `store`/`reconcile` (those resolve to you already), nor for a re-flush that conflicted, errored, was dropped because the player's choice discarded it, stopped at another account's claim on the slot, or raced `dispose()`. A callback that throws is contained with one warning and changes nothing the kit recorded; so is an `async` callback that rejects, though the kit never waits on it — a background re-flush does not block on the game's bookkeeping, so do the work synchronously if you need it done before the kit moves on.
+It fires once per successful background re-flush, with the payload the kit sent, the new revision and the id of the account whose cloud row it landed in, right after the kit has recorded that revision itself. It does *not* fire for a foreground `store`/`reconcile` (those resolve to you already), nor for a re-flush that conflicted, errored, was dropped because the player's choice discarded it, stopped at another account's claim on the slot, or raced `dispose()`. A callback that throws is contained with one warning and changes nothing the kit recorded; so is an `async` callback that rejects, though the kit never waits on it — a background re-flush does not block on the game's bookkeeping, so do the work synchronously if you need it done before the kit moves on.
 
 Pass `{ localChanged: true }` as a third argument to `reconcile` when the game knows this slot's
 local payload has changes that were never confirmed in the cloud — e.g. the player made edits

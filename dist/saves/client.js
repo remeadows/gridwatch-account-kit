@@ -725,7 +725,7 @@ export function createSavesClient(deps) {
                     console.warn(`[account-kit] onBackgroundStored for ${slot} threw: ${message}`);
                 };
                 try {
-                    const returned = deps.onBackgroundStored?.(slot, sent, outcome.revision);
+                    const returned = deps.onBackgroundStored?.(slot, sent, outcome.revision, s.userId);
                     // The declared type is void, but a game can pass an `async` function: its rejection
                     // would escape the catch below and surface as an unhandled rejection in the host page.
                     // Attach a handler so it reports through the same single warning instead. Deliberately

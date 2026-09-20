@@ -23,7 +23,10 @@ export interface SavesClientDeps {
    *  resolve. Only that path fires it: never a foreground store()/reconcile(), never a flush that
    *  conflicted, errored, was discarded, stopped at another account's claim, or raced dispose().
    *  A throw is contained with one warning. */
-  onBackgroundStored?: (slot: string, payload: SavePayload, revision: number) => void;
+  /** `userId` is the account whose cloud row the payload landed in. A background send can outlast a
+   *  sign-out or an account switch, so a game whose bookkeeping is not per-user must compare it to
+   *  whoever is signed in now before acting on the notification. */
+  onBackgroundStored?: (slot: string, payload: SavePayload, revision: number, userId: string) => void;
 }
 
 type Session = { token: string; userId: string };
@@ -730,7 +733,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
           console.warn(`[account-kit] onBackgroundStored for ${slot} threw: ${message}`);
         };
         try {
-          const returned: unknown = deps.onBackgroundStored?.(slot, sent, outcome.revision);
+          const returned: unknown = deps.onBackgroundStored?.(slot, sent, outcome.revision, s.userId);
           // The declared type is void, but a game can pass an `async` function: its rejection
           // would escape the catch below and surface as an unhandled rejection in the host page.
           // Attach a handler so it reports through the same single warning instead. Deliberately
