@@ -1201,6 +1201,58 @@ describe("onBackgroundStored", () => {
     expect(onBackgroundStored).not.toHaveBeenCalled();
   });
 
+  it("contains a REJECTED async callback with the same single warning, and still counts the flush as stored", async () => {
+    // The declared type returns void, but nothing stops a game from passing an async function:
+    // its rejection would sail straight past a synchronous try/catch.
+    const onBackgroundStored = vi.fn(async () => { throw new Error("marker write failed"); });
+    const h = harness(undefined, 0, { onBackgroundStored });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    await flush(); // the rejection settles a microtask after the flush returns
+
+    expect(onBackgroundStored).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+    // A game's own bookkeeping failing says nothing about the request that succeeded.
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+    expect(h.state.readOwner("campaign")).toBe("u1");
+  });
+
+  // "No unhandled rejection" is exactly "a rejection handler was attached to what the callback
+  // returned", and that is what this asserts directly: a hand-rolled thenable records the
+  // handlers it is given. (Asserting it through a process-level "unhandledRejection" listener is
+  // not an option here — vitest 4 runs these files in worker threads where such a listener never
+  // observes a floating rejection, so the assertion would pass whether or not the handler exists.)
+  it("attaches a rejection handler to whatever the callback returns, rather than dropping it", async () => {
+    const handlers: Array<((reason: unknown) => unknown) | undefined | null> = [];
+    const thenable = { then(_onOk?: unknown, onRejected?: ((reason: unknown) => unknown) | null) { handlers.push(onRejected); } };
+    const onBackgroundStored = vi.fn(() => thenable as unknown as void);
+    const h = harness(undefined, 0, { onBackgroundStored });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+
+    expect(handlers).toHaveLength(1);
+    expect(typeof handlers[0]).toBe("function");
+    // And that handler is what emits the one warning, so a rejection is reported exactly like a
+    // synchronous throw.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    handlers[0]?.(new Error("marker write failed"));
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+  });
+
   it("contains a throwing callback with one warning, leaving the confirmed record intact", async () => {
     const onBackgroundStored = vi.fn(() => { throw new Error("marker update failed"); });
     const h = harness(undefined, 0, { onBackgroundStored });

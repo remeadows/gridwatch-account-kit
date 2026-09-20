@@ -64,6 +64,13 @@ function toCloudSave(row: SaveRow): CloudSave {
   return { revision: row.revision, schemaVersion: row.schemaVersion, payload: row.payload, updatedAt: row.updatedAt };
 }
 
+/** True for anything with a callable `then`. Used only to contain a caller-supplied callback that
+ *  turns out to be async: the declared return type is void, but a game can hand us an `async`
+ *  function whose rejection would otherwise escape a synchronous try/catch. */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return typeof (value as PromiseLike<unknown> | null | undefined)?.then === "function";
+}
+
 function errorFor(result: TransportResult): SaveError {
   if (result.kind === "network") return { code: "network", message: result.message };
   const message = typeof (result.body as { error?: unknown })?.error === "string" ? String((result.body as { error: string }).error) : `HTTP ${result.status}`;
@@ -672,11 +679,21 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         // row now, so the kit's own record must already say so. Contained, because a game's
         // marker bookkeeping throwing must not turn a successful re-flush into the warning
         // quietFlush's own catch would log for a failed one, nor leave the slot looking unsynced.
-        try {
-          deps.onBackgroundStored?.(slot, payload, outcome.revision);
-        } catch (thrown) {
+        const warnCallback = (thrown: unknown) => {
           const message = thrown instanceof Error ? thrown.message : String(thrown);
           console.warn(`[account-kit] onBackgroundStored for ${slot} threw: ${message}`);
+        };
+        try {
+          const returned: unknown = deps.onBackgroundStored?.(slot, payload, outcome.revision);
+          // The declared type is void, but a game can pass an `async` function: its rejection
+          // would escape the catch below and surface as an unhandled rejection in the host page.
+          // Attach a handler so it reports through the same single warning instead. Deliberately
+          // not awaited — a background re-flush does not wait on the game's bookkeeping — and
+          // deliberately not done for `current`, which is documented synchronous and returns a
+          // payload, never a promise.
+          if (isThenable(returned)) returned.then(undefined, warnCallback);
+        } catch (thrown) {
+          warnCallback(thrown);
         }
         return;
       }

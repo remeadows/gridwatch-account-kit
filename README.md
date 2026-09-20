@@ -59,7 +59,7 @@ const kit = createAccountKit({
 });
 ```
 
-It fires once per successful background re-flush, with the payload the kit sent and the new revision, right after the kit has recorded that revision itself. It does *not* fire for a foreground `store`/`reconcile` (those resolve to you already), nor for a re-flush that conflicted, errored, was dropped because the player's choice discarded it, stopped at another account's claim on the slot, or raced `dispose()`. A callback that throws is contained with one warning and changes nothing the kit recorded.
+It fires once per successful background re-flush, with the payload the kit sent and the new revision, right after the kit has recorded that revision itself. It does *not* fire for a foreground `store`/`reconcile` (those resolve to you already), nor for a re-flush that conflicted, errored, was dropped because the player's choice discarded it, stopped at another account's claim on the slot, or raced `dispose()`. A callback that throws is contained with one warning and changes nothing the kit recorded; so is an `async` callback that rejects, though the kit never waits on it — a background re-flush does not block on the game's bookkeeping, so do the work synchronously if you need it done before the kit moves on.
 
 Pass `{ localChanged: true }` as a third argument to `reconcile` when the game knows this slot's
 local payload has changes that were never confirmed in the cloud — e.g. the player made edits
