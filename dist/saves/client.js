@@ -484,6 +484,11 @@ export function createSavesClient(deps) {
                         // warning, then today's behavior exactly.
                         const message = thrown instanceof Error ? thrown.message : String(thrown);
                         console.warn(`[account-kit] current() for ${slot} threw, deciding on the payload passed to reconcile: ${message}`);
+                        // "The payload passed to reconcile" is a live reference the game may have mutated in
+                        // place since the call. Run it through the same comparison against the call-time
+                        // snapshot, so that move is still noticed; an untouched payload compares equal and
+                        // gets today's behavior exactly.
+                        fresh = local;
                     }
                     // `undefined` means "no re-read": a contained throw above, or a caller that returned
                     // nothing at all. It is deliberately NOT treated like `null`, which is the game telling

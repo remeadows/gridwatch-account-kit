@@ -704,6 +704,28 @@ describe("reconcile", () => {
       expect(h.store.mock.calls[0][1].payload).toEqual({ ...campaign, coins: 42 });
     });
 
+    it("a throwing `current` still notices a payload mutated in place since the call", async () => {
+      const h = harness();
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      const live = { ...campaign };
+      let releaseLoad!: (r: TransportResult) => void;
+      h.load.mockImplementationOnce(() => new Promise((resolve) => { releaseLoad = resolve; }));
+      h.store.mockResolvedValueOnce(ok(200, { revision: 6, updatedAt: "t" }));
+      h.answers.push("secondary"); // "Keep this one"
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const pending = h.client.reconcile("campaign", live, { current: () => { throw new Error("nope"); } });
+      await flush();
+      live.coins = 42;
+      releaseLoad(ok(200, row(5)));
+
+      expect(await pending).toEqual({ status: "stored", revision: 6 });
+      expect(h.asked).toEqual([CONFLICT_COPY]); // the fallback is compared to the call-time snapshot too
+      expect(h.store.mock.calls[0][1].payload).toEqual({ ...campaign, coins: 42 });
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+    });
+
     it("a `current` that returns the same payload leaves today's behavior byte for byte", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
