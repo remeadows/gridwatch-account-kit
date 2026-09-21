@@ -584,10 +584,18 @@ export function createSavesClient(deps) {
                     if (!now || now.userId !== s.userId)
                         return { status: "signed_out" };
                     // Same user: carry the freshly resolved session forward, so a token that refreshed while
-                    // the GET was pending is what any send below uses — including one this call's own 401
-                    // recovery may already have replaced, which this supersedes (both are the same user's).
-                    s = now;
-                    op.s = now;
+                    // the GET was pending is what any send below uses. UNLESS this operation's own 401
+                    // recovery already replaced the token: getSession and refreshSession are independent
+                    // host callbacks, and a host whose getSession still reports the stale token would put the
+                    // one the server just rejected back in place, with the operation's single recovery
+                    // already spent. The recovered session is the newer fact, so it stays.
+                    if (op.refreshed) {
+                        s = op.s;
+                    }
+                    else {
+                        s = now;
+                        op.s = now;
+                    }
                     let fresh;
                     let reread = false;
                     try {

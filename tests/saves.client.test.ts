@@ -790,6 +790,20 @@ describe("reconcile", () => {
       expect(await pending).toEqual({ status: "current" });
     });
 
+    it("keeps a token its own 401 recovery obtained, even if getSession still returns the stale one", async () => {
+      // A host whose refreshSession returns fresh credentials without changing what getSession reports.
+      const refreshSession = vi.fn(async () => ({ access_token: "tok-recovered", user: { id: "u1" } }));
+      const h = harness(undefined, 0, { refreshSession });
+      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      h.state.writeOwner("campaign", "u1");
+      h.load.mockResolvedValueOnce(ok(401, { error: "unauthorized" })); // the GET is rejected…
+      h.load.mockResolvedValueOnce(ok(200, row(3))); // …and recovered
+      h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t" }));
+      expect(await h.client.reconcile("campaign", L0, { current: () => L1 })).toEqual({ status: "stored", revision: 4 });
+      expect(refreshSession).toHaveBeenCalledTimes(1);
+      expect(h.store.mock.calls[0][2]).toBe("tok-recovered"); // not the token the server just rejected
+    });
+
     it("sends with the token it re-resolved, not the one captured before the GET", async () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
