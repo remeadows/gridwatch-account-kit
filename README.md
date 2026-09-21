@@ -9,7 +9,7 @@ Add to your `package.json`:
 ```json
 {
   "dependencies": {
-    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.2.3"
+    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.2.4"
   }
 }
 ```
@@ -25,6 +25,8 @@ import "@gridwatch/account-kit/header.css";
 const kit = createAccountKit({ returnPath: "/play/match/" });
 mountAccountHeader(kit);
 ```
+
+`kit.signOut()` signs the player out of **this browser only** — their sessions on other devices stay signed in.
 
 ### Cloud saves
 
@@ -117,6 +119,8 @@ fails validation resolves `{ status: "error", error: { code: "invalid_payload", 
 sending anything, exactly as an invalid `local` does; a `current` that throws is contained with one
 warning and the call decides on the payload you passed. Omit it and nothing changes. Out of scope
 by design: a change made while a *prompt* is open — the player's explicit answer wins.
+
+**When the session is rejected.** The saves API validates every token with Supabase, so a session that was revoked server-side — signing out elsewhere, an admin action — answers `401` even though this device's cached JWT has not expired yet. On a `401` (a `GET` or a `PUT`) the kit asks Supabase to refresh the session *once* for that operation and, if the refresh returns a session for the same player, retries the request with the new token; you get the retry's result, and nothing else happens. If the refresh cannot help — no session, an error, or a different account — or the retry answers `401` again, the call resolves exactly the `401` error it would have before (the slot stays dirty, so a later re-flush or `store` can still send it), and the kit then ends the session **for this browser only**, so the account bar and `useAccount` fall back to "Sign in" instead of showing a name the server no longer accepts. That local sign-out happens only while the rejected account is still the signed-in one: a rejection that arrives after the player has switched accounts is ignored, not applied to the new one. There is never more than one refresh per operation and never a retry loop. Nothing the kit holds for the slot is cleared by a rejection — not the sync record, not a payload remembered for a background re-flush, not the ownership record — so unsynced progress is still there when the player signs back in.
 
 Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SPA): it removes the `online`/`visibilitychange` listeners, closes any prompt dialog that's on screen, settles calls still waiting on the debounce timer or on a prompt immediately, and marks the client disposed so a call that is mid-request settles with `{ status: "error", error: { code: "http", message: "disposed" } }` as soon as its current transport attempt returns (the deadline below bounds that wait); no state is written after `dispose()`.
 

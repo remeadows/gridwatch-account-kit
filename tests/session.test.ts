@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __setSupabaseForTests } from "../src/client";
 import { createAccountKit } from "../src/session";
 
@@ -13,6 +13,7 @@ function fakeSupabase(session: unknown = null) {
       signInWithOtp: vi.fn(async () => ({ error: null })),
       signInWithOAuth: vi.fn(async () => ({ error: null })),
       signOut: vi.fn(async () => ({ error: null })),
+      refreshSession: vi.fn(async () => ({ data: { session }, error: null })),
     },
     from: vi.fn(() => ({ select: () => ({ eq: () => ({ maybeSingle }) }), upsert })),
     __emit: (s: unknown) => listeners.forEach((l) => l("SIGNED_IN", s)),
@@ -89,6 +90,16 @@ describe("createAccountKit", () => {
     const kit = createAccountKit({ returnPath: "/" });
     await expect(kit.signOut()).resolves.toBeUndefined();
     expect(sb.auth.signOut).toHaveBeenCalledTimes(1);
+  });
+
+  // D1: signOut() called auth.signOut() with no argument, whose default scope is GLOBAL — signing
+  // out on one device revoked the player's session on every other device too (their phone kept
+  // showing their name while every saves call answered 401).
+  it("signs out of this browser only, leaving the player's other devices signed in", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    await kit.signOut();
+    expect(sb.auth.signOut).toHaveBeenCalledWith({ scope: "local" });
   });
 
   it("saveHandle returns the error message when the error object has no code", async () => {
@@ -185,5 +196,136 @@ describe("createAccountKit", () => {
     expect(url).toBe("https://nexus.example/api/saves/match/campaign");
     expect(url.slice("https://".length)).not.toContain("//");
     vi.unstubAllGlobals();
+  });
+});
+
+// D2: the saves API validates every token with Supabase, so a session revoked elsewhere answers
+// 401 while this device's cached JWT is still unexpired — the player kept seeing their name, and
+// nothing synced, with nothing to tell them. The kit now wires the saves client's two recovery
+// hooks: one refresh attempt, and, when that cannot help, an end to the LOCAL session so the
+// header and useAccount fall back to "Sign in".
+describe("a saves session the server rejects", () => {
+  const matchGame = { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 };
+  const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  const sessionFor = (id: string, token: string) => ({ access_token: token, user: { id, email: "r@example.com" } });
+  const settled = () => new Promise((r) => setTimeout(r, 0)); // the notification is fire-and-forget
+  const authHeader = (call: unknown[]) => new Headers((call[1] as RequestInit).headers).get("Authorization");
+
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("maps auth.refreshSession into the kit's session shape and retries the request with the new token", async () => {
+    const sb = fakeSupabase(sessionFor("u1", "tok"));
+    sb.auth.refreshSession.mockResolvedValueOnce({ data: { session: sessionFor("u1", "tok2") }, error: null } as never);
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(reply(401, { error: "unauthorized" }))
+      .mockResolvedValueOnce(reply(404, { error: "no_save" }));
+    vi.stubGlobal("fetch", fetchImpl);
+    const kit = createAccountKit({ returnPath: "/play/match/", game: matchGame });
+    expect(await kit.saves!.load("campaign")).toEqual({ status: "none" });
+    expect(fetchImpl.mock.calls.map(authHeader)).toEqual(["Bearer tok", "Bearer tok2"]);
+    await settled();
+    expect(sb.auth.signOut).not.toHaveBeenCalled(); // recovered: the player stays signed in
+    kit.saves!.dispose();
+  });
+
+  it("ends the LOCAL session when the rejected user is still the signed-in one", async () => {
+    const sb = fakeSupabase(sessionFor("u1", "tok"));
+    sb.auth.refreshSession.mockResolvedValue({ data: { session: null }, error: { message: "refresh_token_not_found" } } as never);
+    const fetchImpl = vi.fn(async () => reply(401, { error: "unauthorized" }));
+    vi.stubGlobal("fetch", fetchImpl);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/play/match/", game: matchGame });
+    expect(await kit.saves!.load("campaign")).toMatchObject({ status: "error", error: { code: "http", status: 401 } });
+    await settled();
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // a failed refresh is never retried
+    expect(sb.auth.signOut).toHaveBeenCalledTimes(1);
+    expect(sb.auth.signOut).toHaveBeenCalledWith({ scope: "local" }); // local: the other devices are innocent
+    warn.mockRestore();
+    kit.saves!.dispose();
+  });
+
+  it("ends the local session once when several operations are rejected at the same time", async () => {
+    const sb = fakeSupabase(sessionFor("u1", "tok"));
+    sb.auth.refreshSession.mockResolvedValue({ data: { session: null }, error: { message: "refresh_token_not_found" } } as never);
+    vi.stubGlobal("fetch", vi.fn(async () => reply(401, { error: "unauthorized" })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/play/match/", game: matchGame });
+    await Promise.all([kit.saves!.load("campaign"), kit.saves!.load("settings")]); // two slots, two rejections
+    await settled();
+    expect(sb.auth.signOut).toHaveBeenCalledTimes(1); // one check-then-sign-out in flight, not one per rejection
+    warn.mockRestore();
+    kit.saves!.dispose();
+  });
+
+  it("gives each rejected user their own check: a stale rejection for u1 does not swallow u2's", async () => {
+    const sb = fakeSupabase(sessionFor("u1", "tok"));
+    sb.auth.refreshSession.mockResolvedValue({ data: { session: null }, error: { message: "refresh_token_not_found" } } as never);
+    const held: Array<(r: Response) => void> = [];
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { held.push(resolve); })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/play/match/", game: matchGame });
+    const first = kit.saves!.load("campaign"); // captured under u1
+    await settled();
+    sb.auth.getSession.mockResolvedValue({ data: { session: sessionFor("u2", "tok2") }, error: null } as never); // the browser is u2's now
+    const second = kit.saves!.load("settings"); // captured under u2
+    await settled();
+    expect(held).toHaveLength(2);
+    held[0](reply(401, { error: "unauthorized" })); // u1's stale rejection starts first…
+    held[1](reply(401, { error: "unauthorized" })); // …and u2's overlaps it
+    await Promise.all([first, second]);
+    await settled();
+    expect(sb.auth.signOut).toHaveBeenCalledTimes(1); // u1's check finds u2 and does nothing; u2's own check signs out
+    expect(sb.auth.signOut).toHaveBeenCalledWith({ scope: "local" });
+    warn.mockRestore();
+    kit.saves!.dispose();
+  });
+
+  it("reports a throwing auth.refreshSession as no recovery rather than failing the operation", async () => {
+    const sb = fakeSupabase(sessionFor("u1", "tok"));
+    sb.auth.refreshSession.mockRejectedValue(new Error("network down") as never);
+    const fetchImpl = vi.fn(async () => reply(401, { error: "unauthorized" }));
+    vi.stubGlobal("fetch", fetchImpl);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/play/match/", game: matchGame });
+    expect(await kit.saves!.load("campaign")).toMatchObject({ status: "error", error: { code: "http", status: 401 } });
+    await settled();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(sb.auth.signOut).toHaveBeenCalledWith({ scope: "local" });
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+    kit.saves!.dispose();
+  });
+
+  it("does nothing when the rejection names a user who is no longer the signed-in one", async () => {
+    const sb = fakeSupabase(sessionFor("u1", "tok"));
+    sb.auth.getSession
+      .mockResolvedValueOnce({ data: { session: sessionFor("u1", "tok") }, error: null } as never)  // the saves call runs as u1
+      .mockResolvedValue({ data: { session: sessionFor("u2", "tok2") }, error: null } as never);    // u2 has signed in since
+    sb.auth.refreshSession.mockResolvedValue({ data: { session: null }, error: { message: "gone" } } as never);
+    const fetchImpl = vi.fn(async () => reply(401, { error: "unauthorized" }));
+    vi.stubGlobal("fetch", fetchImpl);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/play/match/", game: matchGame });
+    expect(await kit.saves!.load("campaign")).toMatchObject({ status: "error", error: { code: "http", status: 401 } });
+    await settled();
+    expect(sb.auth.signOut).not.toHaveBeenCalled(); // a stale rejection must not sign the current account out
+    warn.mockRestore();
+    kit.saves!.dispose();
+  });
+
+  it("contains a signOut that rejects while ending a rejected session", async () => {
+    const sb = fakeSupabase(sessionFor("u1", "tok"));
+    sb.auth.refreshSession.mockResolvedValue({ data: { session: null }, error: { message: "gone" } } as never);
+    sb.auth.signOut.mockRejectedValue(new Error("sign-out exploded") as never);
+    const fetchImpl = vi.fn(async () => reply(401, { error: "unauthorized" }));
+    vi.stubGlobal("fetch", fetchImpl);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/play/match/", game: matchGame });
+    expect(await kit.saves!.load("campaign")).toMatchObject({ status: "error", error: { code: "http", status: 401 } });
+    await settled();
+    expect(sb.auth.signOut).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+    kit.saves!.dispose();
   });
 });
