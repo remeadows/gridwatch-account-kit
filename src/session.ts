@@ -125,14 +125,27 @@ export function createAccountKit(input: AccountKitConfig): AccountKit {
    *
    *  Contained end to end: this is a notification, and a failure to act on it must not surface as
    *  an unhandled rejection in the host page or change the result the saves call already has. */
-  async function endLocalSession(userId: string): Promise<void> {
-    try {
-      if ((await currentUserId()) !== userId) return;
-      const { error } = await getSupabase().auth.signOut({ scope: "local" });
-      if (error) console.warn("[account-kit] local sign-out after a rejected session failed:", error.message);
-    } catch (thrown) {
-      console.warn("[account-kit] local sign-out after a rejected session threw:", thrown instanceof Error ? thrown.message : String(thrown));
-    }
+  let endingLocalSession: Promise<void> | null = null;
+  function endLocalSession(userId: string): Promise<void> {
+    // One check-then-sign-out at a time. Both slots are usually rejected together, and each extra
+    // concurrent run is another chance for its sign-out to land after a DIFFERENT account has
+    // become current. supabase-js can only sign out "the current session", so the check and the
+    // sign-out cannot be made atomic; what can be done is to run the pair once, back to back, and
+    // let later rejections join it. (Sign-in through the kit is a full-page redirect, which
+    // discards this page and any sign-out still pending on it.)
+    if (endingLocalSession) return endingLocalSession;
+    endingLocalSession = (async () => {
+      try {
+        if ((await currentUserId()) !== userId) return;
+        const { error } = await getSupabase().auth.signOut({ scope: "local" });
+        if (error) console.warn("[account-kit] local sign-out after a rejected session failed:", error.message);
+      } catch (thrown) {
+        console.warn("[account-kit] local sign-out after a rejected session threw:", thrown instanceof Error ? thrown.message : String(thrown));
+      } finally {
+        endingLocalSession = null;
+      }
+    })();
+    return endingLocalSession;
   }
 
   if (input.game) assertGameConfig(input.game);

@@ -244,6 +244,19 @@ describe("a saves session the server rejects", () => {
     kit.saves!.dispose();
   });
 
+  it("ends the local session once when several operations are rejected at the same time", async () => {
+    const sb = fakeSupabase(sessionFor("u1", "tok"));
+    sb.auth.refreshSession.mockResolvedValue({ data: { session: null }, error: { message: "refresh_token_not_found" } } as never);
+    vi.stubGlobal("fetch", vi.fn(async () => reply(401, { error: "unauthorized" })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/play/match/", game: matchGame });
+    await Promise.all([kit.saves!.load("campaign"), kit.saves!.load("settings")]); // two slots, two rejections
+    await settled();
+    expect(sb.auth.signOut).toHaveBeenCalledTimes(1); // one check-then-sign-out in flight, not one per rejection
+    warn.mockRestore();
+    kit.saves!.dispose();
+  });
+
   it("reports a throwing auth.refreshSession as no recovery rather than failing the operation", async () => {
     const sb = fakeSupabase(sessionFor("u1", "tok"));
     sb.auth.refreshSession.mockRejectedValue(new Error("network down") as never);
