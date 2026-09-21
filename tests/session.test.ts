@@ -91,6 +91,16 @@ describe("createAccountKit", () => {
     expect(sb.auth.signOut).toHaveBeenCalledTimes(1);
   });
 
+  // D1: signOut() called auth.signOut() with no argument, whose default scope is GLOBAL — signing
+  // out on one device revoked the player's session on every other device too (their phone kept
+  // showing their name while every saves call answered 401).
+  it("signs out of this browser only, leaving the player's other devices signed in", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    await kit.signOut();
+    expect(sb.auth.signOut).toHaveBeenCalledWith({ scope: "local" });
+  });
+
   it("saveHandle returns the error message when the error object has no code", async () => {
     const sb = fakeSupabase(user);
     const kit = createAccountKit({ returnPath: "/" });

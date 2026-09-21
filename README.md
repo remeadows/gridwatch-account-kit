@@ -26,6 +26,8 @@ const kit = createAccountKit({ returnPath: "/play/match/" });
 mountAccountHeader(kit);
 ```
 
+`kit.signOut()` signs the player out of **this browser only** — their sessions on other devices stay signed in.
+
 ### Cloud saves
 
 ```ts

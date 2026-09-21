@@ -127,7 +127,11 @@ export function createAccountKit(input: AccountKitConfig): AccountKit {
       return error ? error.message : null;
     },
     async signOut() {
-      const { error } = await getSupabase().auth.signOut();
+      // scope: "local" — never Supabase's default, which is GLOBAL and revokes every session the
+      // player has anywhere. Signing out of this browser must not end their session on their phone:
+      // the saves API validates tokens against Supabase, so a revoked-but-unexpired JWT leaves that
+      // device still showing the player's name while every saves call answers 401.
+      const { error } = await getSupabase().auth.signOut({ scope: "local" });
       if (error) throw new Error(error.message);
     },
     async getProfile() {
