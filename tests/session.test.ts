@@ -257,6 +257,29 @@ describe("a saves session the server rejects", () => {
     kit.saves!.dispose();
   });
 
+  it("gives each rejected user their own check: a stale rejection for u1 does not swallow u2's", async () => {
+    const sb = fakeSupabase(sessionFor("u1", "tok"));
+    sb.auth.refreshSession.mockResolvedValue({ data: { session: null }, error: { message: "refresh_token_not_found" } } as never);
+    const held: Array<(r: Response) => void> = [];
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { held.push(resolve); })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kit = createAccountKit({ returnPath: "/play/match/", game: matchGame });
+    const first = kit.saves!.load("campaign"); // captured under u1
+    await settled();
+    sb.auth.getSession.mockResolvedValue({ data: { session: sessionFor("u2", "tok2") }, error: null } as never); // the browser is u2's now
+    const second = kit.saves!.load("settings"); // captured under u2
+    await settled();
+    expect(held).toHaveLength(2);
+    held[0](reply(401, { error: "unauthorized" })); // u1's stale rejection starts first…
+    held[1](reply(401, { error: "unauthorized" })); // …and u2's overlaps it
+    await Promise.all([first, second]);
+    await settled();
+    expect(sb.auth.signOut).toHaveBeenCalledTimes(1); // u1's check finds u2 and does nothing; u2's own check signs out
+    expect(sb.auth.signOut).toHaveBeenCalledWith({ scope: "local" });
+    warn.mockRestore();
+    kit.saves!.dispose();
+  });
+
   it("reports a throwing auth.refreshSession as no recovery rather than failing the operation", async () => {
     const sb = fakeSupabase(sessionFor("u1", "tok"));
     sb.auth.refreshSession.mockRejectedValue(new Error("network down") as never);

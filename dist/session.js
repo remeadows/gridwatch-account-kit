@@ -96,17 +96,25 @@ export function createAccountKit(input) {
      *
      *  Contained end to end: this is a notification, and a failure to act on it must not surface as
      *  an unhandled rejection in the host page or change the result the saves call already has. */
-    let endingLocalSession = null;
+    const endingLocalSession = new Map();
+    let endingTail = Promise.resolve();
     function endLocalSession(userId) {
-        // One check-then-sign-out at a time. Both slots are usually rejected together, and each extra
-        // concurrent run is another chance for its sign-out to land after a DIFFERENT account has
-        // become current. supabase-js can only sign out "the current session", so the check and the
-        // sign-out cannot be made atomic; what can be done is to run the pair once, back to back, and
-        // let later rejections join it. (Sign-in through the kit is a full-page redirect, which
-        // discards this page and any sign-out still pending on it.)
-        if (endingLocalSession)
-            return endingLocalSession;
-        endingLocalSession = (async () => {
+        // Deduplicated PER USER, serialized ACROSS users. Both slots are usually rejected together, so
+        // a second rejection for the same user joins the run already in flight instead of adding
+        // another check-then-sign-out pair. A rejection for a DIFFERENT user must not join it: an
+        // operation captured under a previous account can be rejected alongside one for the current
+        // account, and if the stale one ran first and the current one merely joined it, the check would
+        // find "not that user", do nothing, and leave the really rejected session on screen. So each
+        // user gets their own check, one after another.
+        //
+        // supabase-js can only sign out "the current session", so a check and its sign-out cannot be
+        // made atomic; running the pairs back to back, never interleaved, is what can be done.
+        // (Sign-in through the kit is a full-page redirect, which discards this page and any sign-out
+        // still pending on it.)
+        const inFlight = endingLocalSession.get(userId);
+        if (inFlight)
+            return inFlight;
+        const run = endingTail.then(async () => {
             try {
                 if ((await currentUserId()) !== userId)
                     return;
@@ -118,10 +126,12 @@ export function createAccountKit(input) {
                 console.warn("[account-kit] local sign-out after a rejected session threw:", thrown instanceof Error ? thrown.message : String(thrown));
             }
             finally {
-                endingLocalSession = null;
+                endingLocalSession.delete(userId);
             }
-        })();
-        return endingLocalSession;
+        });
+        endingLocalSession.set(userId, run);
+        endingTail = run;
+        return run;
     }
     if (input.game)
         assertGameConfig(input.game);
