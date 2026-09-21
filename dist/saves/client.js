@@ -102,8 +102,83 @@ export function createSavesClient(deps) {
             lastKnownUserId = next.userId;
         return next;
     }
-    async function loadWith(slot, s) {
-        const result = await withRetry(() => transport.load(slot, s.token), sleep);
+    const operation = (s) => ({ s, refreshed: false, notified: false });
+    const is401 = (result) => result.kind === "ok" && result.status === 401;
+    /** Contained exactly like onBackgroundStored, and for the same reason: the host's reaction (the
+     *  kit's own wiring ends the local session) must never turn a reported 401 into a thrown or
+     *  rejected operation. At most once per operation. */
+    function notifySessionRejected(op) {
+        if (op.notified)
+            return;
+        op.notified = true;
+        const warnCallback = (thrown) => {
+            const message = thrown instanceof Error ? thrown.message : String(thrown);
+            console.warn(`[account-kit] onSessionRejected threw: ${message}`);
+        };
+        try {
+            const returned = deps.onSessionRejected?.(op.s.userId);
+            // The declared type is void, but a host can pass an `async` function whose rejection would
+            // escape this try/catch — same containment as onBackgroundStored, deliberately not awaited.
+            if (isThenable(returned))
+                returned.then(undefined, warnCallback);
+        }
+        catch (thrown) {
+            warnCallback(thrown);
+        }
+    }
+    /** The one refresh this operation is allowed. Null for every way it can fail to produce a
+     *  session this operation may use: no dep, a second 401, no session, a throw, or a DIFFERENT
+     *  user — a recovery that signed somebody else in is not this operation's session, and sending
+     *  under it would upload one account's payload into another's row. */
+    async function recoverSession(op) {
+        if (op.refreshed || !deps.refreshSession)
+            return null;
+        op.refreshed = true;
+        let recovered;
+        try {
+            recovered = await deps.refreshSession();
+        }
+        catch (thrown) {
+            const message = thrown instanceof Error ? thrown.message : String(thrown);
+            console.warn(`[account-kit] refreshSession threw: ${message}`);
+            return null;
+        }
+        if (!recovered || recovered.user.id !== op.s.userId)
+            return null;
+        return { token: recovered.access_token, userId: recovered.user.id };
+    }
+    /** Every request the client makes goes through here: the attempt (with its existing bounded
+     *  retry), and, on 401 only, this operation's one-shot session recovery.
+     *
+     *  Where it sits, and why: INSIDE the operation, after the caller's own gates have run and
+     *  before its result is mapped. Every operation that can send is already at the front of its
+     *  slot's serialized chain (store()'s flush, reconcile(), quietFlush()), so the extra await
+     *  below cannot let another operation for that slot interleave — which is exactly what makes the
+     *  discard gates those callers ran still binding here: a discard is only ever raised by a
+     *  reconcile decision or a prompt answer for this slot, i.e. from inside that same chain. The
+     *  disposed check the transport await already carries is repeated after the refresh, so a
+     *  dispose() during it ends the operation without a retry and without notifying anyone. And
+     *  recovery never prompts, so the background path keeps its "no prompt" promise for free. */
+    async function request(op, attempt) {
+        const result = await withRetry(() => attempt(op.s), sleep);
+        if (disposed || !is401(result))
+            return result;
+        const recovered = await recoverSession(op);
+        if (disposed)
+            return result;
+        if (!recovered) {
+            notifySessionRejected(op);
+            return result;
+        }
+        op.s = recovered;
+        const retry = await withRetry(() => attempt(op.s), sleep);
+        // No recovery inside the retry: one refresh per operation, and a second 401 ends it.
+        if (!disposed && is401(retry))
+            notifySessionRejected(op);
+        return retry;
+    }
+    async function loadWith(slot, op) {
+        const result = await request(op, (s) => transport.load(slot, s.token));
         if (disposed)
             return { status: "error", error: disposedError() };
         if (result.kind === "ok" && result.status === 200 && isSaveRow(result.body, slot)) {
@@ -120,13 +195,15 @@ export function createSavesClient(deps) {
             return { status: "none" };
         return { status: "error", error: errorFor(result) };
     }
-    async function sendOnce(slot, payload, baseRevision, s) {
+    async function sendOnce(slot, payload, baseRevision, op) {
         const body = { schemaVersion: game.schemaVersion, baseRevision, payload, deviceId: state.deviceId(), idempotencyKey: uuidV4() };
         const encodedBytes = new TextEncoder().encode(JSON.stringify(body)).byteLength;
         if (encodedBytes > MAX_BODY_BYTES) {
             return { kind: "error", error: { code: "invalid_payload", message: `request body exceeds ${MAX_BODY_BYTES} bytes` }, dirty: false };
         }
-        const result = await withRetry(() => transport.store(slot, body, s.token), sleep);
+        // One body, one idempotency key, across this send's transport retries AND a 401 retry under a
+        // recovered token: it is the same write, so the server must be able to recognise it as one.
+        const result = await request(op, (s) => transport.store(slot, body, s.token));
         if (disposed)
             return { kind: "error", error: disposedError(), dirty: false };
         if (result.kind === "ok" && result.status === 200) {
@@ -187,22 +264,26 @@ export function createSavesClient(deps) {
      *  restore_dirty / keep-this-one paths are take-overs and claim the slot, while a store()
      *  flush must not overwrite another account's claim (see confirmed() above). It is threaded
      *  through both places a send here can confirm — the plain success and the conflict prompt's
-     *  "Use cloud" — so one caller's intent covers every outcome of its own send. */
-    async function sendWithConflicts(slot, payload, baseRevision, s, claim) {
+     *  "Use cloud" — so one caller's intent covers every outcome of its own send.
+     *
+     *  The session is read off `op` at every use rather than captured once, so a 401 recovery inside
+     *  one of these sends is what the next round's send and the "Use cloud" load also use. Its user
+     *  id cannot change (see Op), so every state write below still names the operation's own user. */
+    async function sendWithConflicts(slot, payload, baseRevision, op, claim) {
         let base = baseRevision;
         let conflictRounds = 0;
         for (;;) {
-            const outcome = await sendOnce(slot, payload, base, s);
+            const outcome = await sendOnce(slot, payload, base, op);
             if (outcome.kind === "stored") {
-                confirmed(slot, s, outcome.revision, { claim });
+                confirmed(slot, op.s, outcome.revision, { claim });
                 return { status: "stored", revision: outcome.revision, updatedAt: outcome.updatedAt };
             }
             if (outcome.kind === "error") {
                 if (outcome.dirty)
-                    state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
+                    state.writeRecord(op.s.userId, slot, { revision: state.readRecord(op.s.userId, slot)?.revision ?? 0, dirty: true });
                 return { status: "error", error: outcome.error };
             }
-            state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
+            state.writeRecord(op.s.userId, slot, { revision: state.readRecord(op.s.userId, slot)?.revision ?? 0, dirty: true });
             if (conflictRounds >= MAX_CONFLICT_PROMPTS) {
                 return { status: "error", error: { code: "http", status: 409, message: "conflict retries exhausted" } };
             }
@@ -211,18 +292,18 @@ export function createSavesClient(deps) {
             if (disposed)
                 return { status: "error", error: disposedError() };
             if (answer === "primary") {
-                const loaded = await loadWith(slot, s);
+                const loaded = await loadWith(slot, op);
                 if (loaded.status !== "ok")
                     return { status: "error", error: loaded.status === "error" ? loaded.error : { code: "http", status: 404, message: "cloud row vanished" } };
-                confirmed(slot, s, loaded.save.revision, { claim });
+                confirmed(slot, op.s, loaded.save.revision, { claim });
                 // The player chose "Use cloud": the local payload they were about to send is discarded,
                 // so it must not be resurrected by a later background re-flush, and any store or
                 // re-flush this user had already queued for the slot must be dropped rather than sent on
                 // top of the revision we just confirmed. Bumping here cannot affect THIS operation: when
                 // we were reached from a store()'s own flush, that flush already made its epoch check at
                 // its top, before this call — so it still reports its legitimate use_cloud result.
-                lastPayload.delete(payloadKey(s.userId, slot));
-                noteDiscard(s.userId, slot);
+                lastPayload.delete(payloadKey(op.s.userId, slot));
+                noteDiscard(op.s.userId, slot);
                 return { status: "use_cloud", save: loaded.save };
             }
             base = outcome.cloudRevision;
@@ -294,7 +375,9 @@ export function createSavesClient(deps) {
         // claim: false — a store is not an ownership decision. This flush made no owner check at all,
         // and its send can outlast an account switch in another tab, so it may only claim a slot that
         // is unset or already this user's (see confirmed()).
-        return sendWithConflicts(slot, payload, base, s, false);
+        // The operation starts here, after every gate above has answered: its one 401 recovery covers
+        // this send and anything the conflict loop does afterwards.
+        return sendWithConflicts(slot, payload, base, operation(s), false);
     }
     function store(slot, payload) {
         assertSlot(slot);
@@ -397,6 +480,12 @@ export function createSavesClient(deps) {
                 if (!resolved)
                     return { status: "signed_out" };
                 let s = resolved; // re-assigned only to the SAME user's refreshed session, below
+                // This call's operation, carrying the session every request below actually sends with —
+                // which a 401 recovery may replace by the SAME user's refreshed one — and its one-shot
+                // recovery budget. `s` is kept alongside it for the user id and the state writes keyed by
+                // it, which a recovery can never change; the two are re-synchronised at the one place this
+                // function itself re-resolves the session (the `current` re-read below).
+                const op = operation(resolved);
                 let record = state.readRecord(s.userId, slot);
                 /** Everything the `localChanged` hint does, in one place, because `current` (below) has to
                  *  do exactly the same thing when its re-read comes back different — the whole point of
@@ -470,7 +559,7 @@ export function createSavesClient(deps) {
                 // row, and so a crash or a failed load still leaves the slot protected.
                 if (options?.localChanged === true && local !== null)
                     noteLocalChanged(local);
-                const loaded = await loadWith(slot, s);
+                const loaded = await loadWith(slot, op);
                 if (loaded.status === "error")
                     return loaded;
                 const cloud = loaded.status === "ok" ? loaded.save : null;
@@ -495,8 +584,10 @@ export function createSavesClient(deps) {
                     if (!now || now.userId !== s.userId)
                         return { status: "signed_out" };
                     // Same user: carry the freshly resolved session forward, so a token that refreshed while
-                    // the GET was pending is what any send below uses.
+                    // the GET was pending is what any send below uses — including one this call's own 401
+                    // recovery may already have replaced, which this supersedes (both are the same user's).
                     s = now;
+                    op.s = now;
                     let fresh;
                     let reread = false;
                     try {
@@ -597,7 +688,7 @@ export function createSavesClient(deps) {
                     // claim: true — this is either the table's own `upload` (the slot is unset or already
                     // this user's) or the ownership prompt's "Upload", which is a deliberate take-over.
                     // Both are ownership decisions made here, at the front of this slot's chain.
-                    const result = await sendWithConflicts(slot, local, 0, s, true);
+                    const result = await sendWithConflicts(slot, local, 0, op, true);
                     return result.status === "stored" ? { status: "uploaded", revision: result.revision } : result;
                 };
                 switch (decision) {
@@ -655,14 +746,14 @@ export function createSavesClient(deps) {
                         }
                         // claim: true — "Keep this one" is the take-over answer: the player said the local
                         // save is theirs and it is going up as their cloud row.
-                        return asReconcile(await sendWithConflicts(slot, local, current.revision, s, true));
+                        return asReconcile(await sendWithConflicts(slot, local, current.revision, op, true));
                     }
                     case "current": return { status: "current" };
                     case "restore_dirty":
                         // claim: true — the table only reaches restore_dirty when the slot is unset or already
                         // this user's (decideReconcile sends ownedByOther to conflict_prompt instead), and it
                         // is a reconcile decision made here, at the front of this slot's chain.
-                        return asReconcile(await sendWithConflicts(slot, local, state.readRecord(s.userId, slot)?.revision ?? 0, s, true));
+                        return asReconcile(await sendWithConflicts(slot, local, state.readRecord(s.userId, slot)?.revision ?? 0, op, true));
                 }
             }
             catch (thrown) {
@@ -739,7 +830,10 @@ export function createSavesClient(deps) {
             if (latest === undefined)
                 return;
             const sent = JSON.parse(JSON.stringify(latest));
-            const outcome = await sendOnce(slot, sent, base, s);
+            // The operation starts here, after every guard above: a background re-flush gets the same
+            // one-shot 401 recovery as a foreground send, and since recovery never prompts, this path's
+            // "never prompt the player" promise is unaffected.
+            const outcome = await sendOnce(slot, sent, base, operation(s));
             if (disposed)
                 return;
             // claim: false — and this is the path the rule exists for. The owner check above ran BEFORE
@@ -879,7 +973,7 @@ export function createSavesClient(deps) {
                 const s = await session();
                 if (disposed)
                     return { status: "error", error: disposedError() };
-                return s ? await loadWith(slot, s) : { status: "signed_out" };
+                return s ? await loadWith(slot, operation(s)) : { status: "signed_out" };
             }
             catch (thrown) {
                 // load() never rejects: a caller-supplied getSession/transport that throws must still

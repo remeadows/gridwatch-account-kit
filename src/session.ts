@@ -92,6 +92,49 @@ export function createAccountKit(input: AccountKitConfig): AccountKit {
     return (await getSession())?.user.id ?? null;
   }
 
+  // Contract, same as getSession(): never rejects. A refresh the saves client cannot use is
+  // reported as "no session" (null), because that is precisely what the client does with it —
+  // report the 401 it already has and tell us the session was rejected.
+  async function refreshSession() {
+    try {
+      const { data, error } = await getSupabase().auth.refreshSession();
+      if (error) {
+        console.warn("[account-kit] refreshSession failed:", error.message);
+        return null;
+      }
+      const s = data.session;
+      return s ? { access_token: s.access_token, user: { id: s.user.id } } : null;
+    } catch (thrown) {
+      console.warn("[account-kit] refreshSession threw:", thrown instanceof Error ? thrown.message : String(thrown));
+      return null;
+    }
+  }
+
+  /** The saves API rejected `userId`'s token and no refresh could recover it — the session was
+   *  revoked server-side (a sign-out elsewhere, an admin action). This device's cached JWT is
+   *  usually still unexpired, so the header would go on showing the player's name while nothing
+   *  syncs; ending the LOCAL session makes onAuthStateChange fire, and the header / useAccount
+   *  fall back to "Sign in", which is the truth.
+   *
+   *  Local, never global: the rejection says nothing about this player's other devices, and
+   *  ending their sessions is the very defect this release fixes (D1).
+   *
+   *  Only when the rejected user is still the signed-in one, re-checked here rather than trusted
+   *  from the rejection: a saves operation can outlast a sign-out or an account switch, and a
+   *  stale rejection for a previous account must not sign the current one out.
+   *
+   *  Contained end to end: this is a notification, and a failure to act on it must not surface as
+   *  an unhandled rejection in the host page or change the result the saves call already has. */
+  async function endLocalSession(userId: string): Promise<void> {
+    try {
+      if ((await currentUserId()) !== userId) return;
+      const { error } = await getSupabase().auth.signOut({ scope: "local" });
+      if (error) console.warn("[account-kit] local sign-out after a rejected session failed:", error.message);
+    } catch (thrown) {
+      console.warn("[account-kit] local sign-out after a rejected session threw:", thrown instanceof Error ? thrown.message : String(thrown));
+    }
+  }
+
   if (input.game) assertGameConfig(input.game);
   const saves: SavesClient | undefined = input.game
     ? createSavesClient({
@@ -101,6 +144,8 @@ export function createAccountKit(input: AccountKitConfig): AccountKit {
         transport: createTransport(`${config.nexusOrigin.replace(/\/+$/, "")}/api/saves/${input.game.routeAlias}`),
         prompt: createDomPromptHost(),
         onBackgroundStored: input.onBackgroundStored,
+        refreshSession,
+        onSessionRejected: (userId) => { void endLocalSession(userId); },
       })
     : undefined;
 

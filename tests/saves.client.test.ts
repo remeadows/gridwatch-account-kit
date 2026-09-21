@@ -2352,3 +2352,179 @@ describe("two real clients over one storage", () => {
     expect(onBackgroundStored).toHaveBeenCalledWith("campaign", b, 2, "u1");
   });
 });
+
+// D2: the saves API validates every token against Supabase, so a session revoked elsewhere (a
+// sign-out on another device, before v0.2.4 made that local) answers 401 to every call while this
+// device's cached JWT still names the player. A 401 used to be reported as a plain dirty error and
+// nothing else: nothing tried to recover the session and nothing told the host it was rejected.
+describe("a rejected session (401)", () => {
+  const unauthorized = () => ok(401, { error: "unauthorized" });
+  const error401 = { status: "error", error: { code: "http", status: 401, message: "unauthorized" } };
+  const sessionFor = (id: string, token: string) => ({ access_token: token, user: { id } });
+
+  it("recovers once and retries the PUT with the new token, resolving the retry's result", async () => {
+    const onSessionRejected = vi.fn();
+    const refreshSession = vi.fn(async () => sessionFor("u1", "tok2"));
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.store.mockResolvedValueOnce(unauthorized()).mockResolvedValueOnce(ok(200, { revision: 3, updatedAt: "t" }));
+    expect(await h.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 3, updatedAt: "t" });
+    expect(refreshSession).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls.map((c) => c[2])).toEqual(["tok", "tok2"]); // the retry carries the NEW token
+    expect(onSessionRejected).not.toHaveBeenCalled();
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+  });
+
+  it("recovers once and retries the GET with the new token", async () => {
+    const onSessionRejected = vi.fn();
+    const refreshSession = vi.fn(async () => sessionFor("u1", "tok2"));
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.load.mockResolvedValueOnce(unauthorized()).mockResolvedValueOnce(ok(200, row(2)));
+    expect(await h.client.load("campaign")).toEqual({ status: "ok", save: { revision: 2, schemaVersion: 1, payload: campaign, updatedAt: row(2).updatedAt } });
+    expect(h.load.mock.calls.map((c) => c[1])).toEqual(["tok", "tok2"]);
+    expect(onSessionRejected).not.toHaveBeenCalled();
+  });
+
+  it("reports the 401 and notifies the host once when the refresh yields no session", async () => {
+    const onSessionRejected = vi.fn();
+    const refreshSession = vi.fn(async () => null);
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.store.mockResolvedValue(unauthorized());
+    expect(await h.client.store("campaign", campaign)).toEqual(error401);
+    expect(h.store).toHaveBeenCalledTimes(1); // nothing retried
+    expect(onSessionRejected).toHaveBeenCalledTimes(1);
+    expect(onSessionRejected).toHaveBeenCalledWith("u1");
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true }); // 401 is still dirty
+  });
+
+  it("does not retry under a DIFFERENT user when the refresh yields another account", async () => {
+    const onSessionRejected = vi.fn();
+    const refreshSession = vi.fn(async () => sessionFor("u2", "tok2"));
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.store.mockResolvedValue(unauthorized());
+    expect(await h.client.store("campaign", campaign)).toEqual(error401);
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(onSessionRejected).toHaveBeenCalledTimes(1);
+    expect(onSessionRejected).toHaveBeenCalledWith("u1"); // the user the operation captured
+  });
+
+  it("stops at a second 401: one refresh per operation, no third attempt", async () => {
+    const onSessionRejected = vi.fn();
+    const refreshSession = vi.fn(async () => sessionFor("u1", "tok2"));
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.store.mockResolvedValue(unauthorized());
+    expect(await h.client.store("campaign", campaign)).toEqual(error401);
+    expect(h.store).toHaveBeenCalledTimes(2);
+    expect(refreshSession).toHaveBeenCalledTimes(1);
+    expect(onSessionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it("contains a throwing refreshSession and still notifies once", async () => {
+    const onSessionRejected = vi.fn();
+    const refreshSession = vi.fn(async () => { throw new Error("refresh exploded"); });
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.store.mockResolvedValue(unauthorized());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await h.client.store("campaign", campaign)).toEqual(error401);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(onSessionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it("contains a throwing onSessionRejected with one warning, leaving the 401 result intact", async () => {
+    const onSessionRejected = vi.fn(() => { throw new Error("host blew up"); });
+    const h = harness(undefined, 0, { onSessionRejected });
+    h.store.mockResolvedValue(unauthorized());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await h.client.store("campaign", campaign)).toEqual(error401);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+    expect(onSessionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it("notifies without a refreshSession dep, behaving exactly as before otherwise", async () => {
+    const onSessionRejected = vi.fn();
+    const h = harness(undefined, 0, { onSessionRejected });
+    h.store.mockResolvedValue(unauthorized());
+    expect(await h.client.store("campaign", campaign)).toEqual(error401);
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(onSessionRejected).toHaveBeenCalledTimes(1);
+    expect(onSessionRejected).toHaveBeenCalledWith("u1");
+  });
+
+  it("gives a background re-flush the same one-shot recovery, and never prompts", async () => {
+    const onSessionRejected = vi.fn();
+    const refreshSession = vi.fn(async () => sessionFor("u1", "tok2"));
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(unauthorized()).mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store.mock.calls.map((c) => c[2])).toEqual(["tok", "tok2"]);
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+    expect(h.prompt.ask).not.toHaveBeenCalled();
+    expect(onSessionRejected).not.toHaveBeenCalled();
+  });
+
+  it("notifies from a background re-flush whose recovery failed, still without prompting", async () => {
+    const onSessionRejected = vi.fn();
+    const refreshSession = vi.fn(async () => null);
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+
+    h.store.mockReset();
+    h.store.mockResolvedValue(unauthorized());
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.prompt.ask).not.toHaveBeenCalled();
+    expect(onSessionRejected).toHaveBeenCalledTimes(1);
+    expect(onSessionRejected).toHaveBeenCalledWith("u1");
+  });
+
+  it("neither retries nor notifies when dispose() lands while the refresh is in flight", async () => {
+    const onSessionRejected = vi.fn();
+    let releaseRefresh!: (s: { access_token: string; user: { id: string } } | null) => void;
+    const refreshSession = vi.fn(() => new Promise<{ access_token: string; user: { id: string } } | null>((resolve) => { releaseRefresh = resolve; }));
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.store.mockResolvedValue(unauthorized());
+    const pending = h.client.store("campaign", campaign);
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(refreshSession).toHaveBeenCalledTimes(1);
+
+    h.client.dispose();
+    releaseRefresh(sessionFor("u1", "tok2"));
+    expect(await pending).toEqual({ status: "error", error: { code: "http", message: "disposed" } });
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(1); // no retry
+    expect(onSessionRejected).not.toHaveBeenCalled();
+  });
+
+  it("leaves the record and the remembered payload alone, so unsynced progress survives the rejection", async () => {
+    const onSessionRejected = vi.fn();
+    const refreshSession = vi.fn(async () => null);
+    const h = harness(undefined, 0, { refreshSession, onSessionRejected });
+    h.state.writeRecord("u1", "campaign", { revision: 4, dirty: false });
+    h.store.mockResolvedValue(unauthorized());
+    expect((await h.client.store("campaign", campaign)).status).toBe("error");
+    expect(onSessionRejected).toHaveBeenCalledTimes(1);
+    // Nothing cleared: the revision still describes this user's cloud row, the slot is still dirty,
+    // and the slot is still this user's.
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: true });
+    expect(h.state.readOwner("campaign")).toBeNull();
+
+    // And the payload is still remembered — when the player signs back in, their work goes up.
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 5, updatedAt: "t" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 4, payload: campaign });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 5, dirty: false });
+  });
+});
