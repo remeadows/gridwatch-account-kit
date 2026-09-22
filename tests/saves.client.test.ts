@@ -850,8 +850,16 @@ describe("reconcile", () => {
       await flush();
       h.state.writeRecord("u1", "campaign", { revision: 7, dirty: true }); // another tab confirmed newer revisions meanwhile
       // The row is at 7 (fix round 1: a 404 under a record @7 would now mean the server lost the row).
+      const decide = vi.mocked(decideReconcile);
+      decide.mockClear();
       releaseLoad(ok(200, row(7)));
       expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: campaign, updatedAt: row(7).updatedAt } });
+      // Fix round 2 (M1): what the move to null itself settled, read BEFORE use_cloud's own
+      // confirmation (which writes { 7, clean } whatever came before). Re-read: { 7, clean }. From
+      // the record captured before the GET: { 3, clean }, which the state layer refuses, leaving
+      // { 7, dirty } — so this assertion tells the two apart despite the monotonic rule.
+      expect(decide).toHaveBeenCalledTimes(1);
+      expect(decide.mock.calls[0][0].record).toEqual({ revision: 7, dirty: false });
       expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false }); // not rolled back to 3
     });
 
@@ -977,17 +985,23 @@ describe("reconcile", () => {
     describe("a move to null", () => {
       it("drops the hint's own seed, so the next re-flush cannot resurrect the payload the game reported gone", async () => {
         const h = harness();
-        h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+        // Fix round 2 (M1): a revision-0 record, so a 404 is what the record predicts and no
+        // server-regression reset runs — the hint's dirty flag is cleared by the move to null alone.
+        h.state.writeRecord("u1", "campaign", { revision: 0, dirty: false });
         h.state.writeOwner("campaign", "u1");
-        // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
-        // agree, so the record is discarded (never synced) before the decision.
-        h.load.mockResolvedValue(ok(404, { error: "no_save" }));
-        expectConsole("warn", "treating the slot as never synced");
+        h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
         expect(await h.client.reconcile("campaign", L0, { localChanged: true, current: () => null })).toEqual({ status: "nothing" });
-        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // reset kept the hint's dirty flag (C1b); the move to null cleared it
+        expect(h.load).toHaveBeenCalledTimes(1);
+        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false });
         expect(h.state.readOwner("campaign")).toBe("u1"); // untouched
 
         h.store.mockResolvedValue(ok(200, { revision: 4, updatedAt: "t" }));
+        window.dispatchEvent(new Event("online"));
+        await flush();
+        expect(h.store).not.toHaveBeenCalled();
+        // And the seeded payload itself is gone, not merely unflagged: even once something else
+        // marks the slot dirty again, there is nothing remembered to re-flush.
+        h.state.writeRecord("u1", "campaign", { revision: 0, dirty: true });
         window.dispatchEvent(new Event("online"));
         await flush();
         expect(h.store).not.toHaveBeenCalled();
