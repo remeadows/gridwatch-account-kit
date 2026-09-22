@@ -9,7 +9,7 @@ Add to your `package.json`:
 ```json
 {
   "dependencies": {
-    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.2.4"
+    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.2.5"
   }
 }
 ```
@@ -29,6 +29,21 @@ mountAccountHeader(kit);
 `kit.signOut()` signs the player out of **this browser only** — their sessions on other devices stay signed in.
 
 ### Cloud saves
+
+The registry also defines Breach's isolated `expansion-1-r4` slot (alias `breach`,
+game slug `gridwatch-signal-breach`, schema version 1). `BREACH_EXPANSION_V1` is
+exported from `./saves-schema`. This additive registration alone does not enable
+any client's cloud saves: deploy a compatible Nexus server before configuring
+Breach's `game` option. Match's schema and slots are unchanged.
+
+Breach payloads contain `contentRevision`, `clearedLevels`, `settings.lowEffects`,
+and an optional compact checkpoint (omit it when absent). The schema checks
+structure only; the game must decode and deterministically replay the checkpoint
+before adoption. It contains no trusted scores or auth fields. Command integers
+encode `tick * 1024 + opcode * 64 + y * 8 + x`: opcode 0 is launch (cell zero),
+1 sells, and 2–8 place relay/firewall/turret/scrubber/overclock/latencyTrap/arcIce.
+The game rejects reserved opcodes 9–15, invalid history and hashes. Only r4 is
+registered; original campaign and historical expansion slots stay outside it.
 
 ```ts
 const kit = createAccountKit({

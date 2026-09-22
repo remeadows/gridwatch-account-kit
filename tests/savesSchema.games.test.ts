@@ -15,10 +15,10 @@ const campaign = {
 const settings = { musicEnabled: true, sfxEnabled: false, voiceEnabled: true, reducedMotion: false };
 
 describe("save game registry", () => {
-  it("registers only Match in 4a", () => {
-    expect(SAVE_GAMES).toEqual({ match: { slug: "gridwatch-match", slots: ["campaign", "settings"], schemaVersion: 1 } });
+  it("registers Match and the isolated Breach expansion slot", () => {
+    expect(SAVE_GAMES).toEqual({ match: { slug: "gridwatch-match", slots: ["campaign", "settings"], schemaVersion: 1 }, breach: { slug: "gridwatch-signal-breach", slots: ["expansion-1-r4"], schemaVersion: 1 } });
     expect(resolveSaveGame("match")).toEqual(SAVE_GAMES.match);
-    for (const alias of ["zero", "breach", "drift", "gambit", "MATCH", "match/"]) expect(resolveSaveGame(alias)).toBeNull();
+    for (const alias of ["zero", "drift", "gambit", "MATCH", "match/"]) expect(resolveSaveGame(alias)).toBeNull();
     expect(payloadSchemas["gridwatch-match"]?.[1]).toEqual({ campaign: MATCH_CAMPAIGN_V1, settings: MATCH_SETTINGS_V1 });
   });
   it("validates the Match v1 slots", () => {
