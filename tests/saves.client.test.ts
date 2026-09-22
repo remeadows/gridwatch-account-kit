@@ -2845,6 +2845,26 @@ describe("after a background 409, this tab's remembered base keeps deciding", ()
     expect(decide.mock.calls[0][0].record).toEqual({ revision: 3, dirty: true });
     expect(t1.store).not.toHaveBeenCalled();
   });
+
+  // N2: once the player's answer has landed, the remembered payload is what was sent, on the new
+  // revision — so the same question is not asked again when another tab later dirties the record.
+  it("N2: after 'Keep this one' lands, a later reconcile of that same payload is not asked the question again", async () => {
+    const { t1, t2 } = await afterP3();
+    t1.load.mockResolvedValue(ok(200, row(7, { ...campaign, coins: 70 })));
+    t1.answers.push("secondary"); // "Keep this one"
+    expect(await t1.client.reconcile("campaign", { ...campaign, coins: 42 })).toEqual({ status: "stored", revision: 8 });
+    expect(t1.asked).toEqual([CONFLICT_COPY]);
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: false });
+    t2.store.mockReset();
+    t2.store.mockResolvedValue({ kind: "network", message: "offline" });
+    await t2.client.store("campaign", { ...campaign, coins: 71 }); // shared record { 8, dirty }
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+    t1.load.mockResolvedValue(ok(200, row(8, { ...campaign, coins: 42 })));
+    decide.mockClear();
+    await t1.client.reconcile("campaign", { ...campaign, coins: 42 });
+    expect(decide.mock.calls[0][0].record).toEqual({ revision: 8, dirty: true });
+    expect(t1.asked).toEqual([CONFLICT_COPY]); // not asked again
+  });
 });
 
 // Fix round 2 (C1): the second load is judged against the record as it was just BEFORE that load

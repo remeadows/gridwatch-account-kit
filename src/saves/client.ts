@@ -885,13 +885,24 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
           record = stored;
         }
         const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });
+        /** Every reconcile-path send (upload, restore_dirty, "Keep this one") goes through here. Once
+         *  one lands, the payload this tab remembers for the slot is exactly what was sent, on the
+         *  revision it landed at (fix round 3, N2): an older remembered payload with an older base
+         *  would otherwise make a later reconcile of this very payload ask the player a question
+         *  they already answered. The slot is this user's now (these sends claim it). */
+        const sendLocal = async (baseRevision: number): Promise<StoreResult> => {
+          const sent = local as SavePayload;
+          const result = await sendWithConflicts(slot, sent, baseRevision, op, true);
+          if (result.status === "stored" && !disposed) lastPayload.set(payloadKey(s.userId, slot), { payload: sent, base: result.revision });
+          return result;
+        };
         const asReconcile = (result: StoreResult): ReconcileResult =>
           result.status === "stored" ? { status: "stored", revision: result.revision } : result;
         const upload = async (): Promise<ReconcileResult> => {
           // claim: true — this is either the table's own `upload` (the slot is unset or already
           // this user's) or the ownership prompt's "Upload", which is a deliberate take-over.
           // Both are ownership decisions made here, at the front of this slot's chain.
-          const result = await sendWithConflicts(slot, local as SavePayload, 0, op, true);
+          const result = await sendLocal(0);
           return result.status === "stored" ? { status: "uploaded", revision: result.revision } : result;
         };
         switch (decision) {
@@ -958,14 +969,14 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             }
             // claim: true — "Keep this one" is the take-over answer: the player said the local
             // save is theirs and it is going up as their cloud row.
-            return asReconcile(await sendWithConflicts(slot, local as SavePayload, current.revision, op, true));
+            return asReconcile(await sendLocal(current.revision));
           }
           case "current": return { status: "current" };
           case "restore_dirty":
             // claim: true — the table only reaches restore_dirty when the slot is unset or already
             // this user's (decideReconcile sends ownedByOther to conflict_prompt instead), and it
             // is a reconcile decision made here, at the front of this slot's chain.
-            return asReconcile(await sendWithConflicts(slot, local as SavePayload, state.readRecord(s.userId, slot)?.revision ?? 0, op, true));
+            return asReconcile(await sendLocal(state.readRecord(s.userId, slot)?.revision ?? 0));
         }
       } catch (thrown) {
         // reconcile() never rejects (same contract as load()/store()): a caller-supplied
