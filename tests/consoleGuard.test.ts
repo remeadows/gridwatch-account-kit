@@ -11,6 +11,17 @@ describe("consoleGuard", () => {
     console.warn("hello 2");
     console.error("it went", "boom");
   });
+  // A /g or /y RegExp carries lastIndex between test() calls: without a reset, the second of two
+  // identical messages would fail to match and be reported as undeclared.
+  it("matches a global or sticky pattern consistently across repeated messages", () => {
+    expectConsole("warn", /repeat/g);
+    expectConsole("error", /^again$/y);
+    console.warn("repeat");
+    console.warn("repeat");
+    console.warn("repeat");
+    console.error("again");
+    console.error("again");
+  });
   it.fails("fails a test that writes an undeclared console.warn", () => {
     console.warn("surprise");
   });

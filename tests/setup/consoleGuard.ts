@@ -20,8 +20,13 @@ let calls: Array<{ level: Level; message: string }> = [];
 let expectations: Expectation[] = [];
 const original = { warn: console.warn, error: console.error };
 
-const matches = (pattern: RegExp | string, message: string) =>
-  typeof pattern === "string" ? message.includes(pattern) : pattern.test(message);
+// A /g or /y pattern carries lastIndex between test() calls; reset it so every message is matched
+// from the start, whatever an earlier match (or the caller) left behind.
+const matches = (pattern: RegExp | string, message: string) => {
+  if (typeof pattern === "string") return message.includes(pattern);
+  pattern.lastIndex = 0;
+  return pattern.test(message);
+};
 
 /** Declare that this test is expected to write `pattern` (a RegExp, or a substring) to
  *  console[level]. Every matching call is allowed; the test fails if none happens. */
