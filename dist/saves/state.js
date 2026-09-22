@@ -90,7 +90,13 @@ export function createSaveStateStore(gameSlug, storage = typeof localStorage ===
             write(recordKey(userId, slot), JSON.stringify(next));
         },
         clearRecord(userId, slot) {
-            remove(recordKey(userId, slot));
+            // Unsynced local progress is still unsynced after the server went backwards: keep the flag.
+            // Revision 0 then makes the decision table prompt when a cloud row exists (dirty and behind
+            // it) and upload when none does, and keeps the slot queued for a background re-flush.
+            if (readRecord(userId, slot)?.dirty)
+                write(recordKey(userId, slot), JSON.stringify({ revision: 0, dirty: true }));
+            else
+                remove(recordKey(userId, slot));
         },
         readOwner(slot) {
             const value = readJson(ownerKey(slot));
