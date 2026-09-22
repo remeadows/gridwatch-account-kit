@@ -2867,6 +2867,30 @@ describe("after a background 409, this tab's remembered base keeps deciding", ()
   });
 });
 
+// N4: restore_dirty sends on the cloud revision the table decided on, never on a re-read of the
+// record — a write landing between the decision and the send then gets a 409, not a silent success.
+describe("restore_dirty sends on the revision it decided on", () => {
+  it("a record write between the decision and the send ends in a 409 and the prompt, not a PUT on the newer revision", async () => {
+    const h = harness();
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+    h.state.writeOwner("campaign", "u1");
+    h.load.mockResolvedValueOnce(ok(200, row(3)));
+    const decide = vi.mocked(decideReconcile);
+    decide.mockImplementationOnce(() => {
+      // Another tab stores 4 and its record write lands right after the decision.
+      h.state.writeRecord("u1", "campaign", { revision: 4, dirty: true });
+      return "restore_dirty";
+    });
+    h.store.mockImplementation(async (_s, body) => (body.baseRevision === 4 ? ok(200, { revision: 5, updatedAt: "t5" }) : ok(409, { error: "conflict", cloud: { revision: 4, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } })));
+    h.load.mockResolvedValueOnce(ok(200, row(4)));
+    h.answers.push("primary"); // "Use cloud"
+    expect(await h.client.reconcile("campaign", { ...campaign, coins: 42 })).toMatchObject({ status: "use_cloud", save: { revision: 4 } });
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3 });
+    expect(h.asked).toEqual([CONFLICT_COPY]);
+  });
+});
+
 // Fix round 2 (C1): the second load is judged against the record as it was just BEFORE that load
 // was sent (r0), not as it is when the load returns. Another tab can confirm again while the
 // re-load is in flight: its row is correct as of when it was served, and only a row below r0 (or

@@ -976,7 +976,9 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             // claim: true — the table only reaches restore_dirty when the slot is unset or already
             // this user's (decideReconcile sends ownedByOther to conflict_prompt instead), and it
             // is a reconcile decision made here, at the front of this slot's chain.
-            return asReconcile(await sendLocal(state.readRecord(s.userId, slot)?.revision ?? 0));
+            // On the cloud revision the table decided on (fix round 3, N4), never a re-read of the
+            // record: a write from another tab landing in between must meet a 409, not match the CAS.
+            return asReconcile(await sendLocal((cloud as CloudSave).revision));
         }
       } catch (thrown) {
         // reconcile() never rejects (same contract as load()/store()): a caller-supplied
