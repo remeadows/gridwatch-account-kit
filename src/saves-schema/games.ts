@@ -1,4 +1,5 @@
 import { findDeniedKey } from "./denylist.js";
+import { BREACH_EXPANSION_V1 } from "./breach.js";
 import { validateAgainst, type Schema, type ValidationResult } from "./validate.js";
 
 export interface SaveGame { slug: string; slots: readonly string[]; schemaVersion: number }
@@ -8,6 +9,7 @@ export interface SaveGame { slug: string; slots: readonly string[]; schemaVersio
  *  Record<string, SaveGame> index signature, which TypeScript otherwise treats as always present. */
 export const SAVE_GAMES: Readonly<Record<string, SaveGame | undefined>> = Object.freeze({
   match: Object.freeze({ slug: "gridwatch-match", slots: Object.freeze(["campaign", "settings"]), schemaVersion: 1 }),
+  breach: Object.freeze({ slug: "gridwatch-signal-breach", slots: Object.freeze(["expansion-1-r4"]), schemaVersion: 1 }),
 });
 
 export function resolveSaveGame(alias: string): SaveGame | null {
@@ -60,6 +62,7 @@ export const payloadSchemas: Readonly<
   Record<string, Readonly<Record<number, Readonly<Record<string, Schema | undefined>> | undefined>> | undefined>
 > = Object.freeze({
   "gridwatch-match": Object.freeze({ 1: Object.freeze({ campaign: MATCH_CAMPAIGN_V1, settings: MATCH_SETTINGS_V1 }) }),
+  "gridwatch-signal-breach": Object.freeze({ 1: Object.freeze({ "expansion-1-r4": BREACH_EXPANSION_V1 }) }),
 });
 
 /** Schema check, then the recursive key denylist (spec §3.2). Every lookup level is
