@@ -2511,21 +2511,57 @@ describe("sync records are monotonic across tabs (a cloud GET older than another
     s.neverAheadOfCloud();
   });
 
-  it("(b) a moved current() after the re-load marks dirty against the record as it is now (7), not the one captured before the GET (3)", async () => {
+  // Fix round 2 (C2): the STORED record is marked dirty at 7 (monotonic), but the payload that moved
+  // was built on 3, so the decision is handed { 3, dirty } against cloud 7: the conflict prompt, as
+  // v0.2.5 gave. Deciding on { 7, dirty } would PUT it on base 7 and silently replace tab 2's row.
+  it("(b) a moved current() after the re-load is decided on the revision it was built on (3), not the stored 7: the conflict prompt", async () => {
     const s = setup();
     const current = vi.fn(() => L1);
     const pending = s.t1.client.reconcile("campaign", campaign, { current });
     await flush();
     await tab2Confirms7(s.t2);
     s.t1.load.mockResolvedValueOnce(ok(200, row(7, at7)));
+    s.t1.answers.push("secondary"); // "Keep this one": the player's explicit take-over
     s.t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
     s.release(ok(200, row(3)));
-    // Record dirty @7 against cloud @7: the table's restore_dirty sends the fresh payload on 7.
     expect(await pending).toEqual({ status: "stored", revision: 8 });
-    expect(s.t1.asked).toEqual([]);
+    expect(s.t1.asked).toEqual([CONFLICT_COPY]);
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: { revision: 3, dirty: true }, cloud: { revision: 7 } });
     expect(s.t1.store).toHaveBeenCalledTimes(1);
     expect(s.t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 7, payload: L1 });
     expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: false });
+    s.monotonic();
+    s.neverAheadOfCloud();
+  });
+
+  it("P4: tab 2 confirms 7 during tab 1's GET, which is served AFTER that PUT (fresh @7); tab 1's moved payload (built on 3) gets the conflict prompt, not a PUT on 7", async () => {
+    const s = setup();
+    const pending = s.t1.client.reconcile("campaign", campaign, { current: () => L1 });
+    await flush();
+    await tab2Confirms7(s.t2);
+    s.t1.store.mockResolvedValue(ok(200, { revision: 8, updatedAt: "t8" }));
+    s.t1.answers.push("primary"); // "Use cloud"
+    s.release(ok(200, row(7, at7)));
+    expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: at7, updatedAt: row(7).updatedAt } });
+    expect(s.t1.asked).toEqual([CONFLICT_COPY]);
+    expect(s.t1.store).not.toHaveBeenCalled(); // tab 2's coins:70 is intact
+    expect(s.t1.load).toHaveBeenCalledTimes(1);
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    s.monotonic();
+    s.neverAheadOfCloud();
+  });
+
+  it("P4 with the localChanged hint: tab 2's clean confirmation @7 cannot turn tab 1's hinted edits (built on 3) into a silent `current`", async () => {
+    const s = setup();
+    const pending = s.t1.client.reconcile("campaign", L1, { localChanged: true });
+    await flush();
+    await tab2Confirms7(s.t2); // writes { 7, clean } over tab 1's { 3, dirty } seed
+    s.t1.answers.push("secondary");
+    s.t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    s.release(ok(200, row(7, at7)));
+    expect(await pending).toEqual({ status: "stored", revision: 8 });
+    expect(s.t1.asked).toEqual([CONFLICT_COPY]);
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: { revision: 3, dirty: true }, cloud: { revision: 7 } });
     s.monotonic();
     s.neverAheadOfCloud();
   });

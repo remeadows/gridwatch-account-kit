@@ -611,6 +611,13 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         // function itself re-resolves the session (the `current` re-read below).
         const op = operation(resolved);
         let record = state.readRecord(s.userId, slot);
+        // The record as it was before the cloud GET: the revision a payload this call sees move
+        // (the `localChanged` hint, or a `current` re-read that differs) was built on. The STORED
+        // record stays monotonic, but another tab may confirm past this while the GET is pending,
+        // and deciding a moved payload against that newer revision would send it on a base it was
+        // never built on — a PUT that lands with no 409 over the other tab's row (fix round 2, C2).
+        const capturedBefore = record;
+        let localMoved = false;
         /** Everything the `localChanged` hint does, in one place, because `current` (below) has to
          *  do exactly the same thing when its re-read comes back different — the whole point of
          *  that option is that a moved local payload is indistinguishable from a caller-hinted one.
@@ -644,6 +651,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
           const latest = state.readRecord(s.userId, slot);
           if (latest !== null && !latest.dirty) state.writeRecord(s.userId, slot, { revision: latest.revision, dirty: true });
           record = state.readRecord(s.userId, slot);
+          localMoved = true;
         };
         /** The mirror image, for a `current` that reports the local payload is GONE (below). Every
          *  piece of per-user state this client holds for a slot describes one thing — that slot's
@@ -663,6 +671,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
          *  device is remains a question only the foreground's ownership prompt answers, and "the
          *  game has no local payload right now" is not an answer to it. */
         const noteLocalGone = (): void => {
+          localMoved = false;
           lastPayload.delete(payloadKey(s.userId, slot));
           noteDiscard(s.userId, slot);
           // Re-read rather than reuse `record`: it was captured before the awaited cloud load, and
@@ -819,8 +828,20 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
           }
         }
         // The record as stored NOW (no await since the stale-row checks above, so never ahead of
-        // `cloud`), not the one captured before the GET.
-        record = state.readRecord(s.userId, slot);
+        // `cloud`), not the one captured before the GET — unless the local payload moved in this
+        // call. Then the decision is handed the revision that payload was built on: the lower of
+        // the pre-GET and stored revisions, dirty, and never ahead of the cloud row (C2). A move
+        // with no record on either side (never synced, or reset by a server regression) is decided
+        // with no record, which the table answers with a prompt or an upload, never a silent send.
+        const stored = state.readRecord(s.userId, slot);
+        if (localMoved) {
+          record = capturedBefore === null || stored === null ? null : {
+            revision: Math.min(capturedBefore.revision, stored.revision, cloud?.revision ?? Number.MAX_SAFE_INTEGER),
+            dirty: true,
+          };
+        } else {
+          record = stored;
+        }
         const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });
         const asReconcile = (result: StoreResult): ReconcileResult =>
           result.status === "stored" ? { status: "stored", revision: result.revision } : result;
@@ -848,7 +869,10 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             // earlier failed store()): a background re-flush must never resurrect work the player
             // explicitly chose to abandon. Clear dirty on whatever record exists (there may be
             // none at all, if this slot was never synced) and drop any remembered payload.
-            if (record !== null) state.writeRecord(s.userId, slot, { revision: record.revision, dirty: false });
+            // The stored record, not the decision's `record` (which a moved payload may have set to
+            // an older base): a lower clean write would be refused and leave the flag set.
+            const settled = state.readRecord(s.userId, slot);
+            if (settled !== null) state.writeRecord(s.userId, slot, { revision: settled.revision, dirty: false });
             lastPayload.delete(payloadKey(s.userId, slot));
             noteDiscard(s.userId, slot);
             return { status: "fresh" };
