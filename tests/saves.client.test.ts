@@ -2,8 +2,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSavesClient, type SavesClientDeps } from "../src/saves/client";
 import { CONFLICT_COPY, OWNERSHIP_COPY, createDomPromptHost, type PromptAnswer, type PromptCopy } from "../src/saves/prompt";
+import { decideReconcile } from "../src/saves/reconcile";
 import { createSaveStateStore } from "../src/saves/state";
 import type { Transport, TransportResult } from "../src/saves/transport";
+
+// A pass-through spy: the real decision table runs unchanged everywhere in this file. It exists so
+// the cross-tab tests below can assert what the client ever HANDED the table (see "never ahead").
+vi.mock("../src/saves/reconcile", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/saves/reconcile")>();
+  return { ...actual, decideReconcile: vi.fn(actual.decideReconcile) };
+});
 
 const game = { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 };
 const campaign = { coins: 5, boosters: { rocket: 1 }, selectedHeroId: "rusty", completedTutorial: true, tutorialReplayRequested: false, levels: {}, areaRewards: {}, intelSeen: {} };
@@ -2364,6 +2372,165 @@ describe("two real clients over one storage", () => {
     expect(t2.state.readRecord("u2", "campaign")).toEqual({ revision: 1, dirty: false }); // untouched
     expect(onBackgroundStored).toHaveBeenCalledTimes(1);
     expect(onBackgroundStored).toHaveBeenCalledWith("campaign", b, 2, "u1");
+  });
+});
+
+// Kit v0.2.6: the per-user sync record is shared by every tab of the origin, and a cloud GET can be
+// OLDER than a revision another tab has since confirmed. Tab 1's reconcile starts a GET, tab 2 (same
+// account) stores and confirms revision 7, and only then does tab 1's GET come back with the row
+// at revision 3. Deciding on that row used to roll the shared record back 7 -> 3 and hand the game
+// the stale revision-3 payload as use_cloud; the moved-payload path wrote the pre-GET record back
+// as dirty @3 over 7. The rule: a record's revision never decreases (state layer), and a reconcile
+// never decides on a row older than the record stored for this user when the row arrives.
+describe("sync records are monotonic across tabs (a cloud GET older than another tab's confirmation)", () => {
+  const decide = vi.mocked(decideReconcile);
+  const L1 = { ...campaign, coins: 42 };
+  const at7 = { ...campaign, coins: 70 };
+  const recordKey = "gw-account-kit.saves.gridwatch-match.campaign.u1.v1";
+
+  function snapshot(backing: Storage): Record<string, string | null> {
+    const out: Record<string, string | null> = {};
+    for (let i = 0; i < backing.length; i += 1) { const k = backing.key(i)!; out[k] = backing.getItem(k); }
+    return out;
+  }
+
+  /** Two real clients, ONE storage, both signed in as u1. u1's record is clean @3 and u1 owns the
+   *  slot; tab 1's first cloud GET is held open until the test releases it. Every revision written
+   *  to u1's record is logged, so a test can assert it never went backwards even for a moment. */
+  function setup() {
+    const backing = sharedStorage();
+    const revisions: number[] = [];
+    const setItem = backing.setItem;
+    backing.setItem = (k: string, v: string) => { if (k === recordKey) revisions.push((JSON.parse(v) as { revision: number }).revision); setItem(k, v); };
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    let releaseGet!: (r: TransportResult) => void;
+    t1.load.mockImplementationOnce(() => new Promise((resolve) => { releaseGet = resolve; }));
+    decide.mockClear();
+    const monotonic = () => expect(revisions).toEqual([...revisions].sort((a, b) => a - b));
+    // The pure table must never be handed a record that is ahead of the cloud row it decides on.
+    const neverAheadOfCloud = () => {
+      for (const [inputs] of decide.mock.calls) {
+        if (inputs.cloud !== null && inputs.record !== null) expect(inputs.record.revision).toBeLessThanOrEqual(inputs.cloud.revision);
+      }
+    };
+    return { backing, t1, t2, release: (r: TransportResult) => releaseGet(r), monotonic, neverAheadOfCloud };
+  }
+
+  async function tab2Confirms7(t2: ReturnType<typeof tab>) {
+    t2.store.mockResolvedValueOnce(ok(200, { revision: 7, updatedAt: "t7" }));
+    expect(await t2.client.store("campaign", at7)).toEqual({ status: "stored", revision: 7, updatedAt: "t7" });
+    expect(t2.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+  }
+
+  it("(a) current() returns null: the stale row is re-loaded, and the fresh revision-7 row is what use_cloud hands back", async () => {
+    const s = setup();
+    const current = vi.fn(() => null);
+    const pending = s.t1.client.reconcile("campaign", campaign, { current });
+    await flush();
+    await tab2Confirms7(s.t2);
+    s.t1.load.mockResolvedValueOnce(ok(200, row(7, at7)));
+    s.release(ok(200, row(3)));
+    expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: at7, updatedAt: row(7).updatedAt } });
+    expect(s.t1.load).toHaveBeenCalledTimes(2);
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    s.monotonic();
+    s.neverAheadOfCloud();
+    expect(decide).toHaveBeenCalledTimes(1);
+  });
+
+  it("(a) plain use_cloud path, still stale after the re-load: a retryable error, and nothing written or remembered", async () => {
+    const s = setup();
+    const pending = s.t1.client.reconcile("campaign", null);
+    await flush();
+    await tab2Confirms7(s.t2);
+    const before = snapshot(s.backing);
+    s.t1.load.mockResolvedValueOnce(ok(200, row(3)));
+    s.release(ok(200, row(3)));
+    expect(await pending).toEqual({ status: "error", error: { code: "network", message: expect.any(String) } });
+    expect(s.t1.load).toHaveBeenCalledTimes(2);
+    expect(snapshot(s.backing)).toEqual(before); // no record, no owner, nothing at all
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    expect(decide).not.toHaveBeenCalled();
+    s.monotonic();
+  });
+
+  it("still stale with a moved current(): current() is never consulted and its payload is never remembered for a re-flush", async () => {
+    const s = setup();
+    const current = vi.fn(() => L1);
+    const pending = s.t1.client.reconcile("campaign", campaign, { current });
+    await flush();
+    await tab2Confirms7(s.t2);
+    s.t1.load.mockResolvedValueOnce(ok(200, row(3)));
+    s.release(ok(200, row(3)));
+    expect(await pending).toMatchObject({ status: "error", error: { code: "network" } });
+    expect(current).not.toHaveBeenCalled();
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    // Tab 2's next commit fails offline, so u1's shared record goes dirty @7. If tab 1 had
+    // remembered L1, the online event would now re-flush it from tab 1.
+    s.t2.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await s.t2.client.store("campaign", { ...at7, coins: 71 })).status).toBe("error");
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(s.t1.store).not.toHaveBeenCalled();
+    expect(decide).not.toHaveBeenCalled();
+    s.monotonic();
+  });
+
+  it("(b) a moved current() after the re-load marks dirty against the record as it is now (7), not the one captured before the GET (3)", async () => {
+    const s = setup();
+    const current = vi.fn(() => L1);
+    const pending = s.t1.client.reconcile("campaign", campaign, { current });
+    await flush();
+    await tab2Confirms7(s.t2);
+    s.t1.load.mockResolvedValueOnce(ok(200, row(7, at7)));
+    s.t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    s.release(ok(200, row(3)));
+    // Record dirty @7 against cloud @7: the table's restore_dirty sends the fresh payload on 7.
+    expect(await pending).toEqual({ status: "stored", revision: 8 });
+    expect(s.t1.asked).toEqual([]);
+    expect(s.t1.store).toHaveBeenCalledTimes(1);
+    expect(s.t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 7, payload: L1 });
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: false });
+    s.monotonic();
+    s.neverAheadOfCloud();
+  });
+
+  it("reconcile's conflict prompt: \"Use cloud\" answered after another tab confirmed a newer revision hands back that newer row", async () => {
+    const s = setup();
+    s.t1.load.mockReset();
+    s.t1.load.mockResolvedValueOnce(ok(200, row(5)));
+    let answer!: (a: PromptAnswer) => void;
+    s.t1.prompt.ask.mockImplementationOnce(() => new Promise<PromptAnswer>((resolve) => { answer = resolve; }));
+    // Hinted: record dirty @3 vs cloud @5 is the conflict prompt.
+    const pending = s.t1.client.reconcile("campaign", L1, { localChanged: true });
+    await flush();
+    expect(s.t1.prompt.ask).toHaveBeenCalledTimes(1);
+    await tab2Confirms7(s.t2); // while the prompt is open
+    s.t1.load.mockResolvedValueOnce(ok(200, row(7, at7)));
+    answer("primary");
+    expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: at7, updatedAt: row(7).updatedAt } });
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    s.monotonic();
+    s.neverAheadOfCloud();
+  });
+
+  it("the conflict prompt's \"Use cloud\" never hands back a row older than the stored record either", async () => {
+    const s = setup();
+    s.t1.load.mockReset();
+    await tab2Confirms7(s.t2);
+    // Tab 1 stores on its own view; the server answers 409 at 7; the player picks "Use cloud";
+    // both GETs that follow are served stale (revision 3).
+    s.t1.store.mockResolvedValueOnce(ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } }));
+    s.t1.load.mockResolvedValue(ok(200, row(3)));
+    s.t1.answers.push("primary");
+    expect(await s.t1.client.store("campaign", L1)).toMatchObject({ status: "error", error: { code: "network" } });
+    expect(s.t1.load).toHaveBeenCalledTimes(2);
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true }); // the local change stays protected
+    s.monotonic();
   });
 });
 

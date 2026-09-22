@@ -46,6 +46,32 @@ describe("createSaveStateStore", () => {
     expect(id).not.toBe(bogus);
     expect(localStorage.getItem("gw-account-kit.device-id.v1")).toBe(id);
   });
+  // Every tab of the origin shares these records, so a writer holding an older view (a GET that
+  // started before another tab confirmed a newer revision) must not roll the record back.
+  it("never lowers a record's revision: a lower write keeps the stored revision, and a dirty one still marks it dirty", () => {
+    const store = createSaveStateStore("gridwatch-match");
+    store.writeRecord("u1", "campaign", { revision: 7, dirty: false });
+    store.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    expect(store.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    store.writeRecord("u1", "campaign", { revision: 3, dirty: true }); // a local change is still a local change
+    expect(store.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    store.writeRecord("u1", "campaign", { revision: 3, dirty: false }); // an older confirmation cannot clear a newer dirty flag
+    expect(store.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    store.writeRecord("u1", "campaign", { revision: 7, dirty: false }); // equal revision: written as given
+    expect(store.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    store.writeRecord("u1", "campaign", { revision: 9, dirty: true }); // higher: written as given
+    expect(store.readRecord("u1", "campaign")).toEqual({ revision: 9, dirty: true });
+    store.writeRecord("u2", "campaign", { revision: 1, dirty: false }); // per user: u1's 9 does not bound u2
+    expect(store.readRecord("u2", "campaign")).toEqual({ revision: 1, dirty: false });
+  });
+  it("re-reads the stored record at write time, so a second store instance over the same storage (another tab) is respected", () => {
+    const tab1 = createSaveStateStore("gridwatch-match");
+    const tab2 = createSaveStateStore("gridwatch-match");
+    tab1.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    tab2.writeRecord("u1", "campaign", { revision: 7, dirty: false });
+    tab1.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    expect(tab2.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+  });
   it("falls back to memory when storage throws", () => {
     const throwing = { getItem() { throw new Error("private mode"); }, setItem() { throw new Error("private mode"); } } as unknown as Storage;
     const store = createSaveStateStore("gridwatch-match", throwing);
