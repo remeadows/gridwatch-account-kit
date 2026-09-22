@@ -9,6 +9,9 @@ export interface SyncRecord { revision: number; dirty: boolean }
 export interface SaveStateStore {
   readRecord(userId: string, slot: string): SyncRecord | null;
   writeRecord(userId: string, slot: string, record: SyncRecord): void;
+  /** Forget this user's record for the slot ("never synced"). The one way a revision can go down:
+   *  only for a cloud row that went backwards on the SERVER (see the saves client). */
+  clearRecord(userId: string, slot: string): void;
   readOwner(slot: string): string | null;
   writeOwner(slot: string, userId: string): void;
   deviceId(): string;
@@ -44,6 +47,9 @@ export function createSaveStateStore(gameSlug: string, storage: Storage | null =
   function write(key: string, value: string): void {
     try { backing.setItem(key, value); } catch { backing = fallback; fallback.setItem(key, value); }
   }
+  function remove(key: string): void {
+    try { backing.removeItem(key); } catch { backing = fallback; fallback.removeItem(key); }
+  }
   function readJson(key: string): unknown {
     const raw = read(key);
     if (raw === null) return null;
@@ -78,6 +84,9 @@ export function createSaveStateStore(gameSlug: string, storage: Storage | null =
         next = { revision: stored.revision, dirty: true };
       }
       write(recordKey(userId, slot), JSON.stringify(next));
+    },
+    clearRecord(userId, slot) {
+      remove(recordKey(userId, slot));
     },
     readOwner(slot) {
       const value = readJson(ownerKey(slot)) as { userId?: unknown } | null;

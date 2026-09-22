@@ -72,6 +72,18 @@ describe("createSaveStateStore", () => {
     tab1.writeRecord("u1", "campaign", { revision: 3, dirty: false });
     expect(tab2.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
   });
+  it("clearRecord discards a user's record for a slot (never synced), after which any revision may be written", () => {
+    const store = createSaveStateStore("gridwatch-match");
+    store.writeRecord("u1", "campaign", { revision: 7, dirty: true });
+    store.writeRecord("u2", "campaign", { revision: 7, dirty: false });
+    store.writeOwner("campaign", "u1");
+    store.clearRecord("u1", "campaign");
+    expect(store.readRecord("u1", "campaign")).toBeNull();
+    expect(store.readRecord("u2", "campaign")).toEqual({ revision: 7, dirty: false }); // other users untouched
+    expect(store.readOwner("campaign")).toBe("u1"); // owner untouched
+    store.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    expect(store.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+  });
   it("falls back to memory when storage throws", () => {
     const throwing = { getItem() { throw new Error("private mode"); }, setItem() { throw new Error("private mode"); } } as unknown as Storage;
     const store = createSaveStateStore("gridwatch-match", throwing);

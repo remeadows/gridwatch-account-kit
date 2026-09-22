@@ -524,11 +524,14 @@ describe("reconcile", () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
       h.state.writeOwner("campaign", "u9");
-      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+      // agree, so the record is discarded (never synced) before the decision.
+      h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+      expectConsole("warn", "treating the slot as never synced");
       h.answers.push("secondary");
       expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
       expect(h.asked).toEqual([OWNERSHIP_COPY]);
-      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+      expect(h.state.readRecord("u1", "campaign")).toBeNull(); // not dirty: nothing left to re-flush
 
       h.store.mockClear();
       window.dispatchEvent(new Event("online"));
@@ -539,10 +542,13 @@ describe("reconcile", () => {
       const h = harness();
       h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
       h.state.writeOwner("campaign", "u9");
-      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+      // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+      // agree, so the record is discarded (never synced) before the decision.
+      h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+      expectConsole("warn", "treating the slot as never synced");
       h.answers.push("secondary");
       expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
-      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+      expect(h.state.readRecord("u1", "campaign")).toBeNull(); // not dirty: nothing left to re-flush
 
       h.store.mockClear();
       window.dispatchEvent(new Event("online"));
@@ -844,8 +850,9 @@ describe("reconcile", () => {
       const pending = h.client.reconcile("campaign", L0, { current: () => null });
       await flush();
       h.state.writeRecord("u1", "campaign", { revision: 7, dirty: true }); // another tab confirmed newer revisions meanwhile
-      releaseLoad(ok(404, { error: "no_save" }));
-      expect(await pending).toEqual({ status: "nothing" });
+      // The row is at 7 (fix round 1: a 404 under a record @7 would now mean the server lost the row).
+      releaseLoad(ok(200, row(7)));
+      expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: campaign, updatedAt: row(7).updatedAt } });
       expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false }); // not rolled back to 3
     });
 
@@ -973,9 +980,12 @@ describe("reconcile", () => {
         const h = harness();
         h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
         h.state.writeOwner("campaign", "u1");
-        h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+        // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+        // agree, so the record is discarded (never synced) before the decision.
+        h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+        expectConsole("warn", "treating the slot as never synced");
         expect(await h.client.reconcile("campaign", L0, { localChanged: true, current: () => null })).toEqual({ status: "nothing" });
-        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+        expect(h.state.readRecord("u1", "campaign")).toBeNull();
         expect(h.state.readOwner("campaign")).toBe("u1"); // untouched
 
         h.store.mockResolvedValue(ok(200, { revision: 4, updatedAt: "t" }));
@@ -1013,7 +1023,9 @@ describe("reconcile", () => {
         h.store.mockResolvedValue(ok(200, { revision: 4, updatedAt: "t" }));
 
         const queued = h.client.store("campaign", L0); // still inside its debounce window
-        h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+        // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+        // agree, so the record is discarded (never synced) before the decision.
+        h.load.mockResolvedValue(ok(404, { error: "no_save" }));
         expect(await h.client.reconcile("campaign", L0, { current: () => null })).toEqual({ status: "nothing" });
 
         await expect(queued).resolves.toEqual({ status: "error", error: { code: "http", message: "discarded" } });
@@ -1021,7 +1033,7 @@ describe("reconcile", () => {
         expect(h.store).not.toHaveBeenCalled();
         expect(warn).toHaveBeenCalledWith("[account-kit] dropped a store the player discarded");
         warn.mockRestore();
-        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+        expect(h.state.readRecord("u1", "campaign")).toBeNull();
       });
 
       it("with an existing cloud row still resolves use_cloud, and leaves nothing for a later re-flush", async () => {
@@ -1239,6 +1251,10 @@ describe("background re-flush", () => {
     h.state.writeRecord("u2", "campaign", { revision: 5, dirty: true });
 
     h.store.mockClear();
+    // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+    // agree, so the record is discarded (never synced) before the decision.
+    h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+    expectConsole("warn", "treating the slot as never synced");
     resolveLoad(ok(404, { error: "no_save" })); // release the blocked reconcile
     await blocking;
     await flush(); // let the queued quiet re-flush actually run
@@ -1324,7 +1340,10 @@ describe("onBackgroundStored", () => {
     const h = harness(undefined, 0, { onBackgroundStored });
     h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
     expect((await h.client.store("campaign", campaign)).status).toBe("stored");
-    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+    // agree, so the record is discarded (never synced) before the decision.
+    h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+    expectConsole("warn", "treating the slot as never synced");
     h.store.mockResolvedValueOnce(ok(200, { revision: 2, updatedAt: "t2" }));
     expect((await h.client.reconcile("campaign", campaign)).status).toBe("uploaded");
     expect(onBackgroundStored).not.toHaveBeenCalled();
@@ -1832,7 +1851,10 @@ describe("a discard drops every store the same user had already queued for that 
     const h = harness();
     h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
     h.state.writeOwner("campaign", "u9"); // the slot belongs to another account
-    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+    // agree, so the record is discarded (never synced) before the decision.
+    h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+    expectConsole("warn", "treating the slot as never synced");
     let resolveAsk!: (a: PromptAnswer) => void;
     h.prompt.ask.mockImplementationOnce((copy: PromptCopy) => {
       h.asked.push(copy);
@@ -1850,7 +1872,7 @@ describe("a discard drops every store the same user had already queued for that 
     expect(await blocking).toEqual({ status: "fresh" });
     expect(await pending).toEqual(discarded);
     expect(h.store).not.toHaveBeenCalled();
-    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+    expect(h.state.readRecord("u1", "campaign")).toBeNull();
     warn.mockRestore();
   });
 
@@ -2449,43 +2471,44 @@ describe("sync records are monotonic across tabs (a cloud GET older than another
     expect(decide).toHaveBeenCalledTimes(1);
   });
 
-  it("(a) plain use_cloud path, still stale after the re-load: a retryable error, and nothing written or remembered", async () => {
+  // Fix round 1: a second load that is STILL behind the record is not a race any more — the other
+  // tab's store reached the server before it confirmed, so a re-load after it sees the newer row.
+  // Still behind means the server itself went backwards (row reset by an operator). The record is
+  // discarded (never synced) and the second load is decided on with record = null: never a
+  // retryable error forever, never a silent overwrite, never a silent adopt over local progress.
+  it("server went backwards (both loads @3 under a record @7), no local payload: use_cloud @3, record reset to 3, owner kept", async () => {
+    expectConsole("warn", "treating the slot as never synced");
     const s = setup();
     const pending = s.t1.client.reconcile("campaign", null);
     await flush();
     await tab2Confirms7(s.t2);
-    const before = snapshot(s.backing);
     s.t1.load.mockResolvedValueOnce(ok(200, row(3)));
     s.release(ok(200, row(3)));
-    expect(await pending).toEqual({ status: "error", error: { code: "network", message: expect.any(String) } });
+    expect(await pending).toEqual({ status: "use_cloud", save: { revision: 3, schemaVersion: 1, payload: campaign, updatedAt: row(3).updatedAt } });
     expect(s.t1.load).toHaveBeenCalledTimes(2);
-    expect(snapshot(s.backing)).toEqual(before); // no record, no owner, nothing at all
-    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
-    expect(decide).not.toHaveBeenCalled();
-    s.monotonic();
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+    expect(s.t1.state.readOwner("campaign")).toBe("u1");
+    expect(decide).toHaveBeenCalledTimes(1);
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: null, cloud: { revision: 3 }, local: null });
   });
 
-  it("still stale with a moved current(): current() is never consulted and its payload is never remembered for a re-flush", async () => {
+  it("server went backwards with a moved current(): the record is discarded, the moved payload is protected by the conflict prompt", async () => {
+    expectConsole("warn", "treating the slot as never synced");
     const s = setup();
     const current = vi.fn(() => L1);
     const pending = s.t1.client.reconcile("campaign", campaign, { current });
     await flush();
     await tab2Confirms7(s.t2);
     s.t1.load.mockResolvedValueOnce(ok(200, row(3)));
+    s.t1.answers.push("secondary"); // "Keep this one"
+    s.t1.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t4" }));
     s.release(ok(200, row(3)));
-    expect(await pending).toMatchObject({ status: "error", error: { code: "network" } });
-    expect(current).not.toHaveBeenCalled();
-    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
-    // Tab 2's next commit fails offline, so u1's shared record goes dirty @7. If tab 1 had
-    // remembered L1, the online event would now re-flush it from tab 1.
-    s.t2.store.mockResolvedValue({ kind: "network", message: "offline" });
-    expect((await s.t2.client.store("campaign", { ...at7, coins: 71 })).status).toBe("error");
-    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
-    window.dispatchEvent(new Event("online"));
-    await flush();
-    expect(s.t1.store).not.toHaveBeenCalled();
-    expect(decide).not.toHaveBeenCalled();
-    s.monotonic();
+    expect(await pending).toEqual({ status: "stored", revision: 4 });
+    expect(current).toHaveBeenCalledTimes(1);
+    expect(s.t1.asked).toEqual([CONFLICT_COPY]);
+    expect(s.t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3, payload: L1 });
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+    s.neverAheadOfCloud();
   });
 
   it("(b) a moved current() after the re-load marks dirty against the record as it is now (7), not the one captured before the GET (3)", async () => {
@@ -2526,19 +2549,76 @@ describe("sync records are monotonic across tabs (a cloud GET older than another
     s.neverAheadOfCloud();
   });
 
-  it("the conflict prompt's \"Use cloud\" never hands back a row older than the stored record either", async () => {
+  it("store's conflict prompt, \"Use cloud\", server went backwards (both loads @3 under a record @7): the player's choice adopts @3", async () => {
+    expectConsole("warn", "treating the slot as never synced");
     const s = setup();
     s.t1.load.mockReset();
     await tab2Confirms7(s.t2);
-    // Tab 1 stores on its own view; the server answers 409 at 7; the player picks "Use cloud";
-    // both GETs that follow are served stale (revision 3).
     s.t1.store.mockResolvedValueOnce(ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } }));
     s.t1.load.mockResolvedValue(ok(200, row(3)));
     s.t1.answers.push("primary");
-    expect(await s.t1.client.store("campaign", L1)).toMatchObject({ status: "error", error: { code: "network" } });
+    expect(await s.t1.client.store("campaign", L1)).toEqual({ status: "use_cloud", save: { revision: 3, schemaVersion: 1, payload: campaign, updatedAt: row(3).updatedAt } });
     expect(s.t1.load).toHaveBeenCalledTimes(2);
-    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true }); // the local change stays protected
-    s.monotonic();
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+  });
+});
+
+// Fix round 1, single tab: the server itself went backwards (an operator reset or deleted the row)
+// while this browser's record still says 7. Both loads agree, so it is not a cross-tab race.
+describe("a cloud row that went backwards on the server is decided on with no sync record", () => {
+  const decide = vi.mocked(decideReconcile);
+  const L1 = { ...campaign, coins: 42 };
+  const regressed = () => {
+    const h = harness();
+    h.state.writeRecord("u1", "campaign", { revision: 7, dirty: false });
+    h.state.writeOwner("campaign", "u1");
+    decide.mockClear();
+    return h;
+  };
+
+  it("(a) local payload present, both loads @3: conflict prompt, record not left at 7; \"Use cloud\" leaves it 3 and clean", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const h = regressed();
+    h.load.mockResolvedValue(ok(200, row(3)));
+    let seenDuringPrompt: unknown;
+    h.prompt.ask.mockImplementationOnce(async (copy: PromptCopy) => { h.asked.push(copy); seenDuringPrompt = h.state.readRecord("u1", "campaign"); return "primary"; });
+    expect(await h.client.reconcile("campaign", L1)).toEqual({ status: "use_cloud", save: { revision: 3, schemaVersion: 1, payload: campaign, updatedAt: row(3).updatedAt } });
+    expect(h.asked).toEqual([CONFLICT_COPY]);
+    expect(h.load).toHaveBeenCalledTimes(2);
+    expect(seenDuringPrompt).not.toMatchObject({ revision: 7 });
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: null, cloud: { revision: 3 } });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+    expect(h.state.readOwner("campaign")).toBe("u1");
+    expect(h.store).not.toHaveBeenCalled();
+  });
+
+  it("(b) no local payload, both loads @3: use_cloud @3", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const h = regressed();
+    h.load.mockResolvedValue(ok(200, row(3)));
+    expect(await h.client.reconcile("campaign", null)).toEqual({ status: "use_cloud", save: { revision: 3, schemaVersion: 1, payload: campaign, updatedAt: row(3).updatedAt } });
+    expect(h.asked).toEqual([]);
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+  });
+
+  it("(c) a record exists but both loads 404, local present: uploaded on baseRevision 0 (the server has no row to lose)", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const h = regressed();
+    h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t1" }));
+    expect(await h.client.reconcile("campaign", L1)).toEqual({ status: "uploaded", revision: 1 });
+    expect(h.load).toHaveBeenCalledTimes(2);
+    expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 0, payload: L1 });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+    expect(h.asked).toEqual([]);
+  });
+
+  it("a record exists, the first load 404s but the re-load finds the row at the record's revision: decided normally", async () => {
+    const h = regressed();
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" })).mockResolvedValueOnce(ok(200, row(7)));
+    expect(await h.client.reconcile("campaign", L1)).toEqual({ status: "current" });
+    expect(h.load).toHaveBeenCalledTimes(2);
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
   });
 });
 
