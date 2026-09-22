@@ -2789,6 +2789,64 @@ describe("a remembered payload is re-flushed on the base it was built on", () =>
   });
 });
 
+// Fix round 3: the re-review's probes, starting where P3 ends (tab 1's payload built on 3 got a
+// background 409; the shared record is { 7, dirty }; tab 1 remembers base 3; the server is at 7).
+describe("after a background 409, this tab's remembered base keeps deciding", () => {
+  const decide = vi.mocked(decideReconcile);
+  const conflictAt = (revision: number) => ok(409, { error: "conflict", cloud: { revision, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
+  async function afterP3() {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    let put!: (r: TransportResult) => void;
+    t1.store.mockImplementationOnce(() => new Promise((r) => { put = r; }));
+    const p = t1.client.store("campaign", { ...campaign, coins: 42 });
+    await flush();
+    t2.store.mockResolvedValueOnce(ok(200, { revision: 7, updatedAt: "t7" }));
+    await t2.client.store("campaign", { ...campaign, coins: 70 });
+    t1.store.mockResolvedValue({ kind: "network", message: "offline" });
+    put({ kind: "network", message: "offline" });
+    await p;
+    t1.store.mockReset();
+    let server = 7; // a compare-and-swap fake: only a PUT on the current revision lands
+    const cas = async (_s: string, body: { baseRevision: number }) => (body.baseRevision === server ? ok(200, { revision: ++server, updatedAt: `t${server}` }) : conflictAt(server));
+    t1.store.mockImplementation(cas);
+    t2.store.mockReset();
+    t2.store.mockImplementation(cas);
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3 });
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    t1.store.mockClear();
+    decide.mockClear();
+    return { backing, t1, t2 };
+  }
+
+  // N1: a moved payload (the hint, or a differing current()) was built on top of the remembered
+  // one, so the remembered base bounds the decision too — not just the pre-GET and stored records.
+  it("N1: a reconcile with the localChanged hint gets the conflict prompt, not a PUT on 7", async () => {
+    const { t1 } = await afterP3();
+    t1.load.mockResolvedValue(ok(200, row(7, { ...campaign, coins: 70 })));
+    t1.answers.push("primary"); // "Use cloud"
+    expect(await t1.client.reconcile("campaign", { ...campaign, coins: 42 }, { localChanged: true })).toMatchObject({ status: "use_cloud", save: { revision: 7 } });
+    expect(t1.asked).toEqual([CONFLICT_COPY]);
+    expect(decide.mock.calls[0][0].record).toEqual({ revision: 3, dirty: true });
+    expect(t1.store).not.toHaveBeenCalled(); // tab 2's row 7 intact
+  });
+
+  it("N1b: a reconcile whose current() reports a move gets the conflict prompt, not a PUT on 7", async () => {
+    const { t1 } = await afterP3();
+    t1.load.mockResolvedValue(ok(200, row(7, { ...campaign, coins: 70 })));
+    t1.answers.push("primary");
+    expect(await t1.client.reconcile("campaign", { ...campaign, coins: 42 }, { current: () => ({ ...campaign, coins: 43 }) })).toMatchObject({ status: "use_cloud", save: { revision: 7 } });
+    expect(t1.asked).toEqual([CONFLICT_COPY]);
+    expect(decide.mock.calls[0][0].record).toEqual({ revision: 3, dirty: true });
+    expect(t1.store).not.toHaveBeenCalled();
+  });
+});
+
 // Fix round 2 (C1): the second load is judged against the record as it was just BEFORE that load
 // was sent (r0), not as it is when the load returns. Another tab can confirm again while the
 // re-load is in flight: its row is correct as of when it was served, and only a row below r0 (or

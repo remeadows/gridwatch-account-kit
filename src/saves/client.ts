@@ -637,6 +637,10 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         // never built on — a PUT that lands with no 409 over the other tab's row (fix round 2, C2).
         const capturedBefore = record;
         let localMoved = false;
+        // The base the moved payload was built on, as noteLocalChanged computed it — including this
+        // tab's remembered base (fix round 3, N1), which the pre-GET and stored records can both be
+        // above after a background 409.
+        let movedBase = Number.MAX_SAFE_INTEGER;
         /** The base this tab's remembered (unsynced) payload was built on, while the stored record is
          *  dirty; otherwise no bound. The shared record can be dirty at a revision another tab
          *  confirmed AFTER that payload was built (a lower dirty write keeps the stored revision), so
@@ -674,6 +678,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
           // An earlier payload this tab still has unsynced (record dirty) was built on its own base,
           // and this one was built on top of it, so that base bounds it too.
           const builtOn = Math.min(capturedBefore?.revision ?? 0, state.readRecord(s.userId, slot)?.revision ?? 0, inheritedBase());
+          movedBase = Math.min(movedBase, builtOn);
           if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), { payload, base: builtOn });
           // The dirty flag itself is only forced on a CLEAN record, and is safe regardless of the
           // owner: decideReconcile raises ownership_prompt on ownedByOther whether or not the
@@ -705,6 +710,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
          *  game has no local payload right now" is not an answer to it. */
         const noteLocalGone = (): void => {
           localMoved = false;
+          movedBase = Number.MAX_SAFE_INTEGER;
           lastPayload.delete(payloadKey(s.userId, slot));
           noteDiscard(s.userId, slot);
           // Re-read rather than reuse `record`: it was captured before the awaited cloud load, and
@@ -863,13 +869,14 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         // The record as stored NOW (no await since the stale-row checks above, so never ahead of
         // `cloud`), not the one captured before the GET — unless the local payload moved in this
         // call. Then the decision is handed the revision that payload was built on: the lower of
-        // the pre-GET and stored revisions, dirty, and never ahead of the cloud row (C2). A move
+        // the pre-GET and stored revisions and this tab's remembered base (N1), dirty, and never
+        // ahead of the cloud row (C2). A move
         // with no record on either side (never synced, or reset by a server regression) is decided
         // with no record, which the table answers with a prompt or an upload, never a silent send.
         const stored = state.readRecord(s.userId, slot);
         if (localMoved) {
           record = capturedBefore === null || stored === null ? null : {
-            revision: Math.min(capturedBefore.revision, stored.revision, cloud?.revision ?? Number.MAX_SAFE_INTEGER),
+            revision: Math.min(capturedBefore.revision, stored.revision, movedBase, cloud?.revision ?? Number.MAX_SAFE_INTEGER),
             dirty: true,
           };
         } else if (stored !== null && local !== null && inheritedBase() < stored.revision) {
