@@ -61,9 +61,14 @@ function check(schema: Schema, value: unknown, path: string, depth: number, budg
       // Same bound for `number`, whatever min/max the schema declares: a huge finite value (1e308)
       // is a few bytes on the wire but ~309 characters once stored as jsonb text, which can
       // overrun the database's byte backstop after passing client and worker validation.
-      if (!isInteger && Math.abs(value) > Number.MAX_SAFE_INTEGER) return fail(`${path}: expected number`);
-      if (schema.min !== undefined && value < schema.min) return fail(`${path}: below minimum ${schema.min}`);
-      if (schema.max !== undefined && value > schema.max) return fail(`${path}: above maximum ${schema.max}`);
+      // The effective bounds are the declared ones clamped to that range: min(max, MAX_SAFE_INTEGER)
+      // and max(min, -MAX_SAFE_INTEGER). A declared bound keeps its own detail when it is the one
+      // that applies; the safe-range cap says "out of range", since the value IS a number.
+      const safe = isInteger ? Number.POSITIVE_INFINITY : Number.MAX_SAFE_INTEGER;
+      const min = Math.max(schema.min ?? Number.NEGATIVE_INFINITY, -safe);
+      const max = Math.min(schema.max ?? Number.POSITIVE_INFINITY, safe);
+      if (value < min) return fail(min === schema.min ? `${path}: below minimum ${min}` : `${path}: out of range (below minimum ${min})`);
+      if (value > max) return fail(max === schema.max ? `${path}: above maximum ${max}` : `${path}: out of range (above maximum ${max})`);
       return { ok: true };
     }
     case "array": {
