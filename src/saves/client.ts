@@ -267,9 +267,9 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   const behindRecord = (userId: string, slot: string, save: CloudSave) =>
     (state.readRecord(userId, slot)?.revision ?? -1) > save.revision;
 
-  /** Retryable by design (the transport class). Only for the one window loadNotBehindRecord cannot
-   *  cover: another tab confirming a newer revision during reconcile's session re-check just before
-   *  current() and the decision — a one-off race, so retrying resolves it. */
+  /** Retryable by design (the transport class). Only for a one-off cross-tab race: another tab
+   *  confirming a newer revision while loadNotBehindRecord's re-load was in flight, or during
+   *  reconcile's session re-check just before current() and the decision — retrying resolves it. */
   const staleRowError = (): SaveError => ({ code: "network", message: "cloud row is older than a revision this browser already confirmed; try again" });
 
   /** Behind this user's record, re-read now: an older row, or no row at all while the record says
@@ -282,10 +282,13 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   /** loadWith() for every path that is about to DECIDE on the cloud row (reconcile, and the
    *  conflict prompts' "Use cloud"). A row older than the record stored for this user when it
    *  arrives — or a 404 while a record exists — is re-loaded once, and the second answer tells the
-   *  two causes apart:
+   *  causes apart:
    *    - a cross-tab race: another tab's store reached the server before that tab confirmed, so
    *      the re-load (sent after the confirmation) sees the newer row and is decided on normally;
-   *    - the SERVER went backwards (an operator reset or deleted the row): the re-load is still
+   *    - a race again during the re-load (the row is at or above the record as it was when the
+   *      re-load was sent, but another tab has confirmed past it since): the retryable stale-row
+   *      error, nothing written;
+   *    - the SERVER went backwards (the re-load is below the record as it was when it was sent) (an operator reset or deleted the row): the re-load is still
    *      behind. The record no longer describes anything the server has, so it is discarded —
    *      this user's slot is "never synced" — and the caller decides on the second load with
    *      record = null. The decision table then prompts over any local payload (cloud row + local
@@ -296,11 +299,21 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   async function loadNotBehindRecord(slot: string, op: Op): Promise<LoadResult> {
     const first = await loadWith(slot, op);
     if (!behindRecordOrMissing(op.s.userId, slot, first)) return first;
+    // Fix round 2 (C1): the re-load is judged against the record as it was just BEFORE it was sent
+    // (r0), not as it is when it returns. Another tab can confirm again while this GET is in
+    // flight; the row it returns is then correct as of when it was served, and merely looks
+    // "behind" the newer record. Only a row below r0 — or no row while r0 > 0 — says the SERVER
+    // went backwards. Anything else still behind the record now is a race: the retryable stale-row
+    // error, writing nothing (no record, no owner, no remembered payload).
+    const r0 = state.readRecord(op.s.userId, slot)?.revision ?? 0;
     const second = await loadWith(slot, op);
-    if (behindRecordOrMissing(op.s.userId, slot, second)) {
+    const regressed = second.status === "ok" ? second.save.revision < r0 : second.status === "none" && r0 > 0;
+    if (regressed) {
       console.warn(`[account-kit] cloud row for ${slot} is behind this browser's sync record on a re-load too; treating the slot as never synced`);
       state.clearRecord(op.s.userId, slot);
+      return second;
     }
+    if (behindRecordOrMissing(op.s.userId, slot, second)) return { status: "error", error: staleRowError() };
     return second;
   }
 

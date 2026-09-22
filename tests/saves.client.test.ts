@@ -2622,6 +2622,94 @@ describe("a cloud row that went backwards on the server is decided on with no sy
   });
 });
 
+// Fix round 2 (C1): the second load is judged against the record as it was just BEFORE that load
+// was sent (r0), not as it is when the load returns. Another tab can confirm again while the
+// re-load is in flight: its row is correct as of when it was served, and only a row below r0 (or
+// a 404 while r0 > 0) means the server itself went backwards. r0 <= row < now is a race: the
+// retryable stale-row error, with nothing written (record, owner, remembered payload).
+describe("a race during the re-load is not a server regression", () => {
+  const decide = vi.mocked(decideReconcile);
+  const recordKey = "gw-account-kit.saves.gridwatch-match.campaign.u1.v1";
+  function twoTabs(t2Window: Window | null) {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, null);
+    const t2 = tab("u1", "tok1-tab2", backing, t2Window);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    let g1!: (r: TransportResult) => void;
+    let g2!: (r: TransportResult) => void;
+    t1.load.mockImplementationOnce(() => new Promise((r) => { g1 = r; }))
+      .mockImplementationOnce(() => new Promise((r) => { g2 = r; }));
+    decide.mockClear();
+    return { backing, t1, t2, first: (r: TransportResult) => g1(r), second: (r: TransportResult) => g2(r) };
+  }
+  const confirms = async (t2: ReturnType<typeof tab>, revision: number, coins: number) => {
+    t2.store.mockResolvedValueOnce(ok(200, { revision, updatedAt: `t${revision}` }));
+    expect(await t2.client.store("campaign", { ...campaign, coins })).toMatchObject({ status: "stored", revision });
+  };
+
+  it("P1: tab 2 confirms 8 while tab 1's re-load is in flight; the re-load's row 7 is a race, not a regression: retryable error, record stays 8", async () => {
+    const s = twoTabs(null);
+    const pending = s.t1.client.reconcile("campaign", null);
+    await flush();
+    await confirms(s.t2, 7, 70);
+    s.first(ok(200, row(3))); // served before tab 2's PUT @7
+    await flush();
+    expect(s.t1.load).toHaveBeenCalledTimes(2);
+    await confirms(s.t2, 8, 80); // tab 2 keeps playing while the re-load is in flight
+    const before = s.backing.getItem(recordKey);
+    const owner = s.t1.state.readOwner("campaign");
+    s.second(ok(200, row(7, { ...campaign, coins: 70 }))); // served before tab 2's PUT @8
+    const result = await pending;
+    expect(result).toEqual({ status: "error", error: { code: "network", message: expect.any(String) } });
+    expect(s.backing.getItem(recordKey)).toBe(before);
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: false });
+    expect(s.t1.state.readOwner("campaign")).toBe(owner);
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it("P2: same race while tab 2's newest progress is unsynced (dirty @8): the dirty flag and tab 2's remembered payload survive, and its re-flush sends it", async () => {
+    const s = twoTabs(window);
+    const pending = s.t1.client.reconcile("campaign", null);
+    await flush();
+    await confirms(s.t2, 7, 70);
+    s.first(ok(200, row(3)));
+    await flush();
+    await confirms(s.t2, 8, 80);
+    s.t2.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await s.t2.client.store("campaign", { ...campaign, coins: 90 })).status).toBe("error"); // unsynced progress
+    expect(s.t2.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+    s.second(ok(200, row(7)));
+    expect(await pending).toMatchObject({ status: "error", error: { code: "network" } });
+    expect(s.t2.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+    s.t2.store.mockReset();
+    s.t2.store.mockResolvedValueOnce(ok(200, { revision: 9, updatedAt: "t9" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(s.t2.store).toHaveBeenCalledTimes(1);
+    expect(s.t2.store.mock.calls[0][1]).toMatchObject({ baseRevision: 8, payload: { coins: 90 } });
+    expect(s.t2.state.readRecord("u1", "campaign")).toEqual({ revision: 9, dirty: false });
+  });
+
+  it("a re-load row exactly AT r0 while another tab confirmed past it meanwhile is a race too (r0 <= row < now)", async () => {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, null);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 0, dirty: true }); // a first upload that failed
+    let g2!: (r: TransportResult) => void;
+    // The first load returns row @3 after tab 2 confirmed 5, so it is behind; r0 is then 5.
+    t1.load.mockImplementationOnce(async () => { await confirms(t2, 5, 50); return ok(200, row(3)); })
+      .mockImplementationOnce(() => new Promise((r) => { g2 = r; }));
+    const pending = t1.client.reconcile("campaign", null);
+    await flush();
+    expect(t1.load).toHaveBeenCalledTimes(2);
+    await confirms(t2, 6, 60);
+    g2(ok(200, row(5))); // r0 = 5 <= 5 < 6: a race
+    expect(await pending).toMatchObject({ status: "error", error: { code: "network" } });
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 6, dirty: false });
+  });
+});
+
 // D2: the saves API validates every token against Supabase, so a session revoked elsewhere (a
 // sign-out on another device, before v0.2.4 made that local) answers 401 to every call while this
 // device's cached JWT still names the player. A 401 used to be reported as a plain dirty error and
