@@ -58,6 +58,21 @@ describe("validateAgainst", () => {
     const keySchema: Schema = { type: "record", keyPattern: /^[a-z]+$/g, value: { type: "boolean" } };
     expect(validateAgainst(keySchema, { abc: true, def: true })).toEqual({ ok: true });
   });
+  // Kit v0.2.6 item 5: 1e308 passes Number.isInteger, is a few bytes on the wire, and expands to
+  // ~309 characters in Postgres jsonb text — enough of them overrun the database's byte backstop
+  // after passing client and worker validation. An `integer` must be a SAFE integer, declared
+  // bounds or not.
+  it("an integer schema value must be a safe integer, even with no declared max", () => {
+    const int: Schema = { type: "integer" };
+    const nonNegative: Schema = { type: "integer", min: 0 };
+    for (const s of [int, nonNegative]) {
+      expect(validateAgainst(s, 2 ** 53)).toEqual({ ok: false, detail: "$: expected integer" });
+      expect(validateAgainst(s, 1e308)).toEqual({ ok: false, detail: "$: expected integer" });
+      expect(validateAgainst(s, Number.MAX_SAFE_INTEGER)).toEqual({ ok: true });
+    }
+    expect(validateAgainst(int, -(2 ** 53))).toEqual({ ok: false, detail: "$: expected integer" });
+    expect(validateAgainst(int, Number.MIN_SAFE_INTEGER)).toEqual({ ok: true });
+  });
   it("enforces the structural caps", () => {
     const deep: Schema = { type: "record", keyPattern: /^d$/, value: { type: "record", keyPattern: /^d$/, value: { type: "boolean" } } };
     let nested: unknown = true;
