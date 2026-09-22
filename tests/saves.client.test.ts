@@ -522,16 +522,17 @@ describe("reconcile", () => {
     });
     it("'Start fresh' after a hinted reconcile clears the pre-load dirty seed instead of leaving the discarded local payload flagged for background upload", async () => {
       const h = harness();
-      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      // Fix round 2 (I1): a revision-0 dirty record (a first upload that failed) is the one shape that
+      // reaches "Start fresh" with a record in production — a 404 is exactly what revision 0 predicts,
+      // so no server-regression reset runs first and "Start fresh" itself must clear the flag.
+      h.state.writeRecord("u1", "campaign", { revision: 0, dirty: true });
       h.state.writeOwner("campaign", "u9");
-      // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
-      // agree, so the record is discarded (never synced) before the decision.
-      h.load.mockResolvedValue(ok(404, { error: "no_save" }));
-      expectConsole("warn", "treating the slot as never synced");
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
       h.answers.push("secondary");
       expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
       expect(h.asked).toEqual([OWNERSHIP_COPY]);
-      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // reset kept the dirty flag (C1b); Start fresh cleared it
+      expect(h.load).toHaveBeenCalledTimes(1);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // not dirty: nothing left to re-flush
 
       h.store.mockClear();
       window.dispatchEvent(new Event("online"));
@@ -540,15 +541,13 @@ describe("reconcile", () => {
     });
     it("'Start fresh' discards the local payload regardless of why the record was already dirty (hint block never fired here, since the record was dirty going in)", async () => {
       const h = harness();
-      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+      h.state.writeRecord("u1", "campaign", { revision: 0, dirty: true }); // see the test above (I1)
       h.state.writeOwner("campaign", "u9");
-      // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
-      // agree, so the record is discarded (never synced) before the decision.
-      h.load.mockResolvedValue(ok(404, { error: "no_save" }));
-      expectConsole("warn", "treating the slot as never synced");
+      h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
       h.answers.push("secondary");
       expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
-      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // reset kept the dirty flag (C1b); Start fresh cleared it
+      expect(h.load).toHaveBeenCalledTimes(1);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // not dirty: nothing left to re-flush
 
       h.store.mockClear();
       window.dispatchEvent(new Event("online"));
