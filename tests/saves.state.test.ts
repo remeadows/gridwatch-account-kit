@@ -72,9 +72,19 @@ describe("createSaveStateStore", () => {
     tab1.writeRecord("u1", "campaign", { revision: 3, dirty: false });
     expect(tab2.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
   });
-  it("clearRecord discards a user's record for a slot (never synced), after which any revision may be written", () => {
+  it("clearRecord never discards a dirty flag: a dirty record becomes { revision: 0, dirty: true }, re-read at write time", () => {
+    const tab1 = createSaveStateStore("gridwatch-match");
+    const tab2 = createSaveStateStore("gridwatch-match");
+    tab1.writeRecord("u1", "campaign", { revision: 7, dirty: false });
+    tab2.writeRecord("u1", "campaign", { revision: 7, dirty: true }); // another tab marked it dirty since
+    tab1.clearRecord("u1", "campaign");
+    expect(tab1.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: true });
+    tab1.writeRecord("u1", "campaign", { revision: 3, dirty: false }); // any revision may follow
+    expect(tab1.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+  });
+  it("clearRecord discards a user's clean record for a slot (never synced), after which any revision may be written", () => {
     const store = createSaveStateStore("gridwatch-match");
-    store.writeRecord("u1", "campaign", { revision: 7, dirty: true });
+    store.writeRecord("u1", "campaign", { revision: 7, dirty: false });
     store.writeRecord("u2", "campaign", { revision: 7, dirty: false });
     store.writeOwner("campaign", "u1");
     store.clearRecord("u1", "campaign");

@@ -297,8 +297,29 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
    *      never a silent overwrite, never a silent adopt over local progress. The owner record is
    *      not touched: whose local save this is did not change. */
   async function loadNotBehindRecord(slot: string, op: Op): Promise<LoadResult> {
+    const { loaded, regressedFrom } = await loadCheckingRecord(slot, op);
+    if (regressedFrom !== null && !resetRegressed(op.s.userId, slot, regressedFrom)) return { status: "error", error: staleRowError() };
+    return loaded;
+  }
+
+  /** The reset for a server regression loadCheckingRecord found, applied separately so a caller
+   *  that still has a check to make first (reconcile's session re-check before current()) can run
+   *  it BEFORE anything is written. `r0` is the record revision the regression was judged against:
+   *  if another tab has confirmed past it since, the server does have a newer row after all, so
+   *  this is a race, not a regression — nothing is written, and false is returned (the caller
+   *  resolves the retryable stale-row error). */
+  function resetRegressed(userId: string, slot: string, r0: number): boolean {
+    if ((state.readRecord(userId, slot)?.revision ?? 0) > r0) return false;
+    console.warn(`[account-kit] cloud row for ${slot} is behind this browser's sync record on a re-load too; treating the slot as never synced`);
+    state.clearRecord(userId, slot);
+    return true;
+  }
+
+  /** loadNotBehindRecord's load and classification, WITHOUT the reset: a server regression is
+   *  reported as `regressedFrom` (r0) for the caller to pass to resetRegressed. */
+  async function loadCheckingRecord(slot: string, op: Op): Promise<{ loaded: LoadResult; regressedFrom: number | null }> {
     const first = await loadWith(slot, op);
-    if (!behindRecordOrMissing(op.s.userId, slot, first)) return first;
+    if (!behindRecordOrMissing(op.s.userId, slot, first)) return { loaded: first, regressedFrom: null };
     // Fix round 2 (C1): the re-load is judged against the record as it was just BEFORE it was sent
     // (r0), not as it is when it returns. Another tab can confirm again while this GET is in
     // flight; the row it returns is then correct as of when it was served, and merely looks
@@ -308,13 +329,9 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     const r0 = state.readRecord(op.s.userId, slot)?.revision ?? 0;
     const second = await loadWith(slot, op);
     const regressed = second.status === "ok" ? second.save.revision < r0 : second.status === "none" && r0 > 0;
-    if (regressed) {
-      console.warn(`[account-kit] cloud row for ${slot} is behind this browser's sync record on a re-load too; treating the slot as never synced`);
-      state.clearRecord(op.s.userId, slot);
-      return second;
-    }
-    if (behindRecordOrMissing(op.s.userId, slot, second)) return { status: "error", error: staleRowError() };
-    return second;
+    if (regressed) return { loaded: second, regressedFrom: r0 };
+    if (behindRecordOrMissing(op.s.userId, slot, second)) return { loaded: { status: "error", error: staleRowError() }, regressedFrom: null };
+    return { loaded: second, regressedFrom: null };
   }
 
   async function sendOnce(slot: string, payload: SavePayload, baseRevision: number, op: Op): Promise<SendOutcome> {
@@ -665,8 +682,17 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         // load runs, so decideReconcile prompts instead of silently handing back a newer cloud
         // row, and so a crash or a failed load still leaves the slot protected.
         if (options?.localChanged === true && local !== null) noteLocalChanged(local);
-        const loaded = await loadNotBehindRecord(slot, op);
+        // A server regression's reset is deferred while a `current` re-read is still to come: its
+        // session re-check (below) may end this call as signed_out, and then nothing — the record
+        // and its dirty flag included — may have been touched (fix round 2, M2).
+        const checked = await loadCheckingRecord(slot, op);
+        const loaded = checked.loaded;
         if (loaded.status === "error") return loaded;
+        let pendingReset = checked.regressedFrom;
+        if (pendingReset !== null && options?.current === undefined) {
+          if (!resetRegressed(s.userId, slot, pendingReset)) return { status: "error", error: staleRowError() };
+          pendingReset = null;
+        }
         const cloud = loaded.status === "ok" ? loaded.save : null;
         // The cloud GET above can take seconds, and the game's save for this slot can move inside
         // that window. Deciding on the payload the caller handed us before the GET would then let
@@ -703,6 +729,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
           // again here, before current() and with no await left before the decision, so the table
           // is never handed a record ahead of the row (no re-load: that would put an await between
           // this check and the decision again).
+          if (pendingReset !== null && !resetRegressed(s.userId, slot, pendingReset)) return { status: "error", error: staleRowError() };
           if (cloud !== null && behindRecord(s.userId, slot, cloud)) return { status: "error", error: staleRowError() };
           let fresh: SavePayload | null | undefined;
           let reread = false;

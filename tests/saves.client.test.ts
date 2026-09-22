@@ -531,7 +531,7 @@ describe("reconcile", () => {
       h.answers.push("secondary");
       expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
       expect(h.asked).toEqual([OWNERSHIP_COPY]);
-      expect(h.state.readRecord("u1", "campaign")).toBeNull(); // not dirty: nothing left to re-flush
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // reset kept the dirty flag (C1b); Start fresh cleared it
 
       h.store.mockClear();
       window.dispatchEvent(new Event("online"));
@@ -548,7 +548,7 @@ describe("reconcile", () => {
       expectConsole("warn", "treating the slot as never synced");
       h.answers.push("secondary");
       expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
-      expect(h.state.readRecord("u1", "campaign")).toBeNull(); // not dirty: nothing left to re-flush
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // reset kept the dirty flag (C1b); Start fresh cleared it
 
       h.store.mockClear();
       window.dispatchEvent(new Event("online"));
@@ -985,7 +985,7 @@ describe("reconcile", () => {
         h.load.mockResolvedValue(ok(404, { error: "no_save" }));
         expectConsole("warn", "treating the slot as never synced");
         expect(await h.client.reconcile("campaign", L0, { localChanged: true, current: () => null })).toEqual({ status: "nothing" });
-        expect(h.state.readRecord("u1", "campaign")).toBeNull();
+        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // reset kept the hint's dirty flag (C1b); the move to null cleared it
         expect(h.state.readOwner("campaign")).toBe("u1"); // untouched
 
         h.store.mockResolvedValue(ok(200, { revision: 4, updatedAt: "t" }));
@@ -2611,6 +2611,39 @@ describe("a cloud row that went backwards on the server is decided on with no sy
     expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 0, payload: L1 });
     expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
     expect(h.asked).toEqual([]);
+  });
+
+  // Fix round 2 (C1b): a reset never discards a dirty flag. A dirty record becomes { 0, dirty }: the
+  // table then prompts when a row exists (and uploads when none does), and the slot stays queued.
+  it("a DIRTY record is reset to { 0, dirty: true }, not removed: the table is handed that record and prompts", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const h = regressed();
+    h.state.writeRecord("u1", "campaign", { revision: 7, dirty: true });
+    h.load.mockResolvedValue(ok(200, row(3)));
+    let seenDuringPrompt: unknown;
+    h.prompt.ask.mockImplementationOnce(async (copy: PromptCopy) => { h.asked.push(copy); seenDuringPrompt = h.state.readRecord("u1", "campaign"); return "secondary"; });
+    h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t4" }));
+    expect(await h.client.reconcile("campaign", L1)).toEqual({ status: "stored", revision: 4 });
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: { revision: 0, dirty: true }, cloud: { revision: 3 } });
+    expect(seenDuringPrompt).toEqual({ revision: 0, dirty: true });
+    expect(h.asked).toEqual([CONFLICT_COPY]);
+    expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3, payload: L1 });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+  });
+
+  // Fix round 2 (M2): in the current() path the reset waits for the session re-check, so an account
+  // switch (signed_out) leaves the record, dirty flag included, exactly as it was.
+  it("with current(), a regression followed by a signed_out re-check leaves the record untouched", async () => {
+    const h = regressed();
+    h.state.writeRecord("u1", "campaign", { revision: 7, dirty: true });
+    const current = vi.fn(() => L1);
+    h.load.mockResolvedValueOnce(ok(200, row(3)))
+      .mockImplementationOnce(async () => { h.setSession({ access_token: "tok2", user: { id: "u2" } }); return ok(200, row(3)); });
+    expect(await h.client.reconcile("campaign", campaign, { current })).toEqual({ status: "signed_out" });
+    expect(h.load).toHaveBeenCalledTimes(2);
+    expect(current).not.toHaveBeenCalled();
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    expect(decide).not.toHaveBeenCalled();
   });
 
   it("a record exists, the first load 404s but the re-load finds the row at the record's revision: decided normally", async () => {

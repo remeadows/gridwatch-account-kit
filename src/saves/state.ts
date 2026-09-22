@@ -10,7 +10,9 @@ export interface SaveStateStore {
   readRecord(userId: string, slot: string): SyncRecord | null;
   writeRecord(userId: string, slot: string, record: SyncRecord): void;
   /** Forget this user's record for the slot ("never synced"). The one way a revision can go down:
-   *  only for a cloud row that went backwards on the SERVER (see the saves client). */
+   *  only for a cloud row that went backwards on the SERVER (see the saves client). It never
+   *  discards a dirty flag: a record that is dirty when this runs (re-read at write time) becomes
+   *  { revision: 0, dirty: true } instead of being removed; a clean one is removed. */
   clearRecord(userId: string, slot: string): void;
   readOwner(slot: string): string | null;
   writeOwner(slot: string, userId: string): void;
@@ -86,7 +88,11 @@ export function createSaveStateStore(gameSlug: string, storage: Storage | null =
       write(recordKey(userId, slot), JSON.stringify(next));
     },
     clearRecord(userId, slot) {
-      remove(recordKey(userId, slot));
+      // Unsynced local progress is still unsynced after the server went backwards: keep the flag.
+      // Revision 0 then makes the decision table prompt when a cloud row exists (dirty and behind
+      // it) and upload when none does, and keeps the slot queued for a background re-flush.
+      if (readRecord(userId, slot)?.dirty) write(recordKey(userId, slot), JSON.stringify({ revision: 0, dirty: true }));
+      else remove(recordKey(userId, slot));
     },
     readOwner(slot) {
       const value = readJson(ownerKey(slot)) as { userId?: unknown } | null;
