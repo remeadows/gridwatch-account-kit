@@ -5,6 +5,7 @@ import { CONFLICT_COPY, OWNERSHIP_COPY, createDomPromptHost, type PromptAnswer, 
 import { decideReconcile } from "../src/saves/reconcile";
 import { createSaveStateStore } from "../src/saves/state";
 import type { Transport, TransportResult } from "../src/saves/transport";
+import { expectConsole } from "./setup/consoleGuard";
 
 // A pass-through spy: the real decision table runs unchanged everywhere in this file. It exists so
 // the cross-tab tests below can assert what the client ever HANDED the table (see "never ahead").
@@ -60,6 +61,7 @@ describe("load", () => {
     expect(await harness(null).client.load("campaign")).toEqual({ status: "signed_out" });
   });
   it("rejects an inbound cloud row with an invalid payload or the wrong slot instead of handing it to the game", async () => {
+    expectConsole("warn", "[account-kit] rejecting cloud row for campaign: $.extra: unknown property");
     const h = harness();
     h.load.mockResolvedValueOnce(ok(200, row(2, { ...campaign, extra: 1 } as typeof campaign)));
     expect(await h.client.load("campaign")).toMatchObject({ status: "error", error: { code: "invalid_payload" } });
@@ -67,6 +69,7 @@ describe("load", () => {
     expect((await h.client.load("campaign")).status).toBe("error");
   });
   it("never rejects: a thrown getSession becomes a reportable error", async () => {
+    expectConsole("warn", "[account-kit] load campaign failed: boom");
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
     const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
@@ -79,6 +82,7 @@ describe("load", () => {
 
 describe("store", () => {
   it("rejects a bad payload locally without a request", async () => {
+    expectConsole("warn", "[account-kit] refusing to store campaign: $.coins: below minimum 0");
     const h = harness();
     const result = await h.client.store("campaign", { coins: -1 });
     expect(result).toMatchObject({ status: "error", error: { code: "invalid_payload" } });
@@ -147,6 +151,7 @@ describe("store", () => {
     expect(h.store).not.toHaveBeenCalled();
   });
   it("settles all waiters with an http error when the flush chain throws, without an unhandled rejection", async () => {
+    expectConsole("warn", "[account-kit] store flush for campaign failed: boom");
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
     const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
@@ -212,6 +217,7 @@ describe("store", () => {
     expect(state.readRecord("u1", "campaign")).toBeNull();
   });
   it("dispose() closes an open conflict prompt and resolves the pending store as disposed", async () => {
+    expectConsole("warn", "[account-kit] store flush for campaign failed: disposed");
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
     const conflict = ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
@@ -295,6 +301,7 @@ describe("reconcile", () => {
     expect(h.store).not.toHaveBeenCalled();
   });
   it("validates the local payload before sending anything (migration path can carry denylisted keys)", async () => {
+    expectConsole("warn", "[account-kit] refusing to reconcile campaign: $.sessionToken: unknown property");
     const h = harness();
     const result = await h.client.reconcile("campaign", { ...campaign, sessionToken: "x" });
     expect(result).toMatchObject({ status: "error", error: { code: "invalid_payload" } });
@@ -302,6 +309,7 @@ describe("reconcile", () => {
     expect(h.store).not.toHaveBeenCalled();
   });
   it("never rejects: a thrown getSession becomes a reportable error", async () => {
+    expectConsole("warn", "[account-kit] reconcile campaign failed: boom");
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
     const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };

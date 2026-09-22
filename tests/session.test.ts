@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __setSupabaseForTests } from "../src/client";
 import { createAccountKit } from "../src/session";
+import { expectConsole } from "./setup/consoleGuard";
 
 function fakeSupabase(session: unknown = null) {
   const listeners: Array<(e: string, s: unknown) => void> = [];
@@ -81,7 +82,7 @@ describe("createAccountKit", () => {
   it("returns exactly null when the client reports an error alongside a session", async () => {
     const sb = fakeSupabase(user);
     sb.auth.getSession.mockResolvedValueOnce({ data: { session: user }, error: { message: "stale token" } } as never);
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expectConsole("warn", "[account-kit] getSession failed: stale token");
     expect(await createAccountKit({ returnPath: "/" }).getSession()).toBeNull();
   });
 
@@ -139,7 +140,7 @@ describe("createAccountKit", () => {
   it("getProfile and saveHandle survive a throwing auth.getSession (via the safe wrapper)", async () => {
     const sb = fakeSupabase(null);
     sb.auth.getSession.mockRejectedValue(new Error("network down"));
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expectConsole("warn", "[account-kit] getSession threw: network down");
     const kit = createAccountKit({ returnPath: "/" });
     expect(await kit.getProfile()).toEqual({ handle: null });
     expect(await kit.saveHandle("rusty")).toBe("Not signed in.");
@@ -164,7 +165,7 @@ describe("createAccountKit", () => {
   it("getProfile rejects when the profile query resolves a PostgREST error", async () => {
     const sb = fakeSupabase(user);
     sb.__maybeSingle.mockResolvedValueOnce({ data: null, error: { message: "boom" } } as never);
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expectConsole("warn", "[account-kit] profile load failed: boom");
     const kit = createAccountKit({ returnPath: "/" });
     await expect(kit.getProfile()).rejects.toThrow("boom");
   });

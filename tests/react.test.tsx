@@ -2,6 +2,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { useAccount } from "../src/react";
+import { expectConsole } from "./setup/consoleGuard";
 import type { AccountKit } from "../src/session";
 
 function fakeKit(session: unknown, handle: string | null) {
@@ -38,7 +39,7 @@ describe("useAccount", () => {
   it("clears loading even if the initial session read rejects", async () => {
     const { kit } = fakeKit(null, null);
     (kit.getSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("boom"));
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expectConsole("warn", "[account-kit] getSession rejected:");
     const { result } = renderHook(() => useAccount(kit));
     await act(async () => {});
     expect(result.current.loading).toBe(false);
