@@ -2,6 +2,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { canonicalJson, hasLoneSurrogate, requestHash, sha256Hex } from "../src/saves-schema/canonical";
+import { findDeniedKey } from "../src/saves-schema/denylist";
+import { LIMITS, validateAgainst, type Schema } from "../src/saves-schema/validate";
 
 // Reference implementation for the differential test below only — a lookbehind here is fine
 // (this file is never shipped; only src/ is scanned by the release gate and the test above).
@@ -51,6 +53,20 @@ describe("canonicalJson", () => {
     expect(() => canonicalJson(nested)).toThrow(RangeError);
     expect(() => canonicalJson(nested)).toThrow(/deeper than 32/);
     await expect(requestHash({ game: "g", slot: "s", schemaVersion: 1, baseRevision: 0, payload: nested })).rejects.toThrow(/deeper than 32/);
+  });
+  // requestHash wraps the payload one level ({ game, slot, schemaVersion, baseRevision, payload }),
+  // so a payload at exactly LIMITS.maxDepth used to validate and then fail to hash (RangeError).
+  it("hashes any payload the validator accepts: depth 32 validates AND hashes; depth 33 is still rejected", async () => {
+    const rec = { type: "record", keyPattern: /^d$/ } as { type: "record"; keyPattern: RegExp; value: Schema };
+    rec.value = rec; // nests to any depth; the structural cap is what bounds it
+    const nest = (levels: number) => { let v: unknown = {}; for (let i = 0; i < levels; i++) v = { d: v }; return v; };
+    const at32 = nest(LIMITS.maxDepth); // innermost {} sits at depth 32 from the payload root
+    expect(validateAgainst(rec, at32)).toEqual({ ok: true });
+    expect(findDeniedKey(at32)).toBeNull(); // validatePayload's other half
+    await expect(requestHash({ game: "g", slot: "s", schemaVersion: 1, baseRevision: 0, payload: at32 })).resolves.toMatch(/^[0-9a-f]{64}$/);
+    const at33 = nest(LIMITS.maxDepth + 1);
+    expect(validateAgainst(rec, at33).ok).toBe(false);
+    await expect(requestHash({ game: "g", slot: "s", schemaVersion: 1, baseRevision: 0, payload: at33 })).rejects.toThrow(/deeper than 32/);
   });
   it("rejects sparse arrays instead of silently skipping holes (Array.prototype.map skips them)", () => {
     expect(() => canonicalJson(Array(1))).toThrow(TypeError);
