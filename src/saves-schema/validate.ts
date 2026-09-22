@@ -58,6 +58,10 @@ function check(schema: Schema, value: unknown, path: string, depth: number, budg
       const isInteger = schema.type === "integer";
       if (typeof value !== "number" || !Number.isFinite(value)) return fail(`${path}: expected ${schema.type}`);
       if (isInteger && !Number.isSafeInteger(value)) return fail(`${path}: expected integer`);
+      // Same bound for `number`, whatever min/max the schema declares: a huge finite value (1e308)
+      // is a few bytes on the wire but ~309 characters once stored as jsonb text, which can
+      // overrun the database's byte backstop after passing client and worker validation.
+      if (!isInteger && Math.abs(value) > Number.MAX_SAFE_INTEGER) return fail(`${path}: expected number`);
       if (schema.min !== undefined && value < schema.min) return fail(`${path}: below minimum ${schema.min}`);
       if (schema.max !== undefined && value > schema.max) return fail(`${path}: above maximum ${schema.max}`);
       return { ok: true };

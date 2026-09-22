@@ -73,6 +73,17 @@ describe("validateAgainst", () => {
     expect(validateAgainst(int, -(2 ** 53))).toEqual({ ok: false, detail: "$: expected integer" });
     expect(validateAgainst(int, Number.MIN_SAFE_INTEGER)).toEqual({ ok: true });
   });
+  // Same jsonb-size reasoning for `number`: 1e308 is finite, tiny on the wire, ~309 chars stored.
+  it("a number schema value must not exceed Number.MAX_SAFE_INTEGER in magnitude, even with no declared bounds", () => {
+    const num: Schema = { type: "number" };
+    expect(validateAgainst(num, 1e308)).toEqual({ ok: false, detail: "$: expected number" });
+    expect(validateAgainst(num, -1e308)).toEqual({ ok: false, detail: "$: expected number" });
+    expect(validateAgainst(num, 2 ** 53)).toEqual({ ok: false, detail: "$: expected number" });
+    expect(validateAgainst(num, Number.MAX_SAFE_INTEGER)).toEqual({ ok: true });
+    expect(validateAgainst(num, -Number.MAX_SAFE_INTEGER)).toEqual({ ok: true });
+    expect(validateAgainst(num, 0.5)).toEqual({ ok: true });
+    expect(validateAgainst(num, 1e-300)).toEqual({ ok: true }); // tiny magnitudes are not the problem
+  });
   it("enforces the structural caps", () => {
     const deep: Schema = { type: "record", keyPattern: /^d$/, value: { type: "record", keyPattern: /^d$/, value: { type: "boolean" } } };
     let nested: unknown = true;
