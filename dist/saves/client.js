@@ -576,6 +576,10 @@ export function createSavesClient(deps) {
                 // never built on — a PUT that lands with no 409 over the other tab's row (fix round 2, C2).
                 const capturedBefore = record;
                 let localMoved = false;
+                // The base the moved payload was built on, as noteLocalChanged computed it — including this
+                // tab's remembered base (fix round 3, N1), which the pre-GET and stored records can both be
+                // above after a background 409.
+                let movedBase = Number.MAX_SAFE_INTEGER;
                 /** The base this tab's remembered (unsynced) payload was built on, while the stored record is
                  *  dirty; otherwise no bound. The shared record can be dirty at a revision another tab
                  *  confirmed AFTER that payload was built (a lower dirty write keeps the stored revision), so
@@ -613,6 +617,7 @@ export function createSavesClient(deps) {
                     // An earlier payload this tab still has unsynced (record dirty) was built on its own base,
                     // and this one was built on top of it, so that base bounds it too.
                     const builtOn = Math.min(capturedBefore?.revision ?? 0, state.readRecord(s.userId, slot)?.revision ?? 0, inheritedBase());
+                    movedBase = Math.min(movedBase, builtOn);
                     if (owner === null || owner === s.userId)
                         lastPayload.set(payloadKey(s.userId, slot), { payload, base: builtOn });
                     // The dirty flag itself is only forced on a CLEAN record, and is safe regardless of the
@@ -646,6 +651,7 @@ export function createSavesClient(deps) {
                  *  game has no local payload right now" is not an answer to it. */
                 const noteLocalGone = () => {
                     localMoved = false;
+                    movedBase = Number.MAX_SAFE_INTEGER;
                     lastPayload.delete(payloadKey(s.userId, slot));
                     noteDiscard(s.userId, slot);
                     // Re-read rather than reuse `record`: it was captured before the awaited cloud load, and
@@ -820,13 +826,14 @@ export function createSavesClient(deps) {
                 // The record as stored NOW (no await since the stale-row checks above, so never ahead of
                 // `cloud`), not the one captured before the GET — unless the local payload moved in this
                 // call. Then the decision is handed the revision that payload was built on: the lower of
-                // the pre-GET and stored revisions, dirty, and never ahead of the cloud row (C2). A move
+                // the pre-GET and stored revisions and this tab's remembered base (N1), dirty, and never
+                // ahead of the cloud row (C2). A move
                 // with no record on either side (never synced, or reset by a server regression) is decided
                 // with no record, which the table answers with a prompt or an upload, never a silent send.
                 const stored = state.readRecord(s.userId, slot);
                 if (localMoved) {
                     record = capturedBefore === null || stored === null ? null : {
-                        revision: Math.min(capturedBefore.revision, stored.revision, cloud?.revision ?? Number.MAX_SAFE_INTEGER),
+                        revision: Math.min(capturedBefore.revision, stored.revision, movedBase, cloud?.revision ?? Number.MAX_SAFE_INTEGER),
                         dirty: true,
                     };
                 }
@@ -837,12 +844,24 @@ export function createSavesClient(deps) {
                     record = stored;
                 }
                 const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });
+                /** Every reconcile-path send (upload, restore_dirty, "Keep this one") goes through here. Once
+                 *  one lands, the payload this tab remembers for the slot is exactly what was sent, on the
+                 *  revision it landed at (fix round 3, N2): an older remembered payload with an older base
+                 *  would otherwise make a later reconcile of this very payload ask the player a question
+                 *  they already answered. The slot is this user's now (these sends claim it). */
+                const sendLocal = async (baseRevision) => {
+                    const sent = local;
+                    const result = await sendWithConflicts(slot, sent, baseRevision, op, true);
+                    if (result.status === "stored" && !disposed)
+                        lastPayload.set(payloadKey(s.userId, slot), { payload: sent, base: result.revision });
+                    return result;
+                };
                 const asReconcile = (result) => result.status === "stored" ? { status: "stored", revision: result.revision } : result;
                 const upload = async () => {
                     // claim: true — this is either the table's own `upload` (the slot is unset or already
                     // this user's) or the ownership prompt's "Upload", which is a deliberate take-over.
                     // Both are ownership decisions made here, at the front of this slot's chain.
-                    const result = await sendWithConflicts(slot, local, 0, op, true);
+                    const result = await sendLocal(0);
                     return result.status === "stored" ? { status: "uploaded", revision: result.revision } : result;
                 };
                 switch (decision) {
@@ -915,14 +934,16 @@ export function createSavesClient(deps) {
                         }
                         // claim: true — "Keep this one" is the take-over answer: the player said the local
                         // save is theirs and it is going up as their cloud row.
-                        return asReconcile(await sendWithConflicts(slot, local, current.revision, op, true));
+                        return asReconcile(await sendLocal(current.revision));
                     }
                     case "current": return { status: "current" };
                     case "restore_dirty":
                         // claim: true — the table only reaches restore_dirty when the slot is unset or already
                         // this user's (decideReconcile sends ownedByOther to conflict_prompt instead), and it
                         // is a reconcile decision made here, at the front of this slot's chain.
-                        return asReconcile(await sendWithConflicts(slot, local, state.readRecord(s.userId, slot)?.revision ?? 0, op, true));
+                        // On the cloud revision the table decided on (fix round 3, N4), never a re-read of the
+                        // record: a write from another tab landing in between must meet a 409, not match the CAS.
+                        return asReconcile(await sendLocal(cloud.revision));
                 }
             }
             catch (thrown) {
