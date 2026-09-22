@@ -89,8 +89,12 @@ export async function sha256Hex(text) {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
     return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
-/** SHA-256 over the canonical JSON of exactly { game, slot, schemaVersion, baseRevision, payload }. */
+/** SHA-256 over the canonical JSON of exactly { game, slot, schemaVersion, baseRevision, payload }.
+ *
+ *  The wrapper is serialized at depth -1, so the payload itself sits at depth 0 — exactly where
+ *  validatePayload measures it from. Any payload the validator accepts (up to LIMITS.maxDepth) can
+ *  therefore be hashed, and one level deeper is still refused, with the same "deeper than" limit. */
 export async function requestHash(input) {
     const { game, slot, schemaVersion, baseRevision, payload } = input;
-    return sha256Hex(canonicalJson({ game, slot, schemaVersion, baseRevision, payload }));
+    return sha256Hex(serialize({ game, slot, schemaVersion, baseRevision, payload }, "$", -1));
 }

@@ -37,12 +37,16 @@ export function useAccount(kit) {
     }, [kit, userId]);
     const signInWithEmail = useCallback((email, redirectTo) => kit.signInWithEmail(email, { redirectTo }), [kit]);
     const signInWithProvider = useCallback((provider, redirectTo) => kit.signInWithProvider(provider, { redirectTo }), [kit]);
+    // Bound to the user this render shows: if the account changes before submit, the kit refuses
+    // rather than writing the handle onto the other account. A signed-out render has no one to bind to.
     const saveHandle = useCallback(async (raw) => {
-        const error = await kit.saveHandle(raw);
+        if (!userId)
+            return "Not signed in.";
+        const error = await kit.saveHandle(raw, userId);
         if (!error)
             setHandle(raw.trim());
         return error;
-    }, [kit]);
+    }, [kit, userId]);
     const signOut = useCallback(() => kit.signOut().catch((thrown) => { console.warn("[account-kit] signOut failed:", thrown); }), [kit]);
     return { session, handle, loading, signInWithEmail, signInWithProvider, saveHandle, signOut };
 }

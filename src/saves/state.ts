@@ -9,6 +9,11 @@ export interface SyncRecord { revision: number; dirty: boolean }
 export interface SaveStateStore {
   readRecord(userId: string, slot: string): SyncRecord | null;
   writeRecord(userId: string, slot: string, record: SyncRecord): void;
+  /** Forget this user's record for the slot ("never synced"). The one way a revision can go down:
+   *  only for a cloud row that went backwards on the SERVER (see the saves client). It never
+   *  discards a dirty flag: a record that is dirty when this runs (re-read at write time) becomes
+   *  { revision: 0, dirty: true } instead of being removed; a clean one is removed. */
+  clearRecord(userId: string, slot: string): void;
   readOwner(slot: string): string | null;
   writeOwner(slot: string, userId: string): void;
   deviceId(): string;
@@ -44,6 +49,9 @@ export function createSaveStateStore(gameSlug: string, storage: Storage | null =
   function write(key: string, value: string): void {
     try { backing.setItem(key, value); } catch { backing = fallback; fallback.setItem(key, value); }
   }
+  function remove(key: string): void {
+    try { backing.removeItem(key); } catch { backing = fallback; fallback.removeItem(key); }
+  }
   function readJson(key: string): unknown {
     const raw = read(key);
     if (raw === null) return null;
@@ -53,13 +61,38 @@ export function createSaveStateStore(gameSlug: string, storage: Storage | null =
   const recordKey = (userId: string, slot: string) => `gw-account-kit.saves.${gameSlug}.${slot}.${userId}.v1`;
   const ownerKey = (slot: string) => `gw-account-kit.saves.${gameSlug}.${slot}.owner.v1`;
 
+  function readRecord(userId: string, slot: string): SyncRecord | null {
+    const value = readJson(recordKey(userId, slot));
+    return isSyncRecord(value) ? { revision: value.revision, dirty: value.dirty } : null;
+  }
+
   return {
-    readRecord(userId, slot) {
-      const value = readJson(recordKey(userId, slot));
-      return isSyncRecord(value) ? { revision: value.revision, dirty: value.dirty } : null;
-    },
+    readRecord,
+    // A record's revision NEVER decreases. Every tab of the origin shares this record, and a writer
+    // can be holding an older view than what is stored now (a cloud GET that started before another
+    // tab confirmed a newer revision, or a record captured before an await). So the stored record
+    // is re-read here, at write time, and a lower revision is refused — one rule for every writer:
+    //   - a lower CLEAN write is a stale confirmation: it is dropped, and the stored record (dirty
+    //     flag included) stands — an older confirmation says nothing about the newer revision;
+    //   - a lower DIRTY write still marks the stored record dirty at its own revision: a local
+    //     change is a local change whatever revision the writer thought it was based on, and
+    //     dropping it would let the slot look synced while unsynced progress sits on screen.
+    // Equal or higher revisions are written exactly as given.
     writeRecord(userId, slot, record) {
-      write(recordKey(userId, slot), JSON.stringify({ revision: record.revision, dirty: record.dirty }));
+      const stored = readRecord(userId, slot);
+      let next: SyncRecord = { revision: record.revision, dirty: record.dirty };
+      if (stored !== null && record.revision < stored.revision) {
+        if (!record.dirty) return;
+        next = { revision: stored.revision, dirty: true };
+      }
+      write(recordKey(userId, slot), JSON.stringify(next));
+    },
+    clearRecord(userId, slot) {
+      // Unsynced local progress is still unsynced after the server went backwards: keep the flag.
+      // Revision 0 then makes the decision table prompt when a cloud row exists (dirty and behind
+      // it) and upload when none does, and keeps the slot queued for a background re-flush.
+      if (readRecord(userId, slot)?.dirty) write(recordKey(userId, slot), JSON.stringify({ revision: 0, dirty: true }));
+      else remove(recordKey(userId, slot));
     },
     readOwner(slot) {
       const value = readJson(ownerKey(slot)) as { userId?: unknown } | null;

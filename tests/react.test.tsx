@@ -2,6 +2,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { useAccount } from "../src/react";
+import { expectConsole } from "./setup/consoleGuard";
 import type { AccountKit } from "../src/session";
 
 function fakeKit(session: unknown, handle: string | null) {
@@ -38,7 +39,7 @@ describe("useAccount", () => {
   it("clears loading even if the initial session read rejects", async () => {
     const { kit } = fakeKit(null, null);
     (kit.getSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("boom"));
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expectConsole("warn", "[account-kit] getSession rejected:");
     const { result } = renderHook(() => useAccount(kit));
     await act(async () => {});
     expect(result.current.loading).toBe(false);
@@ -66,6 +67,31 @@ describe("useAccount", () => {
     expect(result.current.session).toEqual({ user: { id: "u1" } });
     await act(async () => { expect(await result.current.saveHandle("rusty")).toBeNull(); });
     expect(result.current.handle).toBe("rusty");
+  });
+
+  it("saveHandle passes the user id of the session the hook rendered with, so the kit can refuse a switched account", async () => {
+    const { kit } = fakeKit({ user: { id: "u1" } }, null);
+    const { result } = renderHook(() => useAccount(kit));
+    await act(async () => {});
+    await act(async () => { expect(await result.current.saveHandle("rusty")).toBeNull(); });
+    expect(kit.saveHandle).toHaveBeenCalledWith("rusty", "u1");
+  });
+
+  it("saveHandle does not keep the display handle when the kit refuses a switched account", async () => {
+    const { kit } = fakeKit({ user: { id: "u1" } }, "old");
+    (kit.saveHandle as ReturnType<typeof vi.fn>).mockResolvedValueOnce("You're signed in as a different account now. Reload and try again.");
+    const { result } = renderHook(() => useAccount(kit));
+    await act(async () => {});
+    await act(async () => { expect(await result.current.saveHandle("rusty")).toBe("You're signed in as a different account now. Reload and try again."); });
+    expect(result.current.handle).toBe("old");
+  });
+
+  it("saveHandle from a signed-out render is refused without calling the kit", async () => {
+    const { kit } = fakeKit(null, null);
+    const { result } = renderHook(() => useAccount(kit));
+    await act(async () => {});
+    await act(async () => { expect(await result.current.saveHandle("rusty")).toBe("Not signed in."); });
+    expect(kit.saveHandle).not.toHaveBeenCalled();
   });
 
   it("signOut from the hook calls the kit once", async () => {

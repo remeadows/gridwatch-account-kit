@@ -195,6 +195,77 @@ export function createSavesClient(deps) {
             return { status: "none" };
         return { status: "error", error: errorFor(result) };
     }
+    /** True when this user's sync record, re-read NOW, is ahead of `save`. The record is shared by
+     *  every tab of the origin, and a GET can be older than a revision another tab has confirmed since
+     *  it was sent: such a row describes the cloud as it WAS, and deciding on it would hand the game
+     *  a stale payload as use_cloud (and, before v0.2.6, roll the record back to it). */
+    const behindRecord = (userId, slot, save) => (state.readRecord(userId, slot)?.revision ?? -1) > save.revision;
+    /** Retryable by design (the transport class). Only for a one-off cross-tab race: another tab
+     *  confirming a newer revision while loadNotBehindRecord's re-load was in flight, or during
+     *  reconcile's session re-check just before current() and the decision — retrying resolves it. */
+    const staleRowError = () => ({ code: "network", message: "cloud row is older than a revision this browser already confirmed; try again" });
+    /** Behind this user's record, re-read now: an older row, or no row at all while the record says
+     *  this user has confirmed one (revision > 0). A record at revision 0 was never confirmed against
+     *  any row (a store that failed before the first upload), so a 404 is exactly what it expects. */
+    const behindRecordOrMissing = (userId, slot, loaded) => loaded.status === "ok" ? behindRecord(userId, slot, loaded.save)
+        : loaded.status === "none" && (state.readRecord(userId, slot)?.revision ?? 0) > 0;
+    /** loadWith() for every path that is about to DECIDE on the cloud row (reconcile, and the
+     *  conflict prompts' "Use cloud"). A row older than the record stored for this user when it
+     *  arrives — or a 404 while a record exists — is re-loaded once, and the second answer tells the
+     *  causes apart:
+     *    - a cross-tab race: another tab's store reached the server before that tab confirmed, so
+     *      the re-load (sent after the confirmation) sees the newer row and is decided on normally;
+     *    - a race again during the re-load (the row is at or above the record as it was when the
+     *      re-load was sent, but another tab has confirmed past it since): the retryable stale-row
+     *      error, nothing written;
+     *    - the SERVER went backwards (the re-load is below the record as it was when it was sent) (an operator reset or deleted the row): the re-load is still
+     *      behind. The record no longer describes anything the server has, so it is discarded —
+     *      this user's slot is "never synced" — and the caller decides on the second load with
+     *      record = null. The decision table then prompts over any local payload (cloud row + local
+     *      with no record) or uploads it when there is no row (nothing on the server to lose), and
+     *      adopts the cloud row only when there is nothing local. Never a retryable error forever,
+     *      never a silent overwrite, never a silent adopt over local progress. The owner record is
+     *      not touched: whose local save this is did not change. */
+    async function loadNotBehindRecord(slot, op) {
+        const { loaded, regressedFrom } = await loadCheckingRecord(slot, op);
+        if (regressedFrom !== null && !resetRegressed(op.s.userId, slot, regressedFrom))
+            return { status: "error", error: staleRowError() };
+        return loaded;
+    }
+    /** The reset for a server regression loadCheckingRecord found, applied separately so a caller
+     *  that still has a check to make first (reconcile's session re-check before current()) can run
+     *  it BEFORE anything is written. `r0` is the record revision the regression was judged against:
+     *  if another tab has confirmed past it since, the server does have a newer row after all, so
+     *  this is a race, not a regression — nothing is written, and false is returned (the caller
+     *  resolves the retryable stale-row error). */
+    function resetRegressed(userId, slot, r0) {
+        if ((state.readRecord(userId, slot)?.revision ?? 0) > r0)
+            return false;
+        console.warn(`[account-kit] cloud row for ${slot} is behind this browser's sync record on a re-load too; treating the slot as never synced`);
+        state.clearRecord(userId, slot);
+        return true;
+    }
+    /** loadNotBehindRecord's load and classification, WITHOUT the reset: a server regression is
+     *  reported as `regressedFrom` (r0) for the caller to pass to resetRegressed. */
+    async function loadCheckingRecord(slot, op) {
+        const first = await loadWith(slot, op);
+        if (!behindRecordOrMissing(op.s.userId, slot, first))
+            return { loaded: first, regressedFrom: null };
+        // Fix round 2 (C1): the re-load is judged against the record as it was just BEFORE it was sent
+        // (r0), not as it is when it returns. Another tab can confirm again while this GET is in
+        // flight; the row it returns is then correct as of when it was served, and merely looks
+        // "behind" the newer record. Only a row below r0 — or no row while r0 > 0 — says the SERVER
+        // went backwards. Anything else still behind the record now is a race: the retryable stale-row
+        // error, writing nothing (no record, no owner, no remembered payload).
+        const r0 = state.readRecord(op.s.userId, slot)?.revision ?? 0;
+        const second = await loadWith(slot, op);
+        const regressed = second.status === "ok" ? second.save.revision < r0 : second.status === "none" && r0 > 0;
+        if (regressed)
+            return { loaded: second, regressedFrom: r0 };
+        if (behindRecordOrMissing(op.s.userId, slot, second))
+            return { loaded: { status: "error", error: staleRowError() }, regressedFrom: null };
+        return { loaded: second, regressedFrom: null };
+    }
     async function sendOnce(slot, payload, baseRevision, op) {
         const body = { schemaVersion: game.schemaVersion, baseRevision, payload, deviceId: state.deviceId(), idempotencyKey: uuidV4() };
         const encodedBytes = new TextEncoder().encode(JSON.stringify(body)).byteLength;
@@ -276,11 +347,24 @@ export function createSavesClient(deps) {
             const outcome = await sendOnce(slot, payload, base, op);
             if (outcome.kind === "stored") {
                 confirmed(slot, op.s, outcome.revision, { claim });
+                // The remembered payload IS the cloud row at this revision now: anything built on top of
+                // it is built on this revision, not on the base it went out on.
+                const remembered = lastPayload.get(payloadKey(op.s.userId, slot));
+                if (remembered !== undefined && remembered.payload === payload) {
+                    remembered.base = outcome.revision;
+                    remembered.landed = true;
+                }
                 return { status: "stored", revision: outcome.revision, updatedAt: outcome.updatedAt };
             }
             if (outcome.kind === "error") {
-                if (outcome.dirty)
+                if (outcome.dirty) {
                     state.writeRecord(op.s.userId, slot, { revision: state.readRecord(op.s.userId, slot)?.revision ?? 0, dirty: true });
+                    // The payload that failed is the one a re-flush will send: remember the base it just
+                    // went out on (after a conflict round, the cloud revision the player chose to overwrite).
+                    const remembered = lastPayload.get(payloadKey(op.s.userId, slot));
+                    if (remembered !== undefined && remembered.payload === payload)
+                        remembered.base = base;
+                }
                 return { status: "error", error: outcome.error };
             }
             state.writeRecord(op.s.userId, slot, { revision: state.readRecord(op.s.userId, slot)?.revision ?? 0, dirty: true });
@@ -292,7 +376,7 @@ export function createSavesClient(deps) {
             if (disposed)
                 return { status: "error", error: disposedError() };
             if (answer === "primary") {
-                const loaded = await loadWith(slot, op);
+                const loaded = await loadNotBehindRecord(slot, op);
                 if (loaded.status !== "ok")
                     return { status: "error", error: loaded.status === "error" ? loaded.error : { code: "http", status: 404, message: "cloud row vanished" } };
                 confirmed(slot, op.s, loaded.save.revision, { claim });
@@ -370,8 +454,8 @@ export function createSavesClient(deps) {
             return discardedStore();
         // store() can't know the signed-in user synchronously, so the payload is remembered here,
         // once the session is known, rather than at the top of store() (see payloadKey above).
-        lastPayload.set(payloadKey(s.userId, slot), payload);
         const base = state.readRecord(s.userId, slot)?.revision ?? 0;
+        lastPayload.set(payloadKey(s.userId, slot), { payload, base, landed: false });
         // claim: false — a store is not an ownership decision. This flush made no owner check at all,
         // and its send can outlast an account switch in another tab, so it may only claim a slot that
         // is unset or already this user's (see confirmed()).
@@ -487,6 +571,26 @@ export function createSavesClient(deps) {
                 // function itself re-resolves the session (the `current` re-read below).
                 const op = operation(resolved);
                 let record = state.readRecord(s.userId, slot);
+                // The record as it was before the cloud GET: the revision a payload this call sees move
+                // (the `localChanged` hint, or a `current` re-read that differs) was built on. The STORED
+                // record stays monotonic, but another tab may confirm past this while the GET is pending,
+                // and deciding a moved payload against that newer revision would send it on a base it was
+                // never built on — a PUT that lands with no 409 over the other tab's row (fix round 2, C2).
+                const capturedBefore = record;
+                let localMoved = false;
+                // The base the moved payload was built on, as noteLocalChanged computed it — including this
+                // tab's remembered base (fix round 3, N1), which the pre-GET and stored records can both be
+                // above after a background 409.
+                let movedBase = Number.MAX_SAFE_INTEGER;
+                /** The base this tab's remembered (unsynced) payload was built on, while the stored record is
+                 *  dirty; otherwise no bound. The shared record can be dirty at a revision another tab
+                 *  confirmed AFTER that payload was built (a lower dirty write keeps the stored revision), so
+                 *  alone it would let the table answer restore_dirty and PUT this tab's local on a base it
+                 *  was never built on. With it, the next reconcile after a background 409 prompts (I2). */
+                const inheritedBase = () => {
+                    const remembered = lastPayload.get(payloadKey(s.userId, slot));
+                    return remembered !== undefined && state.readRecord(s.userId, slot)?.dirty ? remembered.base : Number.MAX_SAFE_INTEGER;
+                };
                 /** Everything the `localChanged` hint does, in one place, because `current` (below) has to
                  *  do exactly the same thing when its re-read comes back different — the whole point of
                  *  that option is that a moved local payload is indistinguishable from a caller-hinted one.
@@ -510,15 +614,25 @@ export function createSavesClient(deps) {
                  *  someone else's. */
                 const noteLocalChanged = (payload) => {
                     const owner = state.readOwner(slot);
+                    // Remembered with the revision it was built on: the lower of the record before the GET and
+                    // the record now (a server-regression reset can only lower it), 0 for a never-synced slot.
+                    // An earlier payload this tab still has unsynced (record dirty) was built on its own base,
+                    // and this one was built on top of it, so that base bounds it too.
+                    const builtOn = Math.min(capturedBefore?.revision ?? 0, state.readRecord(s.userId, slot)?.revision ?? 0, inheritedBase());
+                    movedBase = Math.min(movedBase, builtOn);
                     if (owner === null || owner === s.userId)
-                        lastPayload.set(payloadKey(s.userId, slot), payload);
+                        lastPayload.set(payloadKey(s.userId, slot), { payload, base: builtOn, landed: false });
                     // The dirty flag itself is only forced on a CLEAN record, and is safe regardless of the
                     // owner: decideReconcile raises ownership_prompt on ownedByOther whether or not the
                     // record is dirty, so marking it cannot turn a prompt into a silent upload.
-                    if (record !== null && !record.dirty) {
-                        record = { revision: record.revision, dirty: true };
-                        state.writeRecord(s.userId, slot, record);
-                    }
+                    // Against the record as it is NOW, never the `record` captured before an await: another
+                    // tab may have confirmed a newer revision since (and the state layer would refuse to
+                    // lower it anyway — this keeps the intent explicit).
+                    const latest = state.readRecord(s.userId, slot);
+                    if (latest !== null && !latest.dirty)
+                        state.writeRecord(s.userId, slot, { revision: latest.revision, dirty: true });
+                    record = state.readRecord(s.userId, slot);
+                    localMoved = true;
                 };
                 /** The mirror image, for a `current` that reports the local payload is GONE (below). Every
                  *  piece of per-user state this client holds for a slot describes one thing — that slot's
@@ -538,6 +652,8 @@ export function createSavesClient(deps) {
                  *  device is remains a question only the foreground's ownership prompt answers, and "the
                  *  game has no local payload right now" is not an answer to it. */
                 const noteLocalGone = () => {
+                    localMoved = false;
+                    movedBase = Number.MAX_SAFE_INTEGER;
                     lastPayload.delete(payloadKey(s.userId, slot));
                     noteDiscard(s.userId, slot);
                     // Re-read rather than reuse `record`: it was captured before the awaited cloud load, and
@@ -559,9 +675,19 @@ export function createSavesClient(deps) {
                 // row, and so a crash or a failed load still leaves the slot protected.
                 if (options?.localChanged === true && local !== null)
                     noteLocalChanged(local);
-                const loaded = await loadWith(slot, op);
+                // A server regression's reset is deferred while a `current` re-read is still to come: its
+                // session re-check (below) may end this call as signed_out, and then nothing — the record
+                // and its dirty flag included — may have been touched (fix round 2, M2).
+                const checked = await loadCheckingRecord(slot, op);
+                const loaded = checked.loaded;
                 if (loaded.status === "error")
                     return loaded;
+                let pendingReset = checked.regressedFrom;
+                if (pendingReset !== null && options?.current === undefined) {
+                    if (!resetRegressed(s.userId, slot, pendingReset))
+                        return { status: "error", error: staleRowError() };
+                    pendingReset = null;
+                }
                 const cloud = loaded.status === "ok" ? loaded.save : null;
                 // The cloud GET above can take seconds, and the game's save for this slot can move inside
                 // that window. Deciding on the payload the caller handed us before the GET would then let
@@ -596,6 +722,15 @@ export function createSavesClient(deps) {
                         s = now;
                         op.s = now;
                     }
+                    // The row was checked against the record when it arrived, but this session lookup was
+                    // one more await: another tab may have confirmed a newer revision inside it. Checked
+                    // again here, before current() and with no await left before the decision, so the table
+                    // is never handed a record ahead of the row (no re-load: that would put an await between
+                    // this check and the decision again).
+                    if (pendingReset !== null && !resetRegressed(s.userId, slot, pendingReset))
+                        return { status: "error", error: staleRowError() };
+                    if (cloud !== null && behindRecord(s.userId, slot, cloud))
+                        return { status: "error", error: staleRowError() };
                     let fresh;
                     let reread = false;
                     try {
@@ -690,13 +825,45 @@ export function createSavesClient(deps) {
                         }
                     }
                 }
+                // The record as stored NOW (no await since the stale-row checks above, so never ahead of
+                // `cloud`), not the one captured before the GET — unless the local payload moved in this
+                // call. Then the decision is handed the revision that payload was built on: the lower of
+                // the pre-GET and stored revisions and this tab's remembered base (N1), dirty, and never
+                // ahead of the cloud row (C2). A move
+                // with no record on either side (never synced, or reset by a server regression) is decided
+                // with no record, which the table answers with a prompt or an upload, never a silent send.
+                const stored = state.readRecord(s.userId, slot);
+                if (localMoved) {
+                    record = capturedBefore === null || stored === null ? null : {
+                        revision: Math.min(capturedBefore.revision, stored.revision, movedBase, cloud?.revision ?? Number.MAX_SAFE_INTEGER),
+                        dirty: true,
+                    };
+                }
+                else if (stored !== null && local !== null && inheritedBase() < stored.revision) {
+                    record = { revision: Math.min(inheritedBase(), cloud?.revision ?? Number.MAX_SAFE_INTEGER), dirty: true };
+                }
+                else {
+                    record = stored;
+                }
                 const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });
+                /** Every reconcile-path send (upload, restore_dirty, "Keep this one") goes through here. Once
+                 *  one lands, the payload this tab remembers for the slot is exactly what was sent, on the
+                 *  revision it landed at (fix round 3, N2): an older remembered payload with an older base
+                 *  would otherwise make a later reconcile of this very payload ask the player a question
+                 *  they already answered. The slot is this user's now (these sends claim it). */
+                const sendLocal = async (baseRevision) => {
+                    const sent = local;
+                    const result = await sendWithConflicts(slot, sent, baseRevision, op, true);
+                    if (result.status === "stored" && !disposed)
+                        lastPayload.set(payloadKey(s.userId, slot), { payload: sent, base: result.revision, landed: true });
+                    return result;
+                };
                 const asReconcile = (result) => result.status === "stored" ? { status: "stored", revision: result.revision } : result;
                 const upload = async () => {
                     // claim: true — this is either the table's own `upload` (the slot is unset or already
                     // this user's) or the ownership prompt's "Upload", which is a deliberate take-over.
                     // Both are ownership decisions made here, at the front of this slot's chain.
-                    const result = await sendWithConflicts(slot, local, 0, op, true);
+                    const result = await sendLocal(0);
                     return result.status === "stored" ? { status: "uploaded", revision: result.revision } : result;
                 };
                 switch (decision) {
@@ -718,8 +885,11 @@ export function createSavesClient(deps) {
                         // earlier failed store()): a background re-flush must never resurrect work the player
                         // explicitly chose to abandon. Clear dirty on whatever record exists (there may be
                         // none at all, if this slot was never synced) and drop any remembered payload.
-                        if (record !== null)
-                            state.writeRecord(s.userId, slot, { revision: record.revision, dirty: false });
+                        // The stored record, not the decision's `record` (which a moved payload may have set to
+                        // an older base): a lower clean write would be refused and leave the flag set.
+                        const settled = state.readRecord(s.userId, slot);
+                        if (settled !== null)
+                            state.writeRecord(s.userId, slot, { revision: settled.revision, dirty: false });
                         lastPayload.delete(payloadKey(s.userId, slot));
                         noteDiscard(s.userId, slot);
                         return { status: "fresh" };
@@ -736,12 +906,24 @@ export function createSavesClient(deps) {
                     case "conflict_prompt": {
                         // The table already decided a prompt is due: never send first (a send on the cloud
                         // revision would silently win). Ask, then act on the answer.
-                        const current = cloud;
+                        let current = cloud;
                         state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
                         const answer = await prompt.ask(CONFLICT_COPY);
                         if (disposed)
                             return { status: "error", error: disposedError() };
                         if (answer === "primary") {
+                            // The prompt may have been open for a long time, and another tab may have confirmed
+                            // a newer revision meanwhile: "Use cloud" then means the cloud as it is NOW. Same
+                            // rule as the load above — re-load, and never hand back a row older than the record
+                            // (on a still-stale answer the record stays dirty and nothing is discarded).
+                            if (behindRecord(s.userId, slot, current)) {
+                                const reloaded = await loadNotBehindRecord(slot, op);
+                                if (reloaded.status === "error")
+                                    return reloaded;
+                                if (reloaded.status !== "ok")
+                                    return { status: "error", error: { code: "http", status: 404, message: "cloud row vanished" } };
+                                current = reloaded.save;
+                            }
                             // claim: true — the player answered the ownership question just now, in this chain:
                             // this device's local save becomes this user's cloud row.
                             confirmed(slot, s, current.revision, { claim: true });
@@ -754,14 +936,16 @@ export function createSavesClient(deps) {
                         }
                         // claim: true — "Keep this one" is the take-over answer: the player said the local
                         // save is theirs and it is going up as their cloud row.
-                        return asReconcile(await sendWithConflicts(slot, local, current.revision, op, true));
+                        return asReconcile(await sendLocal(current.revision));
                     }
                     case "current": return { status: "current" };
                     case "restore_dirty":
                         // claim: true — the table only reaches restore_dirty when the slot is unset or already
                         // this user's (decideReconcile sends ownedByOther to conflict_prompt instead), and it
                         // is a reconcile decision made here, at the front of this slot's chain.
-                        return asReconcile(await sendWithConflicts(slot, local, state.readRecord(s.userId, slot)?.revision ?? 0, op, true));
+                        // On the cloud revision the table decided on (fix round 3, N4), never a re-read of the
+                        // record: a write from another tab landing in between must meet a 409, not match the CAS.
+                        return asReconcile(await sendLocal(cloud.revision));
                 }
             }
             catch (thrown) {
@@ -823,7 +1007,6 @@ export function createSavesClient(deps) {
             // still uploads the stale in-memory `payload` on top of the just-confirmed revision.
             if (!state.readRecord(s.userId, slot)?.dirty)
                 return;
-            const base = state.readRecord(s.userId, slot)?.revision ?? 0;
             // A copy of what is actually sent: `payload` is the object the game handed store()/reconcile(),
             // which it may mutate while this request is in flight. onBackgroundStored must describe what
             // the cloud now holds, or a game comparing it to its current save could clear an "unsynced"
@@ -834,10 +1017,16 @@ export function createSavesClient(deps) {
             // and then failed to send it, leaving the record dirty. Sending the captured one would land
             // stale content on the confirmed revision and mark the slot clean over the latest save.
             // Nothing remembered any more means it was disowned or sent: there is nothing to do.
+            //
+            // Sent on the base it was built on (I2), not the record's current revision: if another tab
+            // confirmed a newer revision meanwhile, that is a 409 below, and the slot stays dirty for the
+            // next foreground call to resolve.
             const latest = lastPayload.get(payloadKey(s.userId, slot));
-            if (latest === undefined)
+            // A landed entry is a base bound, not pending work (see Remembered): nothing to send.
+            if (latest === undefined || latest.landed)
                 return;
-            const sent = JSON.parse(JSON.stringify(latest));
+            const base = latest.base;
+            const sent = JSON.parse(JSON.stringify(latest.payload));
             // The operation starts here, after every guard above: a background re-flush gets the same
             // one-shot 401 recovery as a foreground send, and since recovery never prompts, this path's
             // "never prompt the player" promise is unaffected.
@@ -850,6 +1039,10 @@ export function createSavesClient(deps) {
             // truthful; re-asserting the ownership would silently overwrite that newer claim.
             if (outcome.kind === "stored") {
                 confirmed(slot, s, outcome.revision, { claim: false });
+                if (lastPayload.get(payloadKey(s.userId, slot)) === latest) {
+                    latest.base = outcome.revision;
+                    latest.landed = true;
+                } // see sendWithConflicts
                 // After confirmed(), never before: the callback tells the game its payload IS the cloud
                 // row now, so the kit's own record must already say so. Contained, because a game's
                 // marker bookkeeping throwing must not turn a successful re-flush into the warning
@@ -962,9 +1155,9 @@ export function createSavesClient(deps) {
         // success would overwrite the newer claim and leave the kit trusting the OTHER account's
         // progress as this user's the next time they come back to this device. See confirmed().
         for (const slot of game.slots) {
-            const payload = lastPayload.get(payloadKey(s.userId, slot));
-            if (payload !== undefined && state.readRecord(s.userId, slot)?.dirty)
-                void quietFlush(slot, payload, s.userId, epochOf(s.userId, slot));
+            const remembered = lastPayload.get(payloadKey(s.userId, slot));
+            if (remembered !== undefined && !remembered.landed && state.readRecord(s.userId, slot)?.dirty)
+                void quietFlush(slot, remembered.payload, s.userId, epochOf(s.userId, slot));
         }
     }
     const onOnline = () => { void reflushDirty(); };

@@ -63,7 +63,10 @@ export interface AccountKit {
   signInWithProvider(provider: Provider, options?: SignInOptions): Promise<string | null>;
   signOut(): Promise<void>;
   getProfile(): Promise<Profile>;
-  saveHandle(raw: string): Promise<string | null>;
+  /** Upserts the signed-in user's handle. Pass `expectedUserId` (the user the form was rendered
+   *  for) and the write is refused — with an error string, nothing written — when a different
+   *  account is signed in by the time it is submitted. */
+  saveHandle(raw: string, expectedUserId?: string): Promise<string | null>;
   signInUrl(): string;
 }
 
@@ -212,12 +215,15 @@ export function createAccountKit(input: AccountKitConfig): AccountKit {
       }
       return { handle: (data as { handle?: string } | null)?.handle ?? null };
     },
-    async saveHandle(raw) {
+    async saveHandle(raw, expectedUserId) {
       const userId = await currentUserId();
       if (!userId) return "Not signed in.";
       const trimmed = raw.trim();
       const invalid = validateHandle(trimmed);
       if (invalid) return invalid;
+      // Bound to the account the caller rendered the form for: no await between this read of the
+      // signed-in user and the upsert, so the check holds at the moment of the write.
+      if (expectedUserId !== undefined && expectedUserId !== userId) return "You're signed in as a different account now. Reload and try again.";
       const { error } = await getSupabase().from("profiles").upsert({ user_id: userId, handle: trimmed });
       if (error) return hasCode(error) && error.code === "23505" ? "That handle is taken." : error.message;
       return null;

@@ -189,7 +189,7 @@ export function createAccountKit(input) {
             }
             return { handle: data?.handle ?? null };
         },
-        async saveHandle(raw) {
+        async saveHandle(raw, expectedUserId) {
             const userId = await currentUserId();
             if (!userId)
                 return "Not signed in.";
@@ -197,6 +197,10 @@ export function createAccountKit(input) {
             const invalid = validateHandle(trimmed);
             if (invalid)
                 return invalid;
+            // Bound to the account the caller rendered the form for: no await between this read of the
+            // signed-in user and the upsert, so the check holds at the moment of the write.
+            if (expectedUserId !== undefined && expectedUserId !== userId)
+                return "You're signed in as a different account now. Reload and try again.";
             const { error } = await getSupabase().from("profiles").upsert({ user_id: userId, handle: trimmed });
             if (error)
                 return hasCode(error) && error.code === "23505" ? "That handle is taken." : error.message;

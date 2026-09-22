@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __setSupabaseForTests } from "../src/client";
 import { createAccountKit } from "../src/session";
+import { expectConsole } from "./setup/consoleGuard";
 
 function fakeSupabase(session: unknown = null) {
   const listeners: Array<(e: string, s: unknown) => void> = [];
@@ -81,7 +82,7 @@ describe("createAccountKit", () => {
   it("returns exactly null when the client reports an error alongside a session", async () => {
     const sb = fakeSupabase(user);
     sb.auth.getSession.mockResolvedValueOnce({ data: { session: user }, error: { message: "stale token" } } as never);
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expectConsole("warn", "[account-kit] getSession failed: stale token");
     expect(await createAccountKit({ returnPath: "/" }).getSession()).toBeNull();
   });
 
@@ -102,6 +103,27 @@ describe("createAccountKit", () => {
     expect(sb.auth.signOut).toHaveBeenCalledWith({ scope: "local" });
   });
 
+  // v0.1.3 backlog: a handle form opened for one account and submitted after the account changed
+  // (another tab, a sign-out/sign-in) used to land on whoever was signed in at submit time.
+  it("saveHandle with an expected user writes only while that user is still the signed-in one", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    expect(await kit.saveHandle("rusty", "u1")).toBeNull();
+    expect(sb.__upsert).toHaveBeenCalledWith({ user_id: "u1", handle: "rusty" });
+    sb.__upsert.mockClear();
+    expect(await kit.saveHandle("rusty", "u2")).toBe("You're signed in as a different account now. Reload and try again.");
+    expect(sb.__upsert).not.toHaveBeenCalled();
+  });
+
+  it("saveHandle re-reads the signed-in user at submit time: an account switch after the form opened is refused", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    const openedFor = (await kit.getSession())!.user.id; // the form renders for u1
+    sb.auth.getSession.mockResolvedValue({ data: { session: { user: { id: "u2" } } }, error: null } as never); // another tab switches account
+    expect(await kit.saveHandle("rusty", openedFor)).toBe("You're signed in as a different account now. Reload and try again.");
+    expect(sb.__upsert).not.toHaveBeenCalled();
+  });
+
   it("saveHandle returns the error message when the error object has no code", async () => {
     const sb = fakeSupabase(user);
     const kit = createAccountKit({ returnPath: "/" });
@@ -118,7 +140,7 @@ describe("createAccountKit", () => {
   it("getProfile and saveHandle survive a throwing auth.getSession (via the safe wrapper)", async () => {
     const sb = fakeSupabase(null);
     sb.auth.getSession.mockRejectedValue(new Error("network down"));
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expectConsole("warn", "[account-kit] getSession threw: network down");
     const kit = createAccountKit({ returnPath: "/" });
     expect(await kit.getProfile()).toEqual({ handle: null });
     expect(await kit.saveHandle("rusty")).toBe("Not signed in.");
@@ -143,7 +165,7 @@ describe("createAccountKit", () => {
   it("getProfile rejects when the profile query resolves a PostgREST error", async () => {
     const sb = fakeSupabase(user);
     sb.__maybeSingle.mockResolvedValueOnce({ data: null, error: { message: "boom" } } as never);
-    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expectConsole("warn", "[account-kit] profile load failed: boom");
     const kit = createAccountKit({ returnPath: "/" });
     await expect(kit.getProfile()).rejects.toThrow("boom");
   });

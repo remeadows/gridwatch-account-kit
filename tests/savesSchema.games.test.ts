@@ -14,6 +14,17 @@ const campaign = {
 };
 const settings = { musicEnabled: true, sfxEnabled: false, voiceEnabled: true, reducedMotion: false };
 
+describe("registered integer fields are safe integers (no declared max needed)", () => {
+  it("Match campaign coins / boosters / level score reject 2**53 and 1e308 and accept MAX_SAFE_INTEGER", () => {
+    for (const huge of [2 ** 53, 1e308]) {
+      expect(validatePayload("gridwatch-match", 1, "campaign", { ...campaign, coins: huge })).toEqual({ ok: false, detail: "$.coins: expected integer" });
+      expect(validatePayload("gridwatch-match", 1, "campaign", { ...campaign, boosters: { rocket: huge } })).toEqual({ ok: false, detail: "$.boosters.rocket: expected integer" });
+      expect(validatePayload("gridwatch-match", 1, "campaign", { ...campaign, levels: { "1": { ...campaign.levels["1"], score: huge } } })).toEqual({ ok: false, detail: "$.levels.1.score: expected integer" });
+    }
+    expect(validatePayload("gridwatch-match", 1, "campaign", { ...campaign, coins: Number.MAX_SAFE_INTEGER })).toEqual({ ok: true });
+  });
+});
+
 describe("save game registry", () => {
   it("registers Match and the isolated Breach expansion slot", () => {
     expect(SAVE_GAMES).toEqual({ match: { slug: "gridwatch-match", slots: ["campaign", "settings"], schemaVersion: 1 }, breach: { slug: "gridwatch-signal-breach", slots: ["expansion-1-r4"], schemaVersion: 1 } });

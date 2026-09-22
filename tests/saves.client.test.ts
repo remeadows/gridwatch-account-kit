@@ -2,8 +2,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSavesClient, type SavesClientDeps } from "../src/saves/client";
 import { CONFLICT_COPY, OWNERSHIP_COPY, createDomPromptHost, type PromptAnswer, type PromptCopy } from "../src/saves/prompt";
+import { decideReconcile } from "../src/saves/reconcile";
 import { createSaveStateStore } from "../src/saves/state";
 import type { Transport, TransportResult } from "../src/saves/transport";
+import { expectConsole } from "./setup/consoleGuard";
+
+// A pass-through spy: the real decision table runs unchanged everywhere in this file. It exists so
+// the cross-tab tests below can assert what the client ever HANDED the table (see "never ahead").
+vi.mock("../src/saves/reconcile", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/saves/reconcile")>();
+  return { ...actual, decideReconcile: vi.fn(actual.decideReconcile) };
+});
 
 const game = { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 };
 const campaign = { coins: 5, boosters: { rocket: 1 }, selectedHeroId: "rusty", completedTutorial: true, tutorialReplayRequested: false, levels: {}, areaRewards: {}, intelSeen: {} };
@@ -52,6 +61,7 @@ describe("load", () => {
     expect(await harness(null).client.load("campaign")).toEqual({ status: "signed_out" });
   });
   it("rejects an inbound cloud row with an invalid payload or the wrong slot instead of handing it to the game", async () => {
+    expectConsole("warn", "[account-kit] rejecting cloud row for campaign: $.extra: unknown property");
     const h = harness();
     h.load.mockResolvedValueOnce(ok(200, row(2, { ...campaign, extra: 1 } as typeof campaign)));
     expect(await h.client.load("campaign")).toMatchObject({ status: "error", error: { code: "invalid_payload" } });
@@ -59,6 +69,7 @@ describe("load", () => {
     expect((await h.client.load("campaign")).status).toBe("error");
   });
   it("never rejects: a thrown getSession becomes a reportable error", async () => {
+    expectConsole("warn", "[account-kit] load campaign failed: boom");
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
     const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
@@ -71,6 +82,7 @@ describe("load", () => {
 
 describe("store", () => {
   it("rejects a bad payload locally without a request", async () => {
+    expectConsole("warn", "[account-kit] refusing to store campaign: $.coins: below minimum 0");
     const h = harness();
     const result = await h.client.store("campaign", { coins: -1 });
     expect(result).toMatchObject({ status: "error", error: { code: "invalid_payload" } });
@@ -139,6 +151,7 @@ describe("store", () => {
     expect(h.store).not.toHaveBeenCalled();
   });
   it("settles all waiters with an http error when the flush chain throws, without an unhandled rejection", async () => {
+    expectConsole("warn", "[account-kit] store flush for campaign failed: boom");
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
     const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
@@ -204,6 +217,7 @@ describe("store", () => {
     expect(state.readRecord("u1", "campaign")).toBeNull();
   });
   it("dispose() closes an open conflict prompt and resolves the pending store as disposed", async () => {
+    expectConsole("warn", "[account-kit] store flush for campaign failed: disposed");
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
     const conflict = ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
@@ -287,6 +301,7 @@ describe("reconcile", () => {
     expect(h.store).not.toHaveBeenCalled();
   });
   it("validates the local payload before sending anything (migration path can carry denylisted keys)", async () => {
+    expectConsole("warn", "[account-kit] refusing to reconcile campaign: $.sessionToken: unknown property");
     const h = harness();
     const result = await h.client.reconcile("campaign", { ...campaign, sessionToken: "x" });
     expect(result).toMatchObject({ status: "error", error: { code: "invalid_payload" } });
@@ -294,6 +309,7 @@ describe("reconcile", () => {
     expect(h.store).not.toHaveBeenCalled();
   });
   it("never rejects: a thrown getSession becomes a reportable error", async () => {
+    expectConsole("warn", "[account-kit] reconcile campaign failed: boom");
     const load = vi.fn<Transport["load"]>();
     const store = vi.fn<Transport["store"]>();
     const prompt = { ask: vi.fn(async () => "primary" as const), dispose: vi.fn() };
@@ -506,13 +522,17 @@ describe("reconcile", () => {
     });
     it("'Start fresh' after a hinted reconcile clears the pre-load dirty seed instead of leaving the discarded local payload flagged for background upload", async () => {
       const h = harness();
-      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+      // Fix round 2 (I1): a revision-0 dirty record (a first upload that failed) is the one shape that
+      // reaches "Start fresh" with a record in production — a 404 is exactly what revision 0 predicts,
+      // so no server-regression reset runs first and "Start fresh" itself must clear the flag.
+      h.state.writeRecord("u1", "campaign", { revision: 0, dirty: true });
       h.state.writeOwner("campaign", "u9");
       h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
       h.answers.push("secondary");
       expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
       expect(h.asked).toEqual([OWNERSHIP_COPY]);
-      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+      expect(h.load).toHaveBeenCalledTimes(1);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // not dirty: nothing left to re-flush
 
       h.store.mockClear();
       window.dispatchEvent(new Event("online"));
@@ -521,12 +541,13 @@ describe("reconcile", () => {
     });
     it("'Start fresh' discards the local payload regardless of why the record was already dirty (hint block never fired here, since the record was dirty going in)", async () => {
       const h = harness();
-      h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+      h.state.writeRecord("u1", "campaign", { revision: 0, dirty: true }); // see the test above (I1)
       h.state.writeOwner("campaign", "u9");
       h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
       h.answers.push("secondary");
       expect(await h.client.reconcile("campaign", campaign, { localChanged: true })).toEqual({ status: "fresh" });
-      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+      expect(h.load).toHaveBeenCalledTimes(1);
+      expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false }); // not dirty: nothing left to re-flush
 
       h.store.mockClear();
       window.dispatchEvent(new Event("online"));
@@ -828,8 +849,17 @@ describe("reconcile", () => {
       const pending = h.client.reconcile("campaign", L0, { current: () => null });
       await flush();
       h.state.writeRecord("u1", "campaign", { revision: 7, dirty: true }); // another tab confirmed newer revisions meanwhile
-      releaseLoad(ok(404, { error: "no_save" }));
-      expect(await pending).toEqual({ status: "nothing" });
+      // The row is at 7 (fix round 1: a 404 under a record @7 would now mean the server lost the row).
+      const decide = vi.mocked(decideReconcile);
+      decide.mockClear();
+      releaseLoad(ok(200, row(7)));
+      expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: campaign, updatedAt: row(7).updatedAt } });
+      // Fix round 2 (M1): what the move to null itself settled, read BEFORE use_cloud's own
+      // confirmation (which writes { 7, clean } whatever came before). Re-read: { 7, clean }. From
+      // the record captured before the GET: { 3, clean }, which the state layer refuses, leaving
+      // { 7, dirty } — so this assertion tells the two apart despite the monotonic rule.
+      expect(decide).toHaveBeenCalledTimes(1);
+      expect(decide.mock.calls[0][0].record).toEqual({ revision: 7, dirty: false });
       expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false }); // not rolled back to 3
     });
 
@@ -955,14 +985,23 @@ describe("reconcile", () => {
     describe("a move to null", () => {
       it("drops the hint's own seed, so the next re-flush cannot resurrect the payload the game reported gone", async () => {
         const h = harness();
-        h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+        // Fix round 2 (M1): a revision-0 record, so a 404 is what the record predicts and no
+        // server-regression reset runs — the hint's dirty flag is cleared by the move to null alone.
+        h.state.writeRecord("u1", "campaign", { revision: 0, dirty: false });
         h.state.writeOwner("campaign", "u1");
         h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
         expect(await h.client.reconcile("campaign", L0, { localChanged: true, current: () => null })).toEqual({ status: "nothing" });
-        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+        expect(h.load).toHaveBeenCalledTimes(1);
+        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 0, dirty: false });
         expect(h.state.readOwner("campaign")).toBe("u1"); // untouched
 
         h.store.mockResolvedValue(ok(200, { revision: 4, updatedAt: "t" }));
+        window.dispatchEvent(new Event("online"));
+        await flush();
+        expect(h.store).not.toHaveBeenCalled();
+        // And the seeded payload itself is gone, not merely unflagged: even once something else
+        // marks the slot dirty again, there is nothing remembered to re-flush.
+        h.state.writeRecord("u1", "campaign", { revision: 0, dirty: true });
         window.dispatchEvent(new Event("online"));
         await flush();
         expect(h.store).not.toHaveBeenCalled();
@@ -997,7 +1036,9 @@ describe("reconcile", () => {
         h.store.mockResolvedValue(ok(200, { revision: 4, updatedAt: "t" }));
 
         const queued = h.client.store("campaign", L0); // still inside its debounce window
-        h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+        // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+        // agree, so the record is discarded (never synced) before the decision.
+        h.load.mockResolvedValue(ok(404, { error: "no_save" }));
         expect(await h.client.reconcile("campaign", L0, { current: () => null })).toEqual({ status: "nothing" });
 
         await expect(queued).resolves.toEqual({ status: "error", error: { code: "http", message: "discarded" } });
@@ -1005,7 +1046,7 @@ describe("reconcile", () => {
         expect(h.store).not.toHaveBeenCalled();
         expect(warn).toHaveBeenCalledWith("[account-kit] dropped a store the player discarded");
         warn.mockRestore();
-        expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+        expect(h.state.readRecord("u1", "campaign")).toBeNull();
       });
 
       it("with an existing cloud row still resolves use_cloud, and leaves nothing for a later re-flush", async () => {
@@ -1223,6 +1264,10 @@ describe("background re-flush", () => {
     h.state.writeRecord("u2", "campaign", { revision: 5, dirty: true });
 
     h.store.mockClear();
+    // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+    // agree, so the record is discarded (never synced) before the decision.
+    h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+    expectConsole("warn", "treating the slot as never synced");
     resolveLoad(ok(404, { error: "no_save" })); // release the blocked reconcile
     await blocking;
     await flush(); // let the queued quiet re-flush actually run
@@ -1308,7 +1353,10 @@ describe("onBackgroundStored", () => {
     const h = harness(undefined, 0, { onBackgroundStored });
     h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t" }));
     expect((await h.client.store("campaign", campaign)).status).toBe("stored");
-    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+    // agree, so the record is discarded (never synced) before the decision.
+    h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+    expectConsole("warn", "treating the slot as never synced");
     h.store.mockResolvedValueOnce(ok(200, { revision: 2, updatedAt: "t2" }));
     expect((await h.client.reconcile("campaign", campaign)).status).toBe("uploaded");
     expect(onBackgroundStored).not.toHaveBeenCalled();
@@ -1481,16 +1529,20 @@ describe("a store or background re-flush never overwrites another account's clai
     h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t0" }));
     expect(await h.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 1, updatedAt: "t0" });
     expect(h.state.readOwner("campaign")).toBe("u1");
-    // Dirty again, with u1's payload still remembered from the store() above.
-    h.state.writeRecord("u1", "campaign", { revision: 1, dirty: true });
+    // Dirty again with u1's payload pending: its next commit fails offline. (Fix round 4: a payload
+    // that already LANDED is never re-flushed, so the fixture needs real pending work.)
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", { ...campaign, coins: 6 })).status).toBe("error");
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: true });
 
     // Hold the PUT open: the quiet flush has already passed its owner check (still u1 at that
     // point) and is now awaiting the transport.
     let resolveStore!: (r: TransportResult) => void;
+    h.store.mockReset();
     h.store.mockImplementationOnce(() => new Promise((resolve) => { resolveStore = resolve; }));
     window.dispatchEvent(new Event("online"));
     await flush();
-    expect(h.store).toHaveBeenCalledTimes(2);
+    expect(h.store).toHaveBeenCalledTimes(1);
 
     // Another tab signs in as u2 and its reconcile claims the slot while the PUT is in flight.
     h.state.writeOwner("campaign", "u2");
@@ -1816,7 +1868,10 @@ describe("a discard drops every store the same user had already queued for that 
     const h = harness();
     h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
     h.state.writeOwner("campaign", "u9"); // the slot belongs to another account
-    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" }));
+    // Fix round 1: a 404 under a record that confirmed a row means the server lost it; both loads
+    // agree, so the record is discarded (never synced) before the decision.
+    h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+    expectConsole("warn", "treating the slot as never synced");
     let resolveAsk!: (a: PromptAnswer) => void;
     h.prompt.ask.mockImplementationOnce((copy: PromptCopy) => {
       h.asked.push(copy);
@@ -1834,7 +1889,7 @@ describe("a discard drops every store the same user had already queued for that 
     expect(await blocking).toEqual({ status: "fresh" });
     expect(await pending).toEqual(discarded);
     expect(h.store).not.toHaveBeenCalled();
-    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+    expect(h.state.readRecord("u1", "campaign")).toBeNull();
     warn.mockRestore();
   });
 
@@ -2364,6 +2419,636 @@ describe("two real clients over one storage", () => {
     expect(t2.state.readRecord("u2", "campaign")).toEqual({ revision: 1, dirty: false }); // untouched
     expect(onBackgroundStored).toHaveBeenCalledTimes(1);
     expect(onBackgroundStored).toHaveBeenCalledWith("campaign", b, 2, "u1");
+  });
+});
+
+// Kit v0.2.6: the per-user sync record is shared by every tab of the origin, and a cloud GET can be
+// OLDER than a revision another tab has since confirmed. Tab 1's reconcile starts a GET, tab 2 (same
+// account) stores and confirms revision 7, and only then does tab 1's GET come back with the row
+// at revision 3. Deciding on that row used to roll the shared record back 7 -> 3 and hand the game
+// the stale revision-3 payload as use_cloud; the moved-payload path wrote the pre-GET record back
+// as dirty @3 over 7. The rule: a record's revision never decreases (state layer), and a reconcile
+// never decides on a row older than the record stored for this user when the row arrives.
+describe("sync records are monotonic across tabs (a cloud GET older than another tab's confirmation)", () => {
+  const decide = vi.mocked(decideReconcile);
+  const L1 = { ...campaign, coins: 42 };
+  const at7 = { ...campaign, coins: 70 };
+  const recordKey = "gw-account-kit.saves.gridwatch-match.campaign.u1.v1";
+
+  function snapshot(backing: Storage): Record<string, string | null> {
+    const out: Record<string, string | null> = {};
+    for (let i = 0; i < backing.length; i += 1) { const k = backing.key(i)!; out[k] = backing.getItem(k); }
+    return out;
+  }
+
+  /** Two real clients, ONE storage, both signed in as u1. u1's record is clean @3 and u1 owns the
+   *  slot; tab 1's first cloud GET is held open until the test releases it. Every revision written
+   *  to u1's record is logged, so a test can assert it never went backwards even for a moment. */
+  function setup() {
+    const backing = sharedStorage();
+    const revisions: number[] = [];
+    const setItem = backing.setItem;
+    backing.setItem = (k: string, v: string) => { if (k === recordKey) revisions.push((JSON.parse(v) as { revision: number }).revision); setItem(k, v); };
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    let releaseGet!: (r: TransportResult) => void;
+    t1.load.mockImplementationOnce(() => new Promise((resolve) => { releaseGet = resolve; }));
+    decide.mockClear();
+    const monotonic = () => expect(revisions).toEqual([...revisions].sort((a, b) => a - b));
+    // The pure table must never be handed a record that is ahead of the cloud row it decides on.
+    const neverAheadOfCloud = () => {
+      for (const [inputs] of decide.mock.calls) {
+        if (inputs.cloud !== null && inputs.record !== null) expect(inputs.record.revision).toBeLessThanOrEqual(inputs.cloud.revision);
+      }
+    };
+    return { backing, t1, t2, release: (r: TransportResult) => releaseGet(r), monotonic, neverAheadOfCloud };
+  }
+
+  async function tab2Confirms7(t2: ReturnType<typeof tab>) {
+    t2.store.mockResolvedValueOnce(ok(200, { revision: 7, updatedAt: "t7" }));
+    expect(await t2.client.store("campaign", at7)).toEqual({ status: "stored", revision: 7, updatedAt: "t7" });
+    expect(t2.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+  }
+
+  it("(a) current() returns null: the stale row is re-loaded, and the fresh revision-7 row is what use_cloud hands back", async () => {
+    const s = setup();
+    const current = vi.fn(() => null);
+    const pending = s.t1.client.reconcile("campaign", campaign, { current });
+    await flush();
+    await tab2Confirms7(s.t2);
+    s.t1.load.mockResolvedValueOnce(ok(200, row(7, at7)));
+    s.release(ok(200, row(3)));
+    expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: at7, updatedAt: row(7).updatedAt } });
+    expect(s.t1.load).toHaveBeenCalledTimes(2);
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    s.monotonic();
+    s.neverAheadOfCloud();
+    expect(decide).toHaveBeenCalledTimes(1);
+  });
+
+  // Fix round 1: a second load that is STILL behind the record is not a race any more — the other
+  // tab's store reached the server before it confirmed, so a re-load after it sees the newer row.
+  // Still behind means the server itself went backwards (row reset by an operator). The record is
+  // discarded (never synced) and the second load is decided on with record = null: never a
+  // retryable error forever, never a silent overwrite, never a silent adopt over local progress.
+  it("server went backwards (both loads @3 under a record @7), no local payload: use_cloud @3, record reset to 3, owner kept", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const s = setup();
+    const pending = s.t1.client.reconcile("campaign", null);
+    await flush();
+    await tab2Confirms7(s.t2);
+    s.t1.load.mockResolvedValueOnce(ok(200, row(3)));
+    s.release(ok(200, row(3)));
+    expect(await pending).toEqual({ status: "use_cloud", save: { revision: 3, schemaVersion: 1, payload: campaign, updatedAt: row(3).updatedAt } });
+    expect(s.t1.load).toHaveBeenCalledTimes(2);
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+    expect(s.t1.state.readOwner("campaign")).toBe("u1");
+    expect(decide).toHaveBeenCalledTimes(1);
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: null, cloud: { revision: 3 }, local: null });
+  });
+
+  it("server went backwards with a moved current(): the record is discarded, the moved payload is protected by the conflict prompt", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const s = setup();
+    const current = vi.fn(() => L1);
+    const pending = s.t1.client.reconcile("campaign", campaign, { current });
+    await flush();
+    await tab2Confirms7(s.t2);
+    s.t1.load.mockResolvedValueOnce(ok(200, row(3)));
+    s.t1.answers.push("secondary"); // "Keep this one"
+    s.t1.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t4" }));
+    s.release(ok(200, row(3)));
+    expect(await pending).toEqual({ status: "stored", revision: 4 });
+    expect(current).toHaveBeenCalledTimes(1);
+    expect(s.t1.asked).toEqual([CONFLICT_COPY]);
+    expect(s.t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3, payload: L1 });
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+    s.neverAheadOfCloud();
+  });
+
+  // Fix round 2 (C2): the STORED record is marked dirty at 7 (monotonic), but the payload that moved
+  // was built on 3, so the decision is handed { 3, dirty } against cloud 7: the conflict prompt, as
+  // v0.2.5 gave. Deciding on { 7, dirty } would PUT it on base 7 and silently replace tab 2's row.
+  it("(b) a moved current() after the re-load is decided on the revision it was built on (3), not the stored 7: the conflict prompt", async () => {
+    const s = setup();
+    const current = vi.fn(() => L1);
+    const pending = s.t1.client.reconcile("campaign", campaign, { current });
+    await flush();
+    await tab2Confirms7(s.t2);
+    s.t1.load.mockResolvedValueOnce(ok(200, row(7, at7)));
+    s.t1.answers.push("secondary"); // "Keep this one": the player's explicit take-over
+    s.t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    s.release(ok(200, row(3)));
+    expect(await pending).toEqual({ status: "stored", revision: 8 });
+    expect(s.t1.asked).toEqual([CONFLICT_COPY]);
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: { revision: 3, dirty: true }, cloud: { revision: 7 } });
+    expect(s.t1.store).toHaveBeenCalledTimes(1);
+    expect(s.t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 7, payload: L1 });
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: false });
+    s.monotonic();
+    s.neverAheadOfCloud();
+  });
+
+  it("P4: tab 2 confirms 7 during tab 1's GET, which is served AFTER that PUT (fresh @7); tab 1's moved payload (built on 3) gets the conflict prompt, not a PUT on 7", async () => {
+    const s = setup();
+    const pending = s.t1.client.reconcile("campaign", campaign, { current: () => L1 });
+    await flush();
+    await tab2Confirms7(s.t2);
+    s.t1.store.mockResolvedValue(ok(200, { revision: 8, updatedAt: "t8" }));
+    s.t1.answers.push("primary"); // "Use cloud"
+    s.release(ok(200, row(7, at7)));
+    expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: at7, updatedAt: row(7).updatedAt } });
+    expect(s.t1.asked).toEqual([CONFLICT_COPY]);
+    expect(s.t1.store).not.toHaveBeenCalled(); // tab 2's coins:70 is intact
+    expect(s.t1.load).toHaveBeenCalledTimes(1);
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    s.monotonic();
+    s.neverAheadOfCloud();
+  });
+
+  it("P4 with the localChanged hint: tab 2's clean confirmation @7 cannot turn tab 1's hinted edits (built on 3) into a silent `current`", async () => {
+    const s = setup();
+    const pending = s.t1.client.reconcile("campaign", L1, { localChanged: true });
+    await flush();
+    await tab2Confirms7(s.t2); // writes { 7, clean } over tab 1's { 3, dirty } seed
+    s.t1.answers.push("secondary");
+    s.t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    s.release(ok(200, row(7, at7)));
+    expect(await pending).toEqual({ status: "stored", revision: 8 });
+    expect(s.t1.asked).toEqual([CONFLICT_COPY]);
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: { revision: 3, dirty: true }, cloud: { revision: 7 } });
+    s.monotonic();
+    s.neverAheadOfCloud();
+  });
+
+  it("reconcile's conflict prompt: \"Use cloud\" answered after another tab confirmed a newer revision hands back that newer row", async () => {
+    const s = setup();
+    s.t1.load.mockReset();
+    s.t1.load.mockResolvedValueOnce(ok(200, row(5)));
+    let answer!: (a: PromptAnswer) => void;
+    s.t1.prompt.ask.mockImplementationOnce(() => new Promise<PromptAnswer>((resolve) => { answer = resolve; }));
+    // Hinted: record dirty @3 vs cloud @5 is the conflict prompt.
+    const pending = s.t1.client.reconcile("campaign", L1, { localChanged: true });
+    await flush();
+    expect(s.t1.prompt.ask).toHaveBeenCalledTimes(1);
+    await tab2Confirms7(s.t2); // while the prompt is open
+    s.t1.load.mockResolvedValueOnce(ok(200, row(7, at7)));
+    answer("primary");
+    expect(await pending).toEqual({ status: "use_cloud", save: { revision: 7, schemaVersion: 1, payload: at7, updatedAt: row(7).updatedAt } });
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+    s.monotonic();
+    s.neverAheadOfCloud();
+  });
+
+  it("store's conflict prompt, \"Use cloud\", server went backwards (both loads @3 under a record @7): the player's choice adopts @3", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const s = setup();
+    s.t1.load.mockReset();
+    await tab2Confirms7(s.t2);
+    s.t1.store.mockResolvedValueOnce(ok(409, { error: "conflict", cloud: { revision: 7, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } }));
+    s.t1.load.mockResolvedValue(ok(200, row(3)));
+    s.t1.answers.push("primary");
+    expect(await s.t1.client.store("campaign", L1)).toEqual({ status: "use_cloud", save: { revision: 3, schemaVersion: 1, payload: campaign, updatedAt: row(3).updatedAt } });
+    expect(s.t1.load).toHaveBeenCalledTimes(2);
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+  });
+});
+
+// Fix round 1, single tab: the server itself went backwards (an operator reset or deleted the row)
+// while this browser's record still says 7. Both loads agree, so it is not a cross-tab race.
+describe("a cloud row that went backwards on the server is decided on with no sync record", () => {
+  const decide = vi.mocked(decideReconcile);
+  const L1 = { ...campaign, coins: 42 };
+  const regressed = () => {
+    const h = harness();
+    h.state.writeRecord("u1", "campaign", { revision: 7, dirty: false });
+    h.state.writeOwner("campaign", "u1");
+    decide.mockClear();
+    return h;
+  };
+
+  it("(a) local payload present, both loads @3: conflict prompt, record not left at 7; \"Use cloud\" leaves it 3 and clean", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const h = regressed();
+    h.load.mockResolvedValue(ok(200, row(3)));
+    let seenDuringPrompt: unknown;
+    h.prompt.ask.mockImplementationOnce(async (copy: PromptCopy) => { h.asked.push(copy); seenDuringPrompt = h.state.readRecord("u1", "campaign"); return "primary"; });
+    expect(await h.client.reconcile("campaign", L1)).toEqual({ status: "use_cloud", save: { revision: 3, schemaVersion: 1, payload: campaign, updatedAt: row(3).updatedAt } });
+    expect(h.asked).toEqual([CONFLICT_COPY]);
+    expect(h.load).toHaveBeenCalledTimes(2);
+    expect(seenDuringPrompt).not.toMatchObject({ revision: 7 });
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: null, cloud: { revision: 3 } });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+    expect(h.state.readOwner("campaign")).toBe("u1");
+    expect(h.store).not.toHaveBeenCalled();
+  });
+
+  it("(b) no local payload, both loads @3: use_cloud @3", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const h = regressed();
+    h.load.mockResolvedValue(ok(200, row(3)));
+    expect(await h.client.reconcile("campaign", null)).toEqual({ status: "use_cloud", save: { revision: 3, schemaVersion: 1, payload: campaign, updatedAt: row(3).updatedAt } });
+    expect(h.asked).toEqual([]);
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 3, dirty: false });
+  });
+
+  it("(c) a record exists but both loads 404, local present: uploaded on baseRevision 0 (the server has no row to lose)", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const h = regressed();
+    h.load.mockResolvedValue(ok(404, { error: "no_save" }));
+    h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t1" }));
+    expect(await h.client.reconcile("campaign", L1)).toEqual({ status: "uploaded", revision: 1 });
+    expect(h.load).toHaveBeenCalledTimes(2);
+    expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 0, payload: L1 });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: false });
+    expect(h.asked).toEqual([]);
+  });
+
+  // Fix round 2 (C1b): a reset never discards a dirty flag. A dirty record becomes { 0, dirty }: the
+  // table then prompts when a row exists (and uploads when none does), and the slot stays queued.
+  it("a DIRTY record is reset to { 0, dirty: true }, not removed: the table is handed that record and prompts", async () => {
+    expectConsole("warn", "treating the slot as never synced");
+    const h = regressed();
+    h.state.writeRecord("u1", "campaign", { revision: 7, dirty: true });
+    h.load.mockResolvedValue(ok(200, row(3)));
+    let seenDuringPrompt: unknown;
+    h.prompt.ask.mockImplementationOnce(async (copy: PromptCopy) => { h.asked.push(copy); seenDuringPrompt = h.state.readRecord("u1", "campaign"); return "secondary"; });
+    h.store.mockResolvedValueOnce(ok(200, { revision: 4, updatedAt: "t4" }));
+    expect(await h.client.reconcile("campaign", L1)).toEqual({ status: "stored", revision: 4 });
+    expect(decide.mock.calls[0][0]).toMatchObject({ record: { revision: 0, dirty: true }, cloud: { revision: 3 } });
+    expect(seenDuringPrompt).toEqual({ revision: 0, dirty: true });
+    expect(h.asked).toEqual([CONFLICT_COPY]);
+    expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3, payload: L1 });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 4, dirty: false });
+  });
+
+  // Fix round 2 (M2): in the current() path the reset waits for the session re-check, so an account
+  // switch (signed_out) leaves the record, dirty flag included, exactly as it was.
+  it("with current(), a regression followed by a signed_out re-check leaves the record untouched", async () => {
+    const h = regressed();
+    h.state.writeRecord("u1", "campaign", { revision: 7, dirty: true });
+    const current = vi.fn(() => L1);
+    h.load.mockResolvedValueOnce(ok(200, row(3)))
+      .mockImplementationOnce(async () => { h.setSession({ access_token: "tok2", user: { id: "u2" } }); return ok(200, row(3)); });
+    expect(await h.client.reconcile("campaign", campaign, { current })).toEqual({ status: "signed_out" });
+    expect(h.load).toHaveBeenCalledTimes(2);
+    expect(current).not.toHaveBeenCalled();
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it("a record exists, the first load 404s but the re-load finds the row at the record's revision: decided normally", async () => {
+    const h = regressed();
+    h.load.mockResolvedValueOnce(ok(404, { error: "no_save" })).mockResolvedValueOnce(ok(200, row(7)));
+    expect(await h.client.reconcile("campaign", L1)).toEqual({ status: "current" });
+    expect(h.load).toHaveBeenCalledTimes(2);
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+  });
+});
+
+// Fix round 2 (I2): a remembered payload carries the base it was built on, and a background
+// re-flush sends on THAT base, not on whatever revision the shared record has reached since. If
+// another tab confirmed newer meanwhile, the server answers 409 and the slot simply stays dirty.
+describe("a remembered payload is re-flushed on the base it was built on", () => {
+  const conflictAt = (revision: number) => ok(409, { error: "conflict", cloud: { revision, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
+
+  it("P3: tab 1's failed send (built on 3) is re-flushed on base 3, gets a 409, and tab 2's revision 7 stays intact", async () => {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    let put!: (r: TransportResult) => void;
+    t1.store.mockImplementationOnce(() => new Promise((r) => { put = r; }));
+    const p = t1.client.store("campaign", { ...campaign, coins: 42 });
+    await flush();
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3 });
+    t2.store.mockResolvedValueOnce(ok(200, { revision: 7, updatedAt: "t7" }));
+    await t2.client.store("campaign", { ...campaign, coins: 70 });
+    t1.store.mockResolvedValue({ kind: "network", message: "offline" });
+    put({ kind: "network", message: "offline" });
+    await p;
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    // The fake server is at 7: only a PUT on base 7 would land.
+    t1.store.mockReset();
+    t1.store.mockImplementation(async (_slot, body) => (body.baseRevision === 7 ? ok(200, { revision: 8, updatedAt: "t8" }) : conflictAt(7)));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).toHaveBeenCalledTimes(1);
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3, payload: { coins: 42 } });
+    expect(t1.asked).toEqual([]); // background: never prompts
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true }); // left dirty, not auto-resolved
+
+    // "Leave the record dirty so the next reconcile prompts": the stored record is dirty AT 7 (the
+    // cloud revision), which alone the table would answer restore_dirty — a PUT on 7 over tab 2's
+    // row. This tab still remembers that its payload was built on 3, so the decision uses 3.
+    t1.load.mockResolvedValue(ok(200, row(7, { ...campaign, coins: 70 })));
+    t1.answers.push("primary"); // "Use cloud"
+    expect(await t1.client.reconcile("campaign", { ...campaign, coins: 42 })).toMatchObject({ status: "use_cloud", save: { revision: 7 } });
+    expect(t1.asked).toEqual([CONFLICT_COPY]);
+    expect(t1.store).toHaveBeenCalledTimes(1); // only the background 409, nothing on base 7
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+  });
+
+  it("the base remembered is that of the failed send: 'Keep this one' on cloud 5 that then fails offline re-flushes on 5", async () => {
+    const h = harness();
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.state.writeOwner("campaign", "u1");
+    const mine = { ...campaign, coins: 42 };
+    h.store.mockResolvedValueOnce(conflictAt(5)).mockResolvedValue({ kind: "network", message: "offline" });
+    h.answers.push("secondary"); // "Keep this one": send on the cloud revision 5
+    expect((await h.client.store("campaign", mine)).status).toBe("error");
+    expect(h.store.mock.calls.at(-1)?.[1]).toMatchObject({ baseRevision: 5, payload: mine });
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 6, updatedAt: "t6" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 5, payload: mine });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 6, dirty: false });
+  });
+
+  it("a payload seeded by a hinted reconcile remembers the revision it was built on (3), even after another tab confirmed 7 and left the record dirty", async () => {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    const mine = { ...campaign, coins: 42 };
+    t1.load.mockResolvedValue({ kind: "network", message: "offline" });
+    expect(await t1.client.reconcile("campaign", mine, { localChanged: true })).toMatchObject({ status: "error", error: { code: "network" } });
+    t2.store.mockResolvedValueOnce(ok(200, { revision: 7, updatedAt: "t7" }));
+    await t2.client.store("campaign", { ...campaign, coins: 70 });
+    t2.store.mockResolvedValue({ kind: "network", message: "offline" });
+    await t2.client.store("campaign", { ...campaign, coins: 71 }); // tab 2's next commit fails: record dirty @7
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    t1.store.mockImplementation(async (_slot, body) => (body.baseRevision === 7 ? ok(200, { revision: 8, updatedAt: "t8" }) : conflictAt(7)));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).toHaveBeenCalledTimes(1);
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3, payload: mine });
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+  });
+});
+
+// Fix round 3: the re-review's probes, starting where P3 ends (tab 1's payload built on 3 got a
+// background 409; the shared record is { 7, dirty }; tab 1 remembers base 3; the server is at 7).
+describe("after a background 409, this tab's remembered base keeps deciding", () => {
+  const decide = vi.mocked(decideReconcile);
+  const conflictAt = (revision: number) => ok(409, { error: "conflict", cloud: { revision, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
+  async function afterP3() {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    let put!: (r: TransportResult) => void;
+    t1.store.mockImplementationOnce(() => new Promise((r) => { put = r; }));
+    const p = t1.client.store("campaign", { ...campaign, coins: 42 });
+    await flush();
+    t2.store.mockResolvedValueOnce(ok(200, { revision: 7, updatedAt: "t7" }));
+    await t2.client.store("campaign", { ...campaign, coins: 70 });
+    t1.store.mockResolvedValue({ kind: "network", message: "offline" });
+    put({ kind: "network", message: "offline" });
+    await p;
+    t1.store.mockReset();
+    let server = 7; // a compare-and-swap fake: only a PUT on the current revision lands
+    const cas = async (_s: string, body: { baseRevision: number }) => (body.baseRevision === server ? ok(200, { revision: ++server, updatedAt: `t${server}` }) : conflictAt(server));
+    t1.store.mockImplementation(cas);
+    t2.store.mockReset();
+    t2.store.mockImplementation(cas);
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3 });
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    t1.store.mockClear();
+    decide.mockClear();
+    return { backing, t1, t2 };
+  }
+
+  // N1: a moved payload (the hint, or a differing current()) was built on top of the remembered
+  // one, so the remembered base bounds the decision too — not just the pre-GET and stored records.
+  it("N1: a reconcile with the localChanged hint gets the conflict prompt, not a PUT on 7", async () => {
+    const { t1 } = await afterP3();
+    t1.load.mockResolvedValue(ok(200, row(7, { ...campaign, coins: 70 })));
+    t1.answers.push("primary"); // "Use cloud"
+    expect(await t1.client.reconcile("campaign", { ...campaign, coins: 42 }, { localChanged: true })).toMatchObject({ status: "use_cloud", save: { revision: 7 } });
+    expect(t1.asked).toEqual([CONFLICT_COPY]);
+    expect(decide.mock.calls[0][0].record).toEqual({ revision: 3, dirty: true });
+    expect(t1.store).not.toHaveBeenCalled(); // tab 2's row 7 intact
+  });
+
+  it("N1b: a reconcile whose current() reports a move gets the conflict prompt, not a PUT on 7", async () => {
+    const { t1 } = await afterP3();
+    t1.load.mockResolvedValue(ok(200, row(7, { ...campaign, coins: 70 })));
+    t1.answers.push("primary");
+    expect(await t1.client.reconcile("campaign", { ...campaign, coins: 42 }, { current: () => ({ ...campaign, coins: 43 }) })).toMatchObject({ status: "use_cloud", save: { revision: 7 } });
+    expect(t1.asked).toEqual([CONFLICT_COPY]);
+    expect(decide.mock.calls[0][0].record).toEqual({ revision: 3, dirty: true });
+    expect(t1.store).not.toHaveBeenCalled();
+  });
+
+  // N2: once the player's answer has landed, the remembered payload is what was sent, on the new
+  // revision — so the same question is not asked again when another tab later dirties the record.
+  it("N2: after 'Keep this one' lands, a later reconcile of that same payload is not asked the question again", async () => {
+    const { t1, t2 } = await afterP3();
+    t1.load.mockResolvedValue(ok(200, row(7, { ...campaign, coins: 70 })));
+    t1.answers.push("secondary"); // "Keep this one"
+    expect(await t1.client.reconcile("campaign", { ...campaign, coins: 42 })).toEqual({ status: "stored", revision: 8 });
+    expect(t1.asked).toEqual([CONFLICT_COPY]);
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: false });
+    t2.store.mockReset();
+    t2.store.mockResolvedValue({ kind: "network", message: "offline" });
+    await t2.client.store("campaign", { ...campaign, coins: 71 }); // shared record { 8, dirty }
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+    // Fix round 4: tab 1's remembered payload has LANDED — it is a base bound, not pending work. A
+    // background re-flush must not send it on 8 (it would match the CAS, confirm { 9, clean } and
+    // bury tab 2's unsynced coins:71 under tab 1's already-synced content).
+    t1.store.mockClear();
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).not.toHaveBeenCalled();
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+    t1.load.mockResolvedValue(ok(200, row(8, { ...campaign, coins: 42 })));
+    decide.mockClear();
+    await t1.client.reconcile("campaign", { ...campaign, coins: 42 });
+    expect(decide.mock.calls[0][0].record).toEqual({ revision: 8, dirty: true });
+    expect(t1.asked).toEqual([CONFLICT_COPY]); // not asked again
+  });
+});
+
+// Fix round 4 (PR #8, Codex P1 / CodeRabbit Major): a remembered payload that has LANDED is only a
+// base bound for later decisions. It is never pending work, so a background re-flush sends nothing
+// for it — even when another tab's failed commit has left the shared record dirty.
+describe("a landed remembered payload is never re-flushed", () => {
+  function twoTabsAt7() {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 7, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    return { t1, t2 };
+  }
+  async function tab2FailsAt8(t1: ReturnType<typeof tab>, t2: ReturnType<typeof tab>) {
+    t2.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await t2.client.store("campaign", { ...campaign, coins: 71 })).status).toBe("error");
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+  }
+
+  it("CodeRabbit scenario: tab 1's reconcile send lands at 8, tab 2's store fails offline, tab 1's `online` sends nothing and tab 2's unsynced payload stays pending", async () => {
+    const { t1, t2 } = twoTabsAt7();
+    const P = { ...campaign, coins: 42 };
+    t1.load.mockResolvedValue(ok(200, row(7)));
+    t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    expect(await t1.client.reconcile("campaign", P, { localChanged: true })).toEqual({ status: "stored", revision: 8 }); // restore_dirty
+    await tab2FailsAt8(t1, t2);
+    t1.store.mockClear();
+    t1.store.mockResolvedValue(ok(200, { revision: 9, updatedAt: "t9" })); // a CAS on 8 WOULD match
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).not.toHaveBeenCalled();
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+  });
+
+  it("the same for a store() flush that landed: its payload is not re-sent over another tab's dirty flag", async () => {
+    const { t1, t2 } = twoTabsAt7();
+    t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    expect(await t1.client.store("campaign", { ...campaign, coins: 42 })).toMatchObject({ status: "stored", revision: 8 });
+    await tab2FailsAt8(t1, t2);
+    t1.store.mockClear();
+    t1.store.mockResolvedValue(ok(200, { revision: 9, updatedAt: "t9" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).not.toHaveBeenCalled();
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+  });
+
+  it("control: NEW local work after a landed send is pending again and re-flushes", async () => {
+    const { t1 } = twoTabsAt7();
+    t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    await t1.client.store("campaign", { ...campaign, coins: 42 });
+    t1.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await t1.client.store("campaign", { ...campaign, coins: 43 })).status).toBe("error");
+    t1.store.mockReset();
+    t1.store.mockResolvedValueOnce(ok(200, { revision: 9, updatedAt: "t9" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).toHaveBeenCalledTimes(1);
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 8, payload: { coins: 43 } });
+  });
+});
+
+// N4: restore_dirty sends on the cloud revision the table decided on, never on a re-read of the
+// record — a write landing between the decision and the send then gets a 409, not a silent success.
+describe("restore_dirty sends on the revision it decided on", () => {
+  it("a record write between the decision and the send ends in a 409 and the prompt, not a PUT on the newer revision", async () => {
+    const h = harness();
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: true });
+    h.state.writeOwner("campaign", "u1");
+    h.load.mockResolvedValueOnce(ok(200, row(3)));
+    const decide = vi.mocked(decideReconcile);
+    decide.mockImplementationOnce(() => {
+      // Another tab stores 4 and its record write lands right after the decision.
+      h.state.writeRecord("u1", "campaign", { revision: 4, dirty: true });
+      return "restore_dirty";
+    });
+    h.store.mockImplementation(async (_s, body) => (body.baseRevision === 4 ? ok(200, { revision: 5, updatedAt: "t5" }) : ok(409, { error: "conflict", cloud: { revision: 4, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } })));
+    h.load.mockResolvedValueOnce(ok(200, row(4)));
+    h.answers.push("primary"); // "Use cloud"
+    expect(await h.client.reconcile("campaign", { ...campaign, coins: 42 })).toMatchObject({ status: "use_cloud", save: { revision: 4 } });
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3 });
+    expect(h.asked).toEqual([CONFLICT_COPY]);
+  });
+});
+
+// Fix round 2 (C1): the second load is judged against the record as it was just BEFORE that load
+// was sent (r0), not as it is when the load returns. Another tab can confirm again while the
+// re-load is in flight: its row is correct as of when it was served, and only a row below r0 (or
+// a 404 while r0 > 0) means the server itself went backwards. r0 <= row < now is a race: the
+// retryable stale-row error, with nothing written (record, owner, remembered payload).
+describe("a race during the re-load is not a server regression", () => {
+  const decide = vi.mocked(decideReconcile);
+  const recordKey = "gw-account-kit.saves.gridwatch-match.campaign.u1.v1";
+  function twoTabs(t2Window: Window | null) {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, null);
+    const t2 = tab("u1", "tok1-tab2", backing, t2Window);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    let g1!: (r: TransportResult) => void;
+    let g2!: (r: TransportResult) => void;
+    t1.load.mockImplementationOnce(() => new Promise((r) => { g1 = r; }))
+      .mockImplementationOnce(() => new Promise((r) => { g2 = r; }));
+    decide.mockClear();
+    return { backing, t1, t2, first: (r: TransportResult) => g1(r), second: (r: TransportResult) => g2(r) };
+  }
+  const confirms = async (t2: ReturnType<typeof tab>, revision: number, coins: number) => {
+    t2.store.mockResolvedValueOnce(ok(200, { revision, updatedAt: `t${revision}` }));
+    expect(await t2.client.store("campaign", { ...campaign, coins })).toMatchObject({ status: "stored", revision });
+  };
+
+  it("P1: tab 2 confirms 8 while tab 1's re-load is in flight; the re-load's row 7 is a race, not a regression: retryable error, record stays 8", async () => {
+    const s = twoTabs(null);
+    const pending = s.t1.client.reconcile("campaign", null);
+    await flush();
+    await confirms(s.t2, 7, 70);
+    s.first(ok(200, row(3))); // served before tab 2's PUT @7
+    await flush();
+    expect(s.t1.load).toHaveBeenCalledTimes(2);
+    await confirms(s.t2, 8, 80); // tab 2 keeps playing while the re-load is in flight
+    const before = s.backing.getItem(recordKey);
+    const owner = s.t1.state.readOwner("campaign");
+    s.second(ok(200, row(7, { ...campaign, coins: 70 }))); // served before tab 2's PUT @8
+    const result = await pending;
+    expect(result).toEqual({ status: "error", error: { code: "network", message: expect.any(String) } });
+    expect(s.backing.getItem(recordKey)).toBe(before);
+    expect(s.t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: false });
+    expect(s.t1.state.readOwner("campaign")).toBe(owner);
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it("P2: same race while tab 2's newest progress is unsynced (dirty @8): the dirty flag and tab 2's remembered payload survive, and its re-flush sends it", async () => {
+    const s = twoTabs(window);
+    const pending = s.t1.client.reconcile("campaign", null);
+    await flush();
+    await confirms(s.t2, 7, 70);
+    s.first(ok(200, row(3)));
+    await flush();
+    await confirms(s.t2, 8, 80);
+    s.t2.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await s.t2.client.store("campaign", { ...campaign, coins: 90 })).status).toBe("error"); // unsynced progress
+    expect(s.t2.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+    s.second(ok(200, row(7)));
+    expect(await pending).toMatchObject({ status: "error", error: { code: "network" } });
+    expect(s.t2.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+    s.t2.store.mockReset();
+    s.t2.store.mockResolvedValueOnce(ok(200, { revision: 9, updatedAt: "t9" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(s.t2.store).toHaveBeenCalledTimes(1);
+    expect(s.t2.store.mock.calls[0][1]).toMatchObject({ baseRevision: 8, payload: { coins: 90 } });
+    expect(s.t2.state.readRecord("u1", "campaign")).toEqual({ revision: 9, dirty: false });
+  });
+
+  it("a re-load row exactly AT r0 while another tab confirmed past it meanwhile is a race too (r0 <= row < now)", async () => {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, null);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 0, dirty: true }); // a first upload that failed
+    let g2!: (r: TransportResult) => void;
+    // The first load returns row @3 after tab 2 confirmed 5, so it is behind; r0 is then 5.
+    t1.load.mockImplementationOnce(async () => { await confirms(t2, 5, 50); return ok(200, row(3)); })
+      .mockImplementationOnce(() => new Promise((r) => { g2 = r; }));
+    const pending = t1.client.reconcile("campaign", null);
+    await flush();
+    expect(t1.load).toHaveBeenCalledTimes(2);
+    await confirms(t2, 6, 60);
+    g2(ok(200, row(5))); // r0 = 5 <= 5 < 6: a race
+    expect(await pending).toMatchObject({ status: "error", error: { code: "network" } });
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 6, dirty: false });
   });
 });
 

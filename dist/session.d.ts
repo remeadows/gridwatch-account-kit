@@ -31,7 +31,10 @@ export interface AccountKit {
     signInWithProvider(provider: Provider, options?: SignInOptions): Promise<string | null>;
     signOut(): Promise<void>;
     getProfile(): Promise<Profile>;
-    saveHandle(raw: string): Promise<string | null>;
+    /** Upserts the signed-in user's handle. Pass `expectedUserId` (the user the form was rendered
+     *  for) and the write is refused — with an error string, nothing written — when a different
+     *  account is signed in by the time it is submitted. */
+    saveHandle(raw: string, expectedUserId?: string): Promise<string | null>;
     signInUrl(): string;
 }
 export declare function createAccountKit(input: AccountKitConfig): AccountKit;

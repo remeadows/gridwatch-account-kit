@@ -58,6 +58,47 @@ describe("validateAgainst", () => {
     const keySchema: Schema = { type: "record", keyPattern: /^[a-z]+$/g, value: { type: "boolean" } };
     expect(validateAgainst(keySchema, { abc: true, def: true })).toEqual({ ok: true });
   });
+  // Kit v0.2.6 item 5: 1e308 passes Number.isInteger, is a few bytes on the wire, and expands to
+  // ~309 characters in Postgres jsonb text — enough of them overrun the database's byte backstop
+  // after passing client and worker validation. An `integer` must be a SAFE integer, declared
+  // bounds or not.
+  it("an integer schema value must be a safe integer, even with no declared max", () => {
+    const int: Schema = { type: "integer" };
+    const nonNegative: Schema = { type: "integer", min: 0 };
+    for (const s of [int, nonNegative]) {
+      expect(validateAgainst(s, 2 ** 53)).toEqual({ ok: false, detail: "$: expected integer" });
+      expect(validateAgainst(s, 1e308)).toEqual({ ok: false, detail: "$: expected integer" });
+      expect(validateAgainst(s, Number.MAX_SAFE_INTEGER)).toEqual({ ok: true });
+    }
+    expect(validateAgainst(int, -(2 ** 53))).toEqual({ ok: false, detail: "$: expected integer" });
+    expect(validateAgainst(int, Number.MIN_SAFE_INTEGER)).toEqual({ ok: true });
+  });
+  // Same jsonb-size reasoning for `number`: 1e308 is finite, tiny on the wire, ~309 chars stored.
+  it("a number schema value must not exceed Number.MAX_SAFE_INTEGER in magnitude, even with no declared bounds", () => {
+    const num: Schema = { type: "number" };
+    // Fix round 2 (M4): the detail says what is wrong — the value IS a number, it is out of range.
+    expect(validateAgainst(num, 1e308)).toEqual({ ok: false, detail: "$: out of range (above maximum 9007199254740991)" });
+    expect(validateAgainst(num, -1e308)).toEqual({ ok: false, detail: "$: out of range (below minimum -9007199254740991)" });
+    expect(validateAgainst(num, 2 ** 53)).toEqual({ ok: false, detail: "$: out of range (above maximum 9007199254740991)" });
+    expect(validateAgainst(num, Number.MAX_SAFE_INTEGER)).toEqual({ ok: true });
+    expect(validateAgainst(num, -Number.MAX_SAFE_INTEGER)).toEqual({ ok: true });
+    expect(validateAgainst(num, 0.5)).toEqual({ ok: true });
+    expect(validateAgainst(num, 1e-300)).toEqual({ ok: true }); // tiny magnitudes are not the problem
+  });
+  // Fix round 2 (M4): the effective bounds are min(declared max, MAX_SAFE_INTEGER) and
+  // max(declared min, -MAX_SAFE_INTEGER). A declared bound wider than the safe range does not widen
+  // it; a tighter one still applies and keeps its own detail.
+  it("a number schema's effective bounds are its declared bounds clamped to the safe range", () => {
+    const wide: Schema = { type: "number", min: -1e308, max: 1e308 };
+    expect(validateAgainst(wide, 1e300)).toEqual({ ok: false, detail: "$: out of range (above maximum 9007199254740991)" });
+    expect(validateAgainst(wide, -1e300)).toEqual({ ok: false, detail: "$: out of range (below minimum -9007199254740991)" });
+    expect(validateAgainst(wide, Number.MAX_SAFE_INTEGER)).toEqual({ ok: true });
+    expect(validateAgainst(wide, -Number.MAX_SAFE_INTEGER)).toEqual({ ok: true });
+    const narrow: Schema = { type: "number", min: -2.5, max: 10 };
+    expect(validateAgainst(narrow, 10.5)).toEqual({ ok: false, detail: "$: above maximum 10" });
+    expect(validateAgainst(narrow, -3)).toEqual({ ok: false, detail: "$: below minimum -2.5" });
+    expect(validateAgainst(narrow, 9.75)).toEqual({ ok: true });
+  });
   it("enforces the structural caps", () => {
     const deep: Schema = { type: "record", keyPattern: /^d$/, value: { type: "record", keyPattern: /^d$/, value: { type: "boolean" } } };
     let nested: unknown = true;
