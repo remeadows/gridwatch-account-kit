@@ -4,6 +4,7 @@ import { MAX_BODY_BYTES } from "../src/saves-schema/wire";
 
 const empty = { contentRevision: "expansion-1-r4", clearedLevels: [], settings: { lowEffects: false } };
 const checkpoint = { completedWaves: 4, tick: 12000, level: 25, contentHash: "a".repeat(64), seed: "test", commands: [0, 12287551] };
+/** Validate a fixture through the registered Breach r4 slot, not just its schema. */
 const validate = (value: unknown) => validatePayload("gridwatch-signal-breach", 1, "expansion-1-r4", value);
 
 describe("Breach expansion save registry", () => {
