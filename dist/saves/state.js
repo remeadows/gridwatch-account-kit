@@ -41,6 +41,15 @@ export function createSaveStateStore(gameSlug, storage = typeof localStorage ===
             fallback.setItem(key, value);
         }
     }
+    function remove(key) {
+        try {
+            backing.removeItem(key);
+        }
+        catch {
+            backing = fallback;
+            fallback.removeItem(key);
+        }
+    }
     function readJson(key) {
         const raw = read(key);
         if (raw === null)
@@ -79,6 +88,9 @@ export function createSaveStateStore(gameSlug, storage = typeof localStorage ===
                 next = { revision: stored.revision, dirty: true };
             }
             write(recordKey(userId, slot), JSON.stringify(next));
+        },
+        clearRecord(userId, slot) {
+            remove(recordKey(userId, slot));
         },
         readOwner(slot) {
             const value = readJson(ownerKey(slot));

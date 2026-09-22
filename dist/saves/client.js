@@ -200,23 +200,39 @@ export function createSavesClient(deps) {
      *  it was sent: such a row describes the cloud as it WAS, and deciding on it would hand the game
      *  a stale payload as use_cloud (and, before v0.2.6, roll the record back to it). */
     const behindRecord = (userId, slot, save) => (state.readRecord(userId, slot)?.revision ?? -1) > save.revision;
-    /** Retryable by design: the transport class, because that is exactly what it is — this device
-     *  saw a newer revision than the cloud answered with, twice, so the answer is lagging. */
+    /** Retryable by design (the transport class). Only for the one window loadNotBehindRecord cannot
+     *  cover: another tab confirming a newer revision during reconcile's session re-check just before
+     *  current() and the decision — a one-off race, so retrying resolves it. */
     const staleRowError = () => ({ code: "network", message: "cloud row is older than a revision this browser already confirmed; try again" });
+    /** Behind this user's record, re-read now: an older row, or no row at all while the record says
+     *  this user has confirmed one (revision > 0). A record at revision 0 was never confirmed against
+     *  any row (a store that failed before the first upload), so a 404 is exactly what it expects. */
+    const behindRecordOrMissing = (userId, slot, loaded) => loaded.status === "ok" ? behindRecord(userId, slot, loaded.save)
+        : loaded.status === "none" && (state.readRecord(userId, slot)?.revision ?? 0) > 0;
     /** loadWith() for every path that is about to DECIDE on the cloud row (reconcile, and the
-     *  conflict prompt's "Use cloud"): a row older than the record stored for this user when it
-     *  arrives is re-loaded once, and a second stale row resolves staleRowError() — never a row the
-     *  caller could act on. It writes nothing; the caller has not written anything for the row yet
-     *  either, so on that error the record, the owner record and remembered payloads are untouched.
-     *  A 404 is passed through: "no row" is not an older row, and the table already handles it. */
+     *  conflict prompts' "Use cloud"). A row older than the record stored for this user when it
+     *  arrives — or a 404 while a record exists — is re-loaded once, and the second answer tells the
+     *  two causes apart:
+     *    - a cross-tab race: another tab's store reached the server before that tab confirmed, so
+     *      the re-load (sent after the confirmation) sees the newer row and is decided on normally;
+     *    - the SERVER went backwards (an operator reset or deleted the row): the re-load is still
+     *      behind. The record no longer describes anything the server has, so it is discarded —
+     *      this user's slot is "never synced" — and the caller decides on the second load with
+     *      record = null. The decision table then prompts over any local payload (cloud row + local
+     *      with no record) or uploads it when there is no row (nothing on the server to lose), and
+     *      adopts the cloud row only when there is nothing local. Never a retryable error forever,
+     *      never a silent overwrite, never a silent adopt over local progress. The owner record is
+     *      not touched: whose local save this is did not change. */
     async function loadNotBehindRecord(slot, op) {
         const first = await loadWith(slot, op);
-        if (first.status !== "ok" || !behindRecord(op.s.userId, slot, first.save))
+        if (!behindRecordOrMissing(op.s.userId, slot, first))
             return first;
         const second = await loadWith(slot, op);
-        if (second.status !== "ok" || !behindRecord(op.s.userId, slot, second.save))
-            return second;
-        return { status: "error", error: staleRowError() };
+        if (behindRecordOrMissing(op.s.userId, slot, second)) {
+            console.warn(`[account-kit] cloud row for ${slot} is behind this browser's sync record on a re-load too; treating the slot as never synced`);
+            state.clearRecord(op.s.userId, slot);
+        }
+        return second;
     }
     async function sendOnce(slot, payload, baseRevision, op) {
         const body = { schemaVersion: game.schemaVersion, baseRevision, payload, deviceId: state.deviceId(), idempotencyKey: uuidV4() };
