@@ -105,7 +105,15 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   // re-flush sends on THAT base, never on whatever the shared record has reached since — another
   // tab may have confirmed a newer revision in between, and sending on it would land with no 409
   // over that tab's row. On the old base the server answers 409 and the slot just stays dirty.
-  type Remembered = { payload: SavePayload; base: number };
+  //
+  // `landed` separates the two jobs an entry does (fix round 4). Pending work (landed: false) is
+  // what a background re-flush may send. A LANDED entry — its payload already reached the cloud —
+  // only bounds later decisions (N1/N2) and is never re-flushed: the shared record can be dirty
+  // because of ANOTHER tab's failed commit, and re-sending this tab's already-synced payload on that
+  // revision would match the CAS, confirm the record clean and bury the other tab's unsynced work.
+  // New local work (store(), the localChanged hint, a moved current()) sets landed: false; every
+  // successful send of the entry's payload sets it true.
+  type Remembered = { payload: SavePayload; base: number; landed: boolean };
   const lastPayload = new Map<string, Remembered>();
   // Bumped every time the player DISCARDS this user's local copy of a slot ("Use cloud" at either
   // prompt, the table's outright use_cloud, or "Start fresh"). Any store/re-flush that was already
@@ -423,7 +431,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         // The remembered payload IS the cloud row at this revision now: anything built on top of
         // it is built on this revision, not on the base it went out on.
         const remembered = lastPayload.get(payloadKey(op.s.userId, slot));
-        if (remembered !== undefined && remembered.payload === payload) remembered.base = outcome.revision;
+        if (remembered !== undefined && remembered.payload === payload) { remembered.base = outcome.revision; remembered.landed = true; }
         return { status: "stored", revision: outcome.revision, updatedAt: outcome.updatedAt };
       }
       if (outcome.kind === "error") {
@@ -517,7 +525,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     // store() can't know the signed-in user synchronously, so the payload is remembered here,
     // once the session is known, rather than at the top of store() (see payloadKey above).
     const base = state.readRecord(s.userId, slot)?.revision ?? 0;
-    lastPayload.set(payloadKey(s.userId, slot), { payload, base });
+    lastPayload.set(payloadKey(s.userId, slot), { payload, base, landed: false });
     // claim: false — a store is not an ownership decision. This flush made no owner check at all,
     // and its send can outlast an account switch in another tab, so it may only claim a slot that
     // is unset or already this user's (see confirmed()).
@@ -679,7 +687,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
           // and this one was built on top of it, so that base bounds it too.
           const builtOn = Math.min(capturedBefore?.revision ?? 0, state.readRecord(s.userId, slot)?.revision ?? 0, inheritedBase());
           movedBase = Math.min(movedBase, builtOn);
-          if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), { payload, base: builtOn });
+          if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), { payload, base: builtOn, landed: false });
           // The dirty flag itself is only forced on a CLEAN record, and is safe regardless of the
           // owner: decideReconcile raises ownership_prompt on ownedByOther whether or not the
           // record is dirty, so marking it cannot turn a prompt into a silent upload.
@@ -893,7 +901,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         const sendLocal = async (baseRevision: number): Promise<StoreResult> => {
           const sent = local as SavePayload;
           const result = await sendWithConflicts(slot, sent, baseRevision, op, true);
-          if (result.status === "stored" && !disposed) lastPayload.set(payloadKey(s.userId, slot), { payload: sent, base: result.revision });
+          if (result.status === "stored" && !disposed) lastPayload.set(payloadKey(s.userId, slot), { payload: sent, base: result.revision, landed: true });
           return result;
         };
         const asReconcile = (result: StoreResult): ReconcileResult =>
@@ -1047,7 +1055,8 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       // confirmed a newer revision meanwhile, that is a 409 below, and the slot stays dirty for the
       // next foreground call to resolve.
       const latest = lastPayload.get(payloadKey(s.userId, slot));
-      if (latest === undefined) return;
+      // A landed entry is a base bound, not pending work (see Remembered): nothing to send.
+      if (latest === undefined || latest.landed) return;
       const base = latest.base;
       const sent = JSON.parse(JSON.stringify(latest.payload)) as SavePayload;
       // The operation starts here, after every guard above: a background re-flush gets the same
@@ -1061,7 +1070,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       // truthful; re-asserting the ownership would silently overwrite that newer claim.
       if (outcome.kind === "stored") {
         confirmed(slot, s, outcome.revision, { claim: false });
-        if (lastPayload.get(payloadKey(s.userId, slot)) === latest) latest.base = outcome.revision; // see sendWithConflicts
+        if (lastPayload.get(payloadKey(s.userId, slot)) === latest) { latest.base = outcome.revision; latest.landed = true; } // see sendWithConflicts
         // After confirmed(), never before: the callback tells the game its payload IS the cloud
         // row now, so the kit's own record must already say so. Contained, because a game's
         // marker bookkeeping throwing must not turn a successful re-flush into the warning
@@ -1172,7 +1181,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     // progress as this user's the next time they come back to this device. See confirmed().
     for (const slot of game.slots) {
       const remembered = lastPayload.get(payloadKey(s.userId, slot));
-      if (remembered !== undefined && state.readRecord(s.userId, slot)?.dirty) void quietFlush(slot, remembered.payload, s.userId, epochOf(s.userId, slot));
+      if (remembered !== undefined && !remembered.landed && state.readRecord(s.userId, slot)?.dirty) void quietFlush(slot, remembered.payload, s.userId, epochOf(s.userId, slot));
     }
   }
   const onOnline = () => { void reflushDirty(); };

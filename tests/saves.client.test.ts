@@ -1529,16 +1529,20 @@ describe("a store or background re-flush never overwrites another account's clai
     h.store.mockResolvedValueOnce(ok(200, { revision: 1, updatedAt: "t0" }));
     expect(await h.client.store("campaign", campaign)).toEqual({ status: "stored", revision: 1, updatedAt: "t0" });
     expect(h.state.readOwner("campaign")).toBe("u1");
-    // Dirty again, with u1's payload still remembered from the store() above.
-    h.state.writeRecord("u1", "campaign", { revision: 1, dirty: true });
+    // Dirty again with u1's payload pending: its next commit fails offline. (Fix round 4: a payload
+    // that already LANDED is never re-flushed, so the fixture needs real pending work.)
+    h.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await h.client.store("campaign", { ...campaign, coins: 6 })).status).toBe("error");
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 1, dirty: true });
 
     // Hold the PUT open: the quiet flush has already passed its owner check (still u1 at that
     // point) and is now awaiting the transport.
     let resolveStore!: (r: TransportResult) => void;
+    h.store.mockReset();
     h.store.mockImplementationOnce(() => new Promise((resolve) => { resolveStore = resolve; }));
     window.dispatchEvent(new Event("online"));
     await flush();
-    expect(h.store).toHaveBeenCalledTimes(2);
+    expect(h.store).toHaveBeenCalledTimes(1);
 
     // Another tab signs in as u2 and its reconcile claims the slot while the PUT is in flight.
     h.state.writeOwner("campaign", "u2");
@@ -2859,11 +2863,80 @@ describe("after a background 409, this tab's remembered base keeps deciding", ()
     t2.store.mockResolvedValue({ kind: "network", message: "offline" });
     await t2.client.store("campaign", { ...campaign, coins: 71 }); // shared record { 8, dirty }
     expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+    // Fix round 4: tab 1's remembered payload has LANDED — it is a base bound, not pending work. A
+    // background re-flush must not send it on 8 (it would match the CAS, confirm { 9, clean } and
+    // bury tab 2's unsynced coins:71 under tab 1's already-synced content).
+    t1.store.mockClear();
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).not.toHaveBeenCalled();
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
     t1.load.mockResolvedValue(ok(200, row(8, { ...campaign, coins: 42 })));
     decide.mockClear();
     await t1.client.reconcile("campaign", { ...campaign, coins: 42 });
     expect(decide.mock.calls[0][0].record).toEqual({ revision: 8, dirty: true });
     expect(t1.asked).toEqual([CONFLICT_COPY]); // not asked again
+  });
+});
+
+// Fix round 4 (PR #8, Codex P1 / CodeRabbit Major): a remembered payload that has LANDED is only a
+// base bound for later decisions. It is never pending work, so a background re-flush sends nothing
+// for it — even when another tab's failed commit has left the shared record dirty.
+describe("a landed remembered payload is never re-flushed", () => {
+  function twoTabsAt7() {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 7, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    return { t1, t2 };
+  }
+  async function tab2FailsAt8(t1: ReturnType<typeof tab>, t2: ReturnType<typeof tab>) {
+    t2.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await t2.client.store("campaign", { ...campaign, coins: 71 })).status).toBe("error");
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+  }
+
+  it("CodeRabbit scenario: tab 1's reconcile send lands at 8, tab 2's store fails offline, tab 1's `online` sends nothing and tab 2's unsynced payload stays pending", async () => {
+    const { t1, t2 } = twoTabsAt7();
+    const P = { ...campaign, coins: 42 };
+    t1.load.mockResolvedValue(ok(200, row(7)));
+    t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    expect(await t1.client.reconcile("campaign", P, { localChanged: true })).toEqual({ status: "stored", revision: 8 }); // restore_dirty
+    await tab2FailsAt8(t1, t2);
+    t1.store.mockClear();
+    t1.store.mockResolvedValue(ok(200, { revision: 9, updatedAt: "t9" })); // a CAS on 8 WOULD match
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).not.toHaveBeenCalled();
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+  });
+
+  it("the same for a store() flush that landed: its payload is not re-sent over another tab's dirty flag", async () => {
+    const { t1, t2 } = twoTabsAt7();
+    t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    expect(await t1.client.store("campaign", { ...campaign, coins: 42 })).toMatchObject({ status: "stored", revision: 8 });
+    await tab2FailsAt8(t1, t2);
+    t1.store.mockClear();
+    t1.store.mockResolvedValue(ok(200, { revision: 9, updatedAt: "t9" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).not.toHaveBeenCalled();
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 8, dirty: true });
+  });
+
+  it("control: NEW local work after a landed send is pending again and re-flushes", async () => {
+    const { t1 } = twoTabsAt7();
+    t1.store.mockResolvedValueOnce(ok(200, { revision: 8, updatedAt: "t8" }));
+    await t1.client.store("campaign", { ...campaign, coins: 42 });
+    t1.store.mockResolvedValue({ kind: "network", message: "offline" });
+    expect((await t1.client.store("campaign", { ...campaign, coins: 43 })).status).toBe("error");
+    t1.store.mockReset();
+    t1.store.mockResolvedValueOnce(ok(200, { revision: 9, updatedAt: "t9" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).toHaveBeenCalledTimes(1);
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 8, payload: { coins: 43 } });
   });
 });
 
