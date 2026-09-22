@@ -28,6 +28,8 @@ mountAccountHeader(kit);
 
 `kit.signOut()` signs the player out of **this browser only** — their sessions on other devices stay signed in.
 
+`kit.saveHandle(raw: string, expectedUserId?: string)` sets the signed-in player's handle and resolves an error string or `null`. Pass the id of the user your handle form was rendered for as `expectedUserId`: if a different account is signed in by the time it is submitted (another tab, a sign-out and sign-in), nothing is written and it resolves `"You're signed in as a different account now. Reload and try again."` (since v0.2.6). `useAccount(kit).saveHandle(raw)` does this for you with the session it rendered with, and resolves `"Not signed in."` from a signed-out render.
+
 ### Cloud saves
 
 The registry also defines Breach's isolated `expansion-1-r4` slot (alias `breach`,

@@ -102,6 +102,27 @@ describe("createAccountKit", () => {
     expect(sb.auth.signOut).toHaveBeenCalledWith({ scope: "local" });
   });
 
+  // v0.1.3 backlog: a handle form opened for one account and submitted after the account changed
+  // (another tab, a sign-out/sign-in) used to land on whoever was signed in at submit time.
+  it("saveHandle with an expected user writes only while that user is still the signed-in one", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    expect(await kit.saveHandle("rusty", "u1")).toBeNull();
+    expect(sb.__upsert).toHaveBeenCalledWith({ user_id: "u1", handle: "rusty" });
+    sb.__upsert.mockClear();
+    expect(await kit.saveHandle("rusty", "u2")).toBe("You're signed in as a different account now. Reload and try again.");
+    expect(sb.__upsert).not.toHaveBeenCalled();
+  });
+
+  it("saveHandle re-reads the signed-in user at submit time: an account switch after the form opened is refused", async () => {
+    const sb = fakeSupabase(user);
+    const kit = createAccountKit({ returnPath: "/" });
+    const openedFor = (await kit.getSession())!.user.id; // the form renders for u1
+    sb.auth.getSession.mockResolvedValue({ data: { session: { user: { id: "u2" } } }, error: null } as never); // another tab switches account
+    expect(await kit.saveHandle("rusty", openedFor)).toBe("You're signed in as a different account now. Reload and try again.");
+    expect(sb.__upsert).not.toHaveBeenCalled();
+  });
+
   it("saveHandle returns the error message when the error object has no code", async () => {
     const sb = fakeSupabase(user);
     const kit = createAccountKit({ returnPath: "/" });
