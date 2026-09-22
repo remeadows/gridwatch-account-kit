@@ -54,13 +54,31 @@ export function createSaveStateStore(gameSlug, storage = typeof localStorage ===
     }
     const recordKey = (userId, slot) => `gw-account-kit.saves.${gameSlug}.${slot}.${userId}.v1`;
     const ownerKey = (slot) => `gw-account-kit.saves.${gameSlug}.${slot}.owner.v1`;
+    function readRecord(userId, slot) {
+        const value = readJson(recordKey(userId, slot));
+        return isSyncRecord(value) ? { revision: value.revision, dirty: value.dirty } : null;
+    }
     return {
-        readRecord(userId, slot) {
-            const value = readJson(recordKey(userId, slot));
-            return isSyncRecord(value) ? { revision: value.revision, dirty: value.dirty } : null;
-        },
+        readRecord,
+        // A record's revision NEVER decreases. Every tab of the origin shares this record, and a writer
+        // can be holding an older view than what is stored now (a cloud GET that started before another
+        // tab confirmed a newer revision, or a record captured before an await). So the stored record
+        // is re-read here, at write time, and a lower revision is refused — one rule for every writer:
+        //   - a lower CLEAN write is a stale confirmation: it is dropped, and the stored record (dirty
+        //     flag included) stands — an older confirmation says nothing about the newer revision;
+        //   - a lower DIRTY write still marks the stored record dirty at its own revision: a local
+        //     change is a local change whatever revision the writer thought it was based on, and
+        //     dropping it would let the slot look synced while unsynced progress sits on screen.
+        // Equal or higher revisions are written exactly as given.
         writeRecord(userId, slot, record) {
-            write(recordKey(userId, slot), JSON.stringify({ revision: record.revision, dirty: record.dirty }));
+            const stored = readRecord(userId, slot);
+            let next = { revision: record.revision, dirty: record.dirty };
+            if (stored !== null && record.revision < stored.revision) {
+                if (!record.dirty)
+                    return;
+                next = { revision: stored.revision, dirty: true };
+            }
+            write(recordKey(userId, slot), JSON.stringify(next));
         },
         readOwner(slot) {
             const value = readJson(ownerKey(slot));

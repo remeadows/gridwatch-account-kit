@@ -195,6 +195,29 @@ export function createSavesClient(deps) {
             return { status: "none" };
         return { status: "error", error: errorFor(result) };
     }
+    /** True when this user's sync record, re-read NOW, is ahead of `save`. The record is shared by
+     *  every tab of the origin, and a GET can be older than a revision another tab has confirmed since
+     *  it was sent: such a row describes the cloud as it WAS, and deciding on it would hand the game
+     *  a stale payload as use_cloud (and, before v0.2.6, roll the record back to it). */
+    const behindRecord = (userId, slot, save) => (state.readRecord(userId, slot)?.revision ?? -1) > save.revision;
+    /** Retryable by design: the transport class, because that is exactly what it is — this device
+     *  saw a newer revision than the cloud answered with, twice, so the answer is lagging. */
+    const staleRowError = () => ({ code: "network", message: "cloud row is older than a revision this browser already confirmed; try again" });
+    /** loadWith() for every path that is about to DECIDE on the cloud row (reconcile, and the
+     *  conflict prompt's "Use cloud"): a row older than the record stored for this user when it
+     *  arrives is re-loaded once, and a second stale row resolves staleRowError() — never a row the
+     *  caller could act on. It writes nothing; the caller has not written anything for the row yet
+     *  either, so on that error the record, the owner record and remembered payloads are untouched.
+     *  A 404 is passed through: "no row" is not an older row, and the table already handles it. */
+    async function loadNotBehindRecord(slot, op) {
+        const first = await loadWith(slot, op);
+        if (first.status !== "ok" || !behindRecord(op.s.userId, slot, first.save))
+            return first;
+        const second = await loadWith(slot, op);
+        if (second.status !== "ok" || !behindRecord(op.s.userId, slot, second.save))
+            return second;
+        return { status: "error", error: staleRowError() };
+    }
     async function sendOnce(slot, payload, baseRevision, op) {
         const body = { schemaVersion: game.schemaVersion, baseRevision, payload, deviceId: state.deviceId(), idempotencyKey: uuidV4() };
         const encodedBytes = new TextEncoder().encode(JSON.stringify(body)).byteLength;
@@ -292,7 +315,7 @@ export function createSavesClient(deps) {
             if (disposed)
                 return { status: "error", error: disposedError() };
             if (answer === "primary") {
-                const loaded = await loadWith(slot, op);
+                const loaded = await loadNotBehindRecord(slot, op);
                 if (loaded.status !== "ok")
                     return { status: "error", error: loaded.status === "error" ? loaded.error : { code: "http", status: 404, message: "cloud row vanished" } };
                 confirmed(slot, op.s, loaded.save.revision, { claim });
@@ -515,10 +538,13 @@ export function createSavesClient(deps) {
                     // The dirty flag itself is only forced on a CLEAN record, and is safe regardless of the
                     // owner: decideReconcile raises ownership_prompt on ownedByOther whether or not the
                     // record is dirty, so marking it cannot turn a prompt into a silent upload.
-                    if (record !== null && !record.dirty) {
-                        record = { revision: record.revision, dirty: true };
-                        state.writeRecord(s.userId, slot, record);
-                    }
+                    // Against the record as it is NOW, never the `record` captured before an await: another
+                    // tab may have confirmed a newer revision since (and the state layer would refuse to
+                    // lower it anyway — this keeps the intent explicit).
+                    const latest = state.readRecord(s.userId, slot);
+                    if (latest !== null && !latest.dirty)
+                        state.writeRecord(s.userId, slot, { revision: latest.revision, dirty: true });
+                    record = state.readRecord(s.userId, slot);
                 };
                 /** The mirror image, for a `current` that reports the local payload is GONE (below). Every
                  *  piece of per-user state this client holds for a slot describes one thing — that slot's
@@ -559,7 +585,7 @@ export function createSavesClient(deps) {
                 // row, and so a crash or a failed load still leaves the slot protected.
                 if (options?.localChanged === true && local !== null)
                     noteLocalChanged(local);
-                const loaded = await loadWith(slot, op);
+                const loaded = await loadNotBehindRecord(slot, op);
                 if (loaded.status === "error")
                     return loaded;
                 const cloud = loaded.status === "ok" ? loaded.save : null;
@@ -596,6 +622,13 @@ export function createSavesClient(deps) {
                         s = now;
                         op.s = now;
                     }
+                    // The row was checked against the record when it arrived, but this session lookup was
+                    // one more await: another tab may have confirmed a newer revision inside it. Checked
+                    // again here, before current() and with no await left before the decision, so the table
+                    // is never handed a record ahead of the row (no re-load: that would put an await between
+                    // this check and the decision again).
+                    if (cloud !== null && behindRecord(s.userId, slot, cloud))
+                        return { status: "error", error: staleRowError() };
                     let fresh;
                     let reread = false;
                     try {
@@ -690,6 +723,9 @@ export function createSavesClient(deps) {
                         }
                     }
                 }
+                // The record as stored NOW (no await since the stale-row checks above, so never ahead of
+                // `cloud`), not the one captured before the GET.
+                record = state.readRecord(s.userId, slot);
                 const decision = decideReconcile({ signedIn: true, cloud, local, record, owner: state.readOwner(slot), userId: s.userId });
                 const asReconcile = (result) => result.status === "stored" ? { status: "stored", revision: result.revision } : result;
                 const upload = async () => {
@@ -736,12 +772,24 @@ export function createSavesClient(deps) {
                     case "conflict_prompt": {
                         // The table already decided a prompt is due: never send first (a send on the cloud
                         // revision would silently win). Ask, then act on the answer.
-                        const current = cloud;
+                        let current = cloud;
                         state.writeRecord(s.userId, slot, { revision: state.readRecord(s.userId, slot)?.revision ?? 0, dirty: true });
                         const answer = await prompt.ask(CONFLICT_COPY);
                         if (disposed)
                             return { status: "error", error: disposedError() };
                         if (answer === "primary") {
+                            // The prompt may have been open for a long time, and another tab may have confirmed
+                            // a newer revision meanwhile: "Use cloud" then means the cloud as it is NOW. Same
+                            // rule as the load above — re-load, and never hand back a row older than the record
+                            // (on a still-stale answer the record stays dirty and nothing is discarded).
+                            if (behindRecord(s.userId, slot, current)) {
+                                const reloaded = await loadNotBehindRecord(slot, op);
+                                if (reloaded.status === "error")
+                                    return reloaded;
+                                if (reloaded.status !== "ok")
+                                    return { status: "error", error: { code: "http", status: 404, message: "cloud row vanished" } };
+                                current = reloaded.save;
+                            }
                             // claim: true — the player answered the ownership question just now, in this chain:
                             // this device's local save becomes this user's cloud row.
                             confirmed(slot, s, current.revision, { claim: true });
