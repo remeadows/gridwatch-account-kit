@@ -100,7 +100,13 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
   const debounceMs = deps.debounceMs ?? 750;
   const windowRef = deps.windowRef === undefined ? (typeof window === "undefined" ? null : window) : deps.windowRef;
 
-  const lastPayload = new Map<string, SavePayload>();
+  // Each remembered payload carries the revision it was built on (fix round 2, I2): the base of the
+  // send that failed, or the record revision when it was committed / seen to move. A background
+  // re-flush sends on THAT base, never on whatever the shared record has reached since — another
+  // tab may have confirmed a newer revision in between, and sending on it would land with no 409
+  // over that tab's row. On the old base the server answers 409 and the slot just stays dirty.
+  type Remembered = { payload: SavePayload; base: number };
+  const lastPayload = new Map<string, Remembered>();
   // Bumped every time the player DISCARDS this user's local copy of a slot ("Use cloud" at either
   // prompt, the table's outright use_cloud, or "Start fresh"). Any store/re-flush that was already
   // queued for that user+slot captured the older epoch and is dropped instead of sent: forgetting
@@ -412,9 +418,22 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     let conflictRounds = 0;
     for (;;) {
       const outcome = await sendOnce(slot, payload, base, op);
-      if (outcome.kind === "stored") { confirmed(slot, op.s, outcome.revision, { claim }); return { status: "stored", revision: outcome.revision, updatedAt: outcome.updatedAt }; }
+      if (outcome.kind === "stored") {
+        confirmed(slot, op.s, outcome.revision, { claim });
+        // The remembered payload IS the cloud row at this revision now: anything built on top of
+        // it is built on this revision, not on the base it went out on.
+        const remembered = lastPayload.get(payloadKey(op.s.userId, slot));
+        if (remembered !== undefined && remembered.payload === payload) remembered.base = outcome.revision;
+        return { status: "stored", revision: outcome.revision, updatedAt: outcome.updatedAt };
+      }
       if (outcome.kind === "error") {
-        if (outcome.dirty) state.writeRecord(op.s.userId, slot, { revision: state.readRecord(op.s.userId, slot)?.revision ?? 0, dirty: true });
+        if (outcome.dirty) {
+          state.writeRecord(op.s.userId, slot, { revision: state.readRecord(op.s.userId, slot)?.revision ?? 0, dirty: true });
+          // The payload that failed is the one a re-flush will send: remember the base it just
+          // went out on (after a conflict round, the cloud revision the player chose to overwrite).
+          const remembered = lastPayload.get(payloadKey(op.s.userId, slot));
+          if (remembered !== undefined && remembered.payload === payload) remembered.base = base;
+        }
         return { status: "error", error: outcome.error };
       }
       state.writeRecord(op.s.userId, slot, { revision: state.readRecord(op.s.userId, slot)?.revision ?? 0, dirty: true });
@@ -497,8 +516,8 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     if (forUser === null && slotGen !== slotGenOf(slot)) return discardedStore();
     // store() can't know the signed-in user synchronously, so the payload is remembered here,
     // once the session is known, rather than at the top of store() (see payloadKey above).
-    lastPayload.set(payloadKey(s.userId, slot), payload);
     const base = state.readRecord(s.userId, slot)?.revision ?? 0;
+    lastPayload.set(payloadKey(s.userId, slot), { payload, base });
     // claim: false — a store is not an ownership decision. This flush made no owner check at all,
     // and its send can outlast an account switch in another tab, so it may only claim a slot that
     // is unset or already this user's (see confirmed()).
@@ -618,6 +637,15 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
         // never built on — a PUT that lands with no 409 over the other tab's row (fix round 2, C2).
         const capturedBefore = record;
         let localMoved = false;
+        /** The base this tab's remembered (unsynced) payload was built on, while the stored record is
+         *  dirty; otherwise no bound. The shared record can be dirty at a revision another tab
+         *  confirmed AFTER that payload was built (a lower dirty write keeps the stored revision), so
+         *  alone it would let the table answer restore_dirty and PUT this tab's local on a base it
+         *  was never built on. With it, the next reconcile after a background 409 prompts (I2). */
+        const inheritedBase = (): number => {
+          const remembered = lastPayload.get(payloadKey(s.userId, slot));
+          return remembered !== undefined && state.readRecord(s.userId, slot)?.dirty ? remembered.base : Number.MAX_SAFE_INTEGER;
+        };
         /** Everything the `localChanged` hint does, in one place, because `current` (below) has to
          *  do exactly the same thing when its re-read comes back different — the whole point of
          *  that option is that a moved local payload is indistinguishable from a caller-hinted one.
@@ -641,7 +669,12 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
          *  someone else's. */
         const noteLocalChanged = (payload: SavePayload): void => {
           const owner = state.readOwner(slot);
-          if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), payload);
+          // Remembered with the revision it was built on: the lower of the record before the GET and
+          // the record now (a server-regression reset can only lower it), 0 for a never-synced slot.
+          // An earlier payload this tab still has unsynced (record dirty) was built on its own base,
+          // and this one was built on top of it, so that base bounds it too.
+          const builtOn = Math.min(capturedBefore?.revision ?? 0, state.readRecord(s.userId, slot)?.revision ?? 0, inheritedBase());
+          if (owner === null || owner === s.userId) lastPayload.set(payloadKey(s.userId, slot), { payload, base: builtOn });
           // The dirty flag itself is only forced on a CLEAN record, and is safe regardless of the
           // owner: decideReconcile raises ownership_prompt on ownedByOther whether or not the
           // record is dirty, so marking it cannot turn a prompt into a silent upload.
@@ -839,6 +872,8 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
             revision: Math.min(capturedBefore.revision, stored.revision, cloud?.revision ?? Number.MAX_SAFE_INTEGER),
             dirty: true,
           };
+        } else if (stored !== null && local !== null && inheritedBase() < stored.revision) {
+          record = { revision: Math.min(inheritedBase(), cloud?.revision ?? Number.MAX_SAFE_INTEGER), dirty: true };
         } else {
           record = stored;
         }
@@ -977,7 +1012,6 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       // instead of trusting the state from when reflushDirty() first queued us — otherwise this
       // still uploads the stale in-memory `payload` on top of the just-confirmed revision.
       if (!state.readRecord(s.userId, slot)?.dirty) return;
-      const base = state.readRecord(s.userId, slot)?.revision ?? 0;
       // A copy of what is actually sent: `payload` is the object the game handed store()/reconcile(),
       // which it may mutate while this request is in flight. onBackgroundStored must describe what
       // the cloud now holds, or a game comparing it to its current save could clear an "unsynced"
@@ -988,9 +1022,14 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       // and then failed to send it, leaving the record dirty. Sending the captured one would land
       // stale content on the confirmed revision and mark the slot clean over the latest save.
       // Nothing remembered any more means it was disowned or sent: there is nothing to do.
+      //
+      // Sent on the base it was built on (I2), not the record's current revision: if another tab
+      // confirmed a newer revision meanwhile, that is a 409 below, and the slot stays dirty for the
+      // next foreground call to resolve.
       const latest = lastPayload.get(payloadKey(s.userId, slot));
       if (latest === undefined) return;
-      const sent = JSON.parse(JSON.stringify(latest)) as SavePayload;
+      const base = latest.base;
+      const sent = JSON.parse(JSON.stringify(latest.payload)) as SavePayload;
       // The operation starts here, after every guard above: a background re-flush gets the same
       // one-shot 401 recovery as a foreground send, and since recovery never prompts, this path's
       // "never prompt the player" promise is unaffected.
@@ -1002,6 +1041,7 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
       // truthful; re-asserting the ownership would silently overwrite that newer claim.
       if (outcome.kind === "stored") {
         confirmed(slot, s, outcome.revision, { claim: false });
+        if (lastPayload.get(payloadKey(s.userId, slot)) === latest) latest.base = outcome.revision; // see sendWithConflicts
         // After confirmed(), never before: the callback tells the game its payload IS the cloud
         // row now, so the kit's own record must already say so. Contained, because a game's
         // marker bookkeeping throwing must not turn a successful re-flush into the warning
@@ -1111,8 +1151,8 @@ export function createSavesClient(deps: SavesClientDeps): SavesClient {
     // success would overwrite the newer claim and leave the kit trusting the OTHER account's
     // progress as this user's the next time they come back to this device. See confirmed().
     for (const slot of game.slots) {
-      const payload = lastPayload.get(payloadKey(s.userId, slot));
-      if (payload !== undefined && state.readRecord(s.userId, slot)?.dirty) void quietFlush(slot, payload, s.userId, epochOf(s.userId, slot));
+      const remembered = lastPayload.get(payloadKey(s.userId, slot));
+      if (remembered !== undefined && state.readRecord(s.userId, slot)?.dirty) void quietFlush(slot, remembered.payload, s.userId, epochOf(s.userId, slot));
     }
   }
   const onOnline = () => { void reflushDirty(); };

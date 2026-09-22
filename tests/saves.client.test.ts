@@ -2691,6 +2691,91 @@ describe("a cloud row that went backwards on the server is decided on with no sy
   });
 });
 
+// Fix round 2 (I2): a remembered payload carries the base it was built on, and a background
+// re-flush sends on THAT base, not on whatever revision the shared record has reached since. If
+// another tab confirmed newer meanwhile, the server answers 409 and the slot simply stays dirty.
+describe("a remembered payload is re-flushed on the base it was built on", () => {
+  const conflictAt = (revision: number) => ok(409, { error: "conflict", cloud: { revision, updatedAt: "t", summary: { schemaVersion: 1, sizeBytes: 2, payloadDigest: "ab", deviceId: null } } });
+
+  it("P3: tab 1's failed send (built on 3) is re-flushed on base 3, gets a 409, and tab 2's revision 7 stays intact", async () => {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    let put!: (r: TransportResult) => void;
+    t1.store.mockImplementationOnce(() => new Promise((r) => { put = r; }));
+    const p = t1.client.store("campaign", { ...campaign, coins: 42 });
+    await flush();
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3 });
+    t2.store.mockResolvedValueOnce(ok(200, { revision: 7, updatedAt: "t7" }));
+    await t2.client.store("campaign", { ...campaign, coins: 70 });
+    t1.store.mockResolvedValue({ kind: "network", message: "offline" });
+    put({ kind: "network", message: "offline" });
+    await p;
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    // The fake server is at 7: only a PUT on base 7 would land.
+    t1.store.mockReset();
+    t1.store.mockImplementation(async (_slot, body) => (body.baseRevision === 7 ? ok(200, { revision: 8, updatedAt: "t8" }) : conflictAt(7)));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).toHaveBeenCalledTimes(1);
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3, payload: { coins: 42 } });
+    expect(t1.asked).toEqual([]); // background: never prompts
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true }); // left dirty, not auto-resolved
+
+    // "Leave the record dirty so the next reconcile prompts": the stored record is dirty AT 7 (the
+    // cloud revision), which alone the table would answer restore_dirty — a PUT on 7 over tab 2's
+    // row. This tab still remembers that its payload was built on 3, so the decision uses 3.
+    t1.load.mockResolvedValue(ok(200, row(7, { ...campaign, coins: 70 })));
+    t1.answers.push("primary"); // "Use cloud"
+    expect(await t1.client.reconcile("campaign", { ...campaign, coins: 42 })).toMatchObject({ status: "use_cloud", save: { revision: 7 } });
+    expect(t1.asked).toEqual([CONFLICT_COPY]);
+    expect(t1.store).toHaveBeenCalledTimes(1); // only the background 409, nothing on base 7
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: false });
+  });
+
+  it("the base remembered is that of the failed send: 'Keep this one' on cloud 5 that then fails offline re-flushes on 5", async () => {
+    const h = harness();
+    h.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    h.state.writeOwner("campaign", "u1");
+    const mine = { ...campaign, coins: 42 };
+    h.store.mockResolvedValueOnce(conflictAt(5)).mockResolvedValue({ kind: "network", message: "offline" });
+    h.answers.push("secondary"); // "Keep this one": send on the cloud revision 5
+    expect((await h.client.store("campaign", mine)).status).toBe("error");
+    expect(h.store.mock.calls.at(-1)?.[1]).toMatchObject({ baseRevision: 5, payload: mine });
+    h.store.mockReset();
+    h.store.mockResolvedValueOnce(ok(200, { revision: 6, updatedAt: "t6" }));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(h.store).toHaveBeenCalledTimes(1);
+    expect(h.store.mock.calls[0][1]).toMatchObject({ baseRevision: 5, payload: mine });
+    expect(h.state.readRecord("u1", "campaign")).toEqual({ revision: 6, dirty: false });
+  });
+
+  it("a payload seeded by a hinted reconcile remembers the revision it was built on (3), even after another tab confirmed 7 and left the record dirty", async () => {
+    const backing = sharedStorage();
+    const t1 = tab("u1", "tok1", backing, window);
+    const t2 = tab("u1", "tok1-tab2", backing, null);
+    t1.state.writeRecord("u1", "campaign", { revision: 3, dirty: false });
+    t1.state.writeOwner("campaign", "u1");
+    const mine = { ...campaign, coins: 42 };
+    t1.load.mockResolvedValue({ kind: "network", message: "offline" });
+    expect(await t1.client.reconcile("campaign", mine, { localChanged: true })).toMatchObject({ status: "error", error: { code: "network" } });
+    t2.store.mockResolvedValueOnce(ok(200, { revision: 7, updatedAt: "t7" }));
+    await t2.client.store("campaign", { ...campaign, coins: 70 });
+    t2.store.mockResolvedValue({ kind: "network", message: "offline" });
+    await t2.client.store("campaign", { ...campaign, coins: 71 }); // tab 2's next commit fails: record dirty @7
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+    t1.store.mockImplementation(async (_slot, body) => (body.baseRevision === 7 ? ok(200, { revision: 8, updatedAt: "t8" }) : conflictAt(7)));
+    window.dispatchEvent(new Event("online"));
+    await flush();
+    expect(t1.store).toHaveBeenCalledTimes(1);
+    expect(t1.store.mock.calls[0][1]).toMatchObject({ baseRevision: 3, payload: mine });
+    expect(t1.state.readRecord("u1", "campaign")).toEqual({ revision: 7, dirty: true });
+  });
+});
+
 // Fix round 2 (C1): the second load is judged against the record as it was just BEFORE that load
 // was sent (r0), not as it is when the load returns. Another tab can confirm again while the
 // re-load is in flight: its row is correct as of when it was served, and only a row below r0 (or
