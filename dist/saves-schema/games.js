@@ -1,5 +1,6 @@
 import { findDeniedKey } from "./denylist.js";
 import { BREACH_EXPANSION_V1 } from "./breach.js";
+import { DRIFT_PROGRESS_V1 } from "./drift.js";
 import { validateAgainst } from "./validate.js";
 /** Alias → game. Only games wired to the kit client appear here; Zero keeps its own path (spec §2.3).
  *  Typed sparse (`| undefined`) so every lookup site must guard instead of trusting a plain
@@ -7,6 +8,7 @@ import { validateAgainst } from "./validate.js";
 export const SAVE_GAMES = Object.freeze({
     match: Object.freeze({ slug: "gridwatch-match", slots: Object.freeze(["campaign", "settings"]), schemaVersion: 1 }),
     breach: Object.freeze({ slug: "gridwatch-signal-breach", slots: Object.freeze(["expansion-1-r4"]), schemaVersion: 1 }),
+    drift: Object.freeze({ slug: "grid-drift", slots: Object.freeze(["progress"]), schemaVersion: 1 }),
 });
 export function resolveSaveGame(alias) {
     return Object.hasOwn(SAVE_GAMES, alias) ? (SAVE_GAMES[alias] ?? null) : null;
@@ -53,6 +55,7 @@ export const MATCH_SETTINGS_V1 = {
 export const payloadSchemas = Object.freeze({
     "gridwatch-match": Object.freeze({ 1: Object.freeze({ campaign: MATCH_CAMPAIGN_V1, settings: MATCH_SETTINGS_V1 }) }),
     "gridwatch-signal-breach": Object.freeze({ 1: Object.freeze({ "expansion-1-r4": BREACH_EXPANSION_V1 }) }),
+    "grid-drift": Object.freeze({ 1: Object.freeze({ progress: DRIFT_PROGRESS_V1 }) }),
 });
 /** Schema check, then the recursive key denylist (spec §3.2). Every lookup level is
  *  Object.hasOwn-guarded so a prototype-chain key ("__proto__", "constructor", "toString", ...)

@@ -9,7 +9,7 @@ Add to your `package.json`:
 ```json
 {
   "dependencies": {
-    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.3.0"
+    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.3.1"
   }
 }
 ```
@@ -46,6 +46,13 @@ encode `tick * 1024 + opcode * 64 + y * 8 + x`: opcode 0 is launch (cell zero),
 1 sells, and 2–8 place relay/firewall/turret/scrubber/overclock/latencyTrap/arcIce.
 The game rejects reserved opcodes 9–15, invalid history and hashes. Only r4 is
 registered; original campaign and historical expansion slots stay outside it.
+
+The registry also defines GRID DRIFT's `progress` slot (alias `drift`, game slug `grid-drift`,
+schema version 1; `DRIFT_PROGRESS_V1` in `./saves-schema`): `{ best?, career }`, where `best` is
+`{ score, dist, rows, date }` and `career` is `{ welds, rows, gates, dist, runs }`, all counts
+non-negative safe integers. `best` is omitted until the first run ends. Achievements are not in it
+(Drift syncs those through its own route, which merges devices). As with Breach, deploy a Nexus
+built on this kit version before any Drift client configures `game`.
 
 ```ts
 const kit = createAccountKit({
