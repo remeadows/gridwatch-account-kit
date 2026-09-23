@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
+import { createCarryClient } from "../src/carry/index";
 import { CONFLICT_COPY, OWNERSHIP_COPY, REPLACE_COPY, createDomPromptHost } from "../src/saves/prompt";
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -80,6 +81,29 @@ describe("createDomPromptHost", () => {
     (document.querySelector(".gw-save-prompt__primary") as HTMLButtonElement).click();
     expect(await b).toBe("primary");
     expect(document.querySelector("dialog.gw-save-prompt")).toBeNull();
+  });
+});
+
+describe("createCarryClient.askReplace", () => {
+  const MATCH = { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 };
+  it("shows REPLACE_COPY and resolves true on Replace, false on Keep this site's", async () => {
+    const client = createCarryClient({
+      game: MATCH, nexusOrigin: "https://nexus.warsignallabs.net", returnPath: "/play/match/",
+      prompt: createDomPromptHost(), win: window as never,
+    });
+    const first = client.askReplace();
+    await tick();
+    const dialog = document.querySelector("dialog.gw-save-prompt")!;
+    expect(dialog.querySelector(".gw-save-prompt__text")!.textContent).toBe(REPLACE_COPY.text);
+    expect(dialog.querySelector(".gw-save-prompt__primary")!.textContent).toBe("Replace");
+    expect(dialog.querySelector(".gw-save-prompt__secondary")!.textContent).toBe("Keep this site's");
+    (dialog.querySelector(".gw-save-prompt__primary") as HTMLButtonElement).click();
+    expect(await first).toBe(true);
+
+    const second = client.askReplace();
+    await tick();
+    (document.querySelector(".gw-save-prompt__secondary") as HTMLButtonElement).click();
+    expect(await second).toBe(false);
   });
 });
 

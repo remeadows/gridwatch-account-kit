@@ -351,3 +351,15 @@ describe("a saves session the server rejects", () => {
     kit.saves!.dispose();
   });
 });
+
+describe("kit.carry (spec §6)", () => {
+  const MATCH = { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 };
+  it("is present with a game and absent without one", () => {
+    expect(createAccountKit({ returnPath: "/play/match/", game: MATCH }).carry).toBeDefined();
+    expect(createAccountKit({ returnPath: "/" }).carry).toBeUndefined();
+  });
+  it("refuses a carryFrom list that is not exact https (or loopback http) at creation", () => {
+    expect(() => createAccountKit({ returnPath: "/play/match/", game: { ...MATCH, carryFrom: ["http://gridwatchmatchweb.warsignallabs.net"] } })).toThrow(/carryFrom/);
+    expect(() => createAccountKit({ returnPath: "/play/match/", game: { ...MATCH, carryFrom: ["https://gridwatchmatchweb.warsignallabs.net"] } })).not.toThrow();
+  });
+});

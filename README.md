@@ -9,7 +9,7 @@ Add to your `package.json`:
 ```json
 {
   "dependencies": {
-    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.2.6"
+    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.3.0"
   }
 }
 ```
@@ -143,13 +143,66 @@ by design: a change made while a *prompt* is open — the player's explicit answ
 
 Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SPA): it removes the `online`/`visibilitychange` listeners, closes any prompt dialog that's on screen, settles calls still waiting on the debounce timer or on a prompt immediately, and marks the client disposed so a call that is mid-request settles with `{ status: "error", error: { code: "http", message: "disposed" } }` as soon as its current transport attempt returns (the deadline below bounds that wait); no state is written after `dispose()`.
 
+### Carry-over from an old hostname (since v0.3.0)
+
+Spec §6.2: an old game hostname hands its local save to Nexus through a three-message
+`ready` → `offer` → `result` protocol carried over `postMessage` between the old tab and a Nexus
+tab it opens.
+
+`kit.carry` is `undefined` without `game`, the same as `kit.saves`. Set `game.carryFrom` to the
+exact old-hostname origins allowed to hand off to this game; `createAccountKit` validates it and
+throws synchronously if any entry is not an exact `https://` origin (the one exception is a
+loopback `http://localhost:<port>` or `http://127.0.0.1:<port>` origin, for local two-origin e2e
+only) — a typo'd or wildcard entry fails fast at construction rather than silently rejecting every
+hand-off at runtime.
+
+```ts
+// Old hostname, in a click handler:
+const result = await kit.carry!.send({ campaign: localCampaign });
+// "accepted" | "declined" | "rejected" | "blocked" | "closed" | "timeout"
+
+// Nexus, on load:
+const result = await kit.carry!.receive(async (offer) => {
+  return (await kit.carry!.askReplace()) ? "accepted" : "declined";
+});
+// "none" | "accepted" | "declined" | "rejected"
+```
+
+`carry.send(slots)` must be called **synchronously** inside the click handler, before any `await`
+— it calls `window.open` to open the Nexus tab, and a popup blocker refuses a tab opened from
+inside a promise callback. It resolves `"blocked"` when that happens. Otherwise it resolves once
+the far side settles: `"accepted"`/`"declined"` is the player's answer at the replace prompt on
+Nexus, `"rejected"` is a failed validation (wrong game, wrong schema, bad payload), `"closed"` is
+the Nexus tab going away before answering, and `"timeout"` is no `ready` within the 20 s ceiling.
+
+`carry.receive(handler)` resolves `"none"` at once unless this tab was opened by a hand-off (the
+`#gw-carry` URL fragment, which the receiver strips with `history.replaceState` before anything
+else) — call it unconditionally on every Nexus load. It also resolves `"none"` if no valid offer
+arrives within the 20 s offer ceiling; there is no time limit on `handler` itself, since the player
+may be sitting at the replace prompt. `handler` receives the validated offer and must resolve
+`"accepted"` or `"declined"`; `kit.carry.askReplace()` shows the spec §6.2 replace prompt ("Replace
+the progress on this site with your progress from the old site?") through the same prompt queue as
+the saves conflict/ownership dialogs, so only one dialog is ever on screen. The old origin's save
+is never modified or deleted by a hand-off, whatever the player answers.
+
+**COOP.** The old hostname and Nexus each open a `window.open` tab to the other and rely on
+`window.opener` / `event.source` to authenticate the reply; a `Cross-Origin-Opener-Policy:
+same-origin` response header on either origin severs that reference and the hand-off times out
+silently. Both origins must serve pages that participate in the hand-off without a same-origin (or
+same-origin-allow-popups-restricting) COOP header.
+
+**iOS Home Screen.** A game launched from an iOS Home Screen icon (standalone display mode) opens
+`window.open` in a way that does not preserve the opener relationship Safari itself uses, so a
+hand-off started from a Home Screen launch always ends in `"timeout"`. Tell the player to open the
+page in Safari (not the Home Screen icon) and try again.
+
 ### Runtime requirements
 
 `kit.saves` needs `crypto.getRandomValues`, `fetch`, `AbortController`, `localStorage` (falls back to an in-memory store when unavailable, e.g. private mode), and `<dialog>` (falls back to a plain `open` attribute when `HTMLDialogElement.showModal` isn't supported). Each transport *attempt* is bounded by a 15 s deadline (a store that retries three times against a dead network can take about 47 s to resolve), and each request body is capped at 64 KB — a `store`/`reconcile` payload that would exceed it locally resolves `{ status: "error", error: { code: "invalid_payload", ... } }` without ever reaching the network.
 
 ## Exports
 
-- **`.`** — Core utilities: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `PLAY_ALIASES`, `NEXUS_ORIGIN`, `HANDLE_RE`, `validateHandle`, `validateReturnPath`, `signInUrl`, `createAccountKit`, `mountAccountHeader`, plus the full saves client surface: `createSavesClient`, `CONFLICT_COPY`, `OWNERSHIP_COPY`, `createDomPromptHost`, `createSaveStateStore`, `createTransport`, `withRetry`, `decideReconcile`, and their types (`SaveGameConfig`, `SavesClient`, `LoadResult`, `StoreResult`, `ReconcileResult`, `ReconcileOptions`, `CloudSave`, `SaveError`, `PromptHost`, `PromptCopy`, `PromptAnswer`, `SaveStateStore`, `SyncRecord`, `Transport`, `TransportResult`, `ReconcileDecision`, `ReconcileInputs`) — enough to assemble a `SavesClient` yourself with a custom transport or prompt host, not just through `createAccountKit`.
+- **`.`** — Core utilities: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `PLAY_ALIASES`, `NEXUS_ORIGIN`, `HANDLE_RE`, `validateHandle`, `validateReturnPath`, `signInUrl`, `createAccountKit`, `mountAccountHeader`, plus the full saves client surface: `createSavesClient`, `CONFLICT_COPY`, `OWNERSHIP_COPY`, `REPLACE_COPY`, `createDomPromptHost`, `createSaveStateStore`, `createTransport`, `withRetry`, `decideReconcile`, and their types (`SaveGameConfig`, `SavesClient`, `LoadResult`, `StoreResult`, `ReconcileResult`, `ReconcileOptions`, `CloudSave`, `SaveError`, `PromptHost`, `PromptCopy`, `PromptAnswer`, `SaveStateStore`, `SyncRecord`, `Transport`, `TransportResult`, `ReconcileDecision`, `ReconcileInputs`) — enough to assemble a `SavesClient` yourself with a custom transport or prompt host, not just through `createAccountKit`. Since v0.3.0, also the carry-over surface (spec §6.2): `createCarryClient`, `CARRY_HASH`, and their types `CarryClient`, `SendResult`, `ReceiveResult`, `CarryOffer`, `CarryHandler` — `kit.carry` assembles this for you from `game`, same as `kit.saves`.
 - **`./react`** — the `useAccount(kit)` React hook (same shape as the apps' former `useAuth`).
 - **`./saves-schema`** — the `/api/saves` wire contract shared by the Nexus worker and the kit client: `SAVE_GAMES`, `resolveSaveGame`, `payloadSchemas`, `validatePayload`, `validateAgainst`, `findDeniedKey`, `DENYLIST`, `canonicalJson`, `hasLoneSurrogate`, `requestHash`, `sha256Hex`, `MAX_BODY_BYTES`, `UUID_RE`, `SLOT_RE`, `ALIAS_RE`, and the wire types. DOM-free, dependency-free.
 
