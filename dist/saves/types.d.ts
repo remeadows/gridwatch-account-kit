@@ -78,5 +78,7 @@ export interface SavesClient {
     load(slot: string): Promise<LoadResult>;
     store(slot: string, payload: SavePayload): Promise<StoreResult>;
     reconcile(slot: string, localPayload: SavePayload | null, options?: ReconcileOptions): Promise<ReconcileResult>;
+    /** Tears the client down. Through createAccountKit the prompt host is shared with kit.carry, so
+     *  this also closes an open carry replace prompt: its askReplace() then answers false. */
     dispose(): void;
 }
