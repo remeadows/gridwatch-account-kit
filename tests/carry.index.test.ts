@@ -76,6 +76,20 @@ describe("createCarryClient with a bad nexusOrigin", () => {
   });
 });
 
+// Bot round 1 (Codex P2 / CodeRabbit Minor): a parseable non-web nexusOrigin gives an opaque
+// ("null") or non-http origin; send must refuse it rather than open that URL and pin event.origin to it.
+describe("createCarryClient with a non-web nexusOrigin", () => {
+  it("does not throw at construction; send throws the prefixed error and opens no tab", () => {
+    for (const bad of ["javascript:alert(1)", "data:text/html,hi", "file:///x", "mailto:a@b.example"]) {
+      const h = harness();
+      let client: ReturnType<typeof createCarryClient> | undefined;
+      expect(() => { client = createCarryClient({ game: GAME, nexusOrigin: bad, returnPath: "/play/match/", prompt: createDomPromptHost(), win: h.win }); }).not.toThrow();
+      expect(() => client!.send({ settings: SETTINGS }), bad).toThrow(/^\[account-kit\] carry: invalid nexusOrigin/);
+      expect(h.calls, bad).toEqual([]);
+    }
+  });
+});
+
 // Final review item 4: receive() is idempotent. A second call (React StrictMode, HMR) gets the
 // first call's promise and never a second listener, so the cloud gate cannot start on an early
 // "none" while the first handler is still applying the save (spec §6.4).

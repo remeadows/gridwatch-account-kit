@@ -42,12 +42,14 @@ export function createCarryClient(deps: CarryClientDeps): CarryClient {
   let target: { nexusOrigin: string; returnPath: string } | undefined;
   const resolveTarget = () => {
     if (!target) {
-      let nexusOrigin: string;
-      try {
-        nexusOrigin = new URL(deps.nexusOrigin).origin;
-      } catch {
+      // Only a web origin: `javascript:`, `data:`, `file:`, `mailto:` … parse fine but give an
+      // opaque ("null") or non-http origin that send would open and pin event.origin against.
+      let url: URL | undefined;
+      try { url = new URL(deps.nexusOrigin); } catch { url = undefined; }
+      if (!url || (url.protocol !== "http:" && url.protocol !== "https:") || url.origin === "null") {
         throw new TypeError(`[account-kit] carry: invalid nexusOrigin "${deps.nexusOrigin}"`);
       }
+      const nexusOrigin = url.origin;
       target = { nexusOrigin, returnPath: validateReturnPath(deps.returnPath, nexusOrigin) };
     }
     return target;
