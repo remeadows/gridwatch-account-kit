@@ -4,6 +4,9 @@ export interface SaveGameConfig {
     routeAlias: string;
     slots: readonly string[];
     schemaVersion: number;
+    /** Spec §6: exact https origins (or a loopback http origin, for local e2e only) allowed to hand
+     *  this game's local save to Nexus. Checked by createAccountKit. */
+    carryFrom?: readonly string[];
 }
 export interface CloudSave {
     revision: number;

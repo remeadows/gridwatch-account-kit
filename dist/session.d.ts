@@ -1,4 +1,5 @@
 import type { Session } from "@supabase/supabase-js";
+import { type CarryClient } from "./carry/index.js";
 import { type SavesClientDeps } from "./saves/client.js";
 import type { SaveGameConfig, SavesClient } from "./saves/types.js";
 export type Provider = "google" | "github";
@@ -25,6 +26,7 @@ export interface AccountKit {
         nexusOrigin: string;
     }>;
     readonly saves: SavesClient | undefined;
+    readonly carry: CarryClient | undefined;
     getSession(): Promise<Session | null>;
     onChange(callback: (session: Session | null) => void): () => void;
     signInWithEmail(email: string, options?: SignInOptions): Promise<string | null>;
