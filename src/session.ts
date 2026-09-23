@@ -1,6 +1,8 @@
 import type { Session } from "@supabase/supabase-js";
 import { getSupabase } from "./client.js";
 import { NEXUS_ORIGIN } from "./config.js";
+import { assertCarryOrigins } from "./carry/protocol.js";
+import { createCarryClient, type CarryClient } from "./carry/index.js";
 import { validateHandle } from "./handle.js";
 import { signInUrl } from "./returnPath.js";
 import { payloadSchemas, resolveSaveGame } from "./saves-schema/games.js";
@@ -32,6 +34,7 @@ function assertGameConfig(game: SaveGameConfig): void {
   for (const slot of game.slots) {
     if (!slotSchemas || !Object.hasOwn(slotSchemas, slot)) throw gameConfigMismatch(`no schema registered for slot "${slot}"`);
   }
+  if (game.carryFrom) assertCarryOrigins(game.carryFrom);
 }
 
 export type Provider = "google" | "github";
@@ -57,6 +60,7 @@ function hasCode(e: unknown): e is { code: string } {
 export interface AccountKit {
   readonly config: Readonly<{ returnPath: string; nexusOrigin: string }>;
   readonly saves: SavesClient | undefined;
+  readonly carry: CarryClient | undefined;
   getSession(): Promise<Session | null>;
   onChange(callback: (session: Session | null) => void): () => void;
   signInWithEmail(email: string, options?: SignInOptions): Promise<string | null>;
@@ -162,22 +166,29 @@ export function createAccountKit(input: AccountKitConfig): AccountKit {
   }
 
   if (input.game) assertGameConfig(input.game);
+  // One prompt host shared by saves (conflict/ownership) and carry (replace): both queue through
+  // it, so only one dialog is ever on screen at a time.
+  const promptHost = createDomPromptHost();
   const saves: SavesClient | undefined = input.game
     ? createSavesClient({
         game: input.game,
         getSession: async () => { const s = await getSession(); return s ? { access_token: s.access_token, user: { id: s.user.id } } : null; },
         state: createSaveStateStore(input.game.gameSlug),
         transport: createTransport(`${config.nexusOrigin.replace(/\/+$/, "")}/api/saves/${input.game.routeAlias}`),
-        prompt: createDomPromptHost(),
+        prompt: promptHost,
         onBackgroundStored: input.onBackgroundStored,
         refreshSession,
         onSessionRejected: (userId) => { void endLocalSession(userId); },
       })
     : undefined;
+  const carry: CarryClient | undefined = input.game
+    ? createCarryClient({ game: input.game, nexusOrigin: config.nexusOrigin, returnPath: config.returnPath, prompt: promptHost })
+    : undefined;
 
   return {
     config,
     saves,
+    carry,
     getSession,
     onChange(callback) {
       const { data } = getSupabase().auth.onAuthStateChange((_event, session) => callback(session));

@@ -1,5 +1,7 @@
 import { getSupabase } from "./client.js";
 import { NEXUS_ORIGIN } from "./config.js";
+import { assertCarryOrigins } from "./carry/protocol.js";
+import { createCarryClient } from "./carry/index.js";
 import { validateHandle } from "./handle.js";
 import { signInUrl } from "./returnPath.js";
 import { payloadSchemas, resolveSaveGame } from "./saves-schema/games.js";
@@ -35,6 +37,8 @@ function assertGameConfig(game) {
         if (!slotSchemas || !Object.hasOwn(slotSchemas, slot))
             throw gameConfigMismatch(`no schema registered for slot "${slot}"`);
     }
+    if (game.carryFrom)
+        assertCarryOrigins(game.carryFrom);
 }
 /** True when `e` carries a string `code` field (e.g. a PostgrestError), narrowing its type. */
 function hasCode(e) {
@@ -135,21 +139,28 @@ export function createAccountKit(input) {
     }
     if (input.game)
         assertGameConfig(input.game);
+    // One prompt host shared by saves (conflict/ownership) and carry (replace): both queue through
+    // it, so only one dialog is ever on screen at a time.
+    const promptHost = createDomPromptHost();
     const saves = input.game
         ? createSavesClient({
             game: input.game,
             getSession: async () => { const s = await getSession(); return s ? { access_token: s.access_token, user: { id: s.user.id } } : null; },
             state: createSaveStateStore(input.game.gameSlug),
             transport: createTransport(`${config.nexusOrigin.replace(/\/+$/, "")}/api/saves/${input.game.routeAlias}`),
-            prompt: createDomPromptHost(),
+            prompt: promptHost,
             onBackgroundStored: input.onBackgroundStored,
             refreshSession,
             onSessionRejected: (userId) => { void endLocalSession(userId); },
         })
         : undefined;
+    const carry = input.game
+        ? createCarryClient({ game: input.game, nexusOrigin: config.nexusOrigin, returnPath: config.returnPath, prompt: promptHost })
+        : undefined;
     return {
         config,
         saves,
+        carry,
         getSession,
         onChange(callback) {
             const { data } = getSupabase().auth.onAuthStateChange((_event, session) => callback(session));

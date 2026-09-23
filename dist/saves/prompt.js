@@ -8,6 +8,11 @@ export const OWNERSHIP_COPY = Object.freeze({
     primary: "Upload",
     secondary: "Start fresh",
 });
+export const REPLACE_COPY = Object.freeze({
+    text: "Replace the progress on this site with your progress from the old site?",
+    primary: "Replace",
+    secondary: "Keep this site's",
+});
 function button(doc, className, label) {
     const node = doc.createElement("button");
     node.type = "button";

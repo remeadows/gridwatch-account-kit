@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { CONFLICT_COPY, OWNERSHIP_COPY, createDomPromptHost } from "../src/saves/prompt";
+import { createCarryClient } from "../src/carry/index";
+import { CONFLICT_COPY, OWNERSHIP_COPY, REPLACE_COPY, createDomPromptHost } from "../src/saves/prompt";
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 afterEach(() => { document.body.innerHTML = ""; });
@@ -9,6 +10,9 @@ describe("prompt copy", () => {
   it("is the spec copy verbatim", () => {
     expect(CONFLICT_COPY).toEqual({ text: "Newer save in the cloud from another device. Use cloud or keep this one?", primary: "Use cloud", secondary: "Keep this one" });
     expect(OWNERSHIP_COPY).toEqual({ text: "This device has progress from another account. Upload it to this account, or start fresh?", primary: "Upload", secondary: "Start fresh" });
+  });
+  it("has the carry replace copy verbatim (spec §6.2)", () => {
+    expect(REPLACE_COPY).toEqual({ text: "Replace the progress on this site with your progress from the old site?", primary: "Replace", secondary: "Keep this site's" });
   });
 });
 
@@ -77,6 +81,29 @@ describe("createDomPromptHost", () => {
     (document.querySelector(".gw-save-prompt__primary") as HTMLButtonElement).click();
     expect(await b).toBe("primary");
     expect(document.querySelector("dialog.gw-save-prompt")).toBeNull();
+  });
+});
+
+describe("createCarryClient.askReplace", () => {
+  const MATCH = { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 };
+  it("shows REPLACE_COPY and resolves true on Replace, false on Keep this site's", async () => {
+    const client = createCarryClient({
+      game: MATCH, nexusOrigin: "https://nexus.warsignallabs.net", returnPath: "/play/match/",
+      prompt: createDomPromptHost(), win: window as never,
+    });
+    const first = client.askReplace();
+    await tick();
+    const dialog = document.querySelector("dialog.gw-save-prompt")!;
+    expect(dialog.querySelector(".gw-save-prompt__text")!.textContent).toBe(REPLACE_COPY.text);
+    expect(dialog.querySelector(".gw-save-prompt__primary")!.textContent).toBe("Replace");
+    expect(dialog.querySelector(".gw-save-prompt__secondary")!.textContent).toBe("Keep this site's");
+    (dialog.querySelector(".gw-save-prompt__primary") as HTMLButtonElement).click();
+    expect(await first).toBe(true);
+
+    const second = client.askReplace();
+    await tick();
+    (document.querySelector(".gw-save-prompt__secondary") as HTMLButtonElement).click();
+    expect(await second).toBe(false);
   });
 });
 

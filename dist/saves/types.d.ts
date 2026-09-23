@@ -4,6 +4,9 @@ export interface SaveGameConfig {
     routeAlias: string;
     slots: readonly string[];
     schemaVersion: number;
+    /** Spec §6: exact https origins (or a loopback http origin, for local e2e only) allowed to hand
+     *  this game's local save to Nexus. Checked by createAccountKit. */
+    carryFrom?: readonly string[];
 }
 export interface CloudSave {
     revision: number;
@@ -75,5 +78,7 @@ export interface SavesClient {
     load(slot: string): Promise<LoadResult>;
     store(slot: string, payload: SavePayload): Promise<StoreResult>;
     reconcile(slot: string, localPayload: SavePayload | null, options?: ReconcileOptions): Promise<ReconcileResult>;
+    /** Tears the client down. Through createAccountKit the prompt host is shared with kit.carry, so
+     *  this also closes an open carry replace prompt: its askReplace() then answers false. */
     dispose(): void;
 }
