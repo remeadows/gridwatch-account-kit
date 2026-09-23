@@ -204,6 +204,13 @@ describe("createAccountKit", () => {
     expect(() => createAccountKit({ returnPath: "/play/match/", game: { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 } })).not.toThrow();
   });
 
+  // Final review item 3: v0.2.6 tolerated nexusOrigin "" (an unset env var); v0.3.0 must not start
+  // throwing an unprefixed TypeError at construction just because `game` now also builds kit.carry.
+  it("does not throw at construction with game and an empty nexusOrigin", () => {
+    fakeSupabase(null);
+    expect(() => createAccountKit({ returnPath: "/play/match/", nexusOrigin: "", game: { gameSlug: "gridwatch-match", routeAlias: "match", slots: ["campaign", "settings"], schemaVersion: 1 } })).not.toThrow();
+  });
+
   it("strips a trailing slash from nexusOrigin before building the saves transport base URL", async () => {
     fakeSupabase(user);
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: "no_save" }), { status: 404, headers: { "Content-Type": "application/json" } }));
