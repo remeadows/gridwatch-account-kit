@@ -141,7 +141,7 @@ by design: a change made while a *prompt* is open — the player's explicit answ
 
 **When the session is rejected.** The saves API validates every token with Supabase, so a session that was revoked server-side — signing out elsewhere, an admin action — answers `401` even though this device's cached JWT has not expired yet. On a `401` (a `GET` or a `PUT`) the kit asks Supabase to refresh the session *once* for that operation and, if the refresh returns a session for the same player, retries the request with the new token; you get the retry's result, and nothing else happens. If the refresh cannot help — no session, an error, or a different account — or the retry answers `401` again, the call resolves exactly the `401` error it would have before (the slot stays dirty, so a later re-flush or `store` can still send it), and the kit then ends the session **for this browser only**, so the account bar and `useAccount` fall back to "Sign in" instead of showing a name the server no longer accepts. That local sign-out happens only while the rejected account is still the signed-in one: a rejection that arrives after the player has switched accounts is ignored, not applied to the new one. There is never more than one refresh per operation and never a retry loop. Nothing the kit holds for the slot is cleared by a rejection — not the sync record, not a payload remembered for a background re-flush, not the ownership record — so unsynced progress is still there when the player signs back in.
 
-Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SPA): it removes the `online`/`visibilitychange` listeners, closes any prompt dialog that's on screen, settles calls still waiting on the debounce timer or on a prompt immediately, and marks the client disposed so a call that is mid-request settles with `{ status: "error", error: { code: "http", message: "disposed" } }` as soon as its current transport attempt returns (the deadline below bounds that wait); no state is written after `dispose()`.
+Call `kit.saves?.dispose()` when tearing the game down (e.g. on unmount in an SPA): it removes the `online`/`visibilitychange` listeners, closes any prompt dialog that's on screen, settles calls still waiting on the debounce timer or on a prompt immediately, and marks the client disposed so a call that is mid-request settles with `{ status: "error", error: { code: "http", message: "disposed" } }` as soon as its current transport attempt returns (the deadline below bounds that wait); no state is written after `dispose()`. Since v0.3.0 `createAccountKit` shares that prompt host with `kit.carry`, so `dispose()` also closes an open carry replace prompt, and its `askReplace()` answers `false`.
 
 ### Carry-over from an old hostname (since v0.3.0)
 
@@ -161,9 +161,14 @@ hand-off at runtime.
 const result = await kit.carry!.send({ campaign: localCampaign });
 // "accepted" | "declined" | "rejected" | "blocked" | "closed" | "timeout"
 
-// Nexus, on load:
+// Nexus, on mount — once, and before the cloud gate's first reconcile (spec §6.4):
 const result = await kit.carry!.receive(async (offer) => {
-  return (await kit.carry!.askReplace()) ? "accepted" : "declined";
+  // isPristine / applyAndPersist stand in for the game's own code: apply each slot the same way
+  // as a cloud answer, persist, and mark the replaced slots unsynced.
+  const pristine = Object.keys(offer.slots).every((slot) => isPristine(slot));
+  if (!pristine && !(await kit.carry!.askReplace())) return "declined"; // "Keep this site's"
+  applyAndPersist(offer.slots);
+  return "accepted";
 });
 // "none" | "accepted" | "declined" | "rejected"
 ```
@@ -172,29 +177,45 @@ const result = await kit.carry!.receive(async (offer) => {
 — it calls `window.open` to open the Nexus tab, and a popup blocker refuses a tab opened from
 inside a promise callback. It resolves `"blocked"` when that happens. Otherwise it resolves once
 the far side settles: `"accepted"`/`"declined"` is the player's answer at the replace prompt on
-Nexus, `"rejected"` is a failed validation (wrong game, wrong schema, bad payload), `"closed"` is
+Nexus, `"rejected"` is a failed validation (wrong game, wrong schema, bad payload) or a handler
+that failed on Nexus, `"closed"` is
 the Nexus tab going away before answering, and `"timeout"` is no `ready` within the 20 s ceiling.
+It throws synchronously, and opens no tab, when called on the Nexus origin, with no slots, with a
+slot the game does not have or with a payload that fails validation, and when `nexusOrigin` is not
+a valid origin (that last check happens on the first `send`, not in `createAccountKit`). Once the
+Nexus tab has sent `ready`, the sender waits without a time limit; if that tab is reloaded, the new
+page does not replay the hand-off and the sender waits until the tab is closed (`"closed"`). Keep
+**Move my progress** usable while a hand-off is pending, so the player can retry.
 
 `carry.receive(handler)` resolves `"none"` at once unless this tab was opened by a hand-off (the
 `#gw-carry` URL fragment, which the receiver strips with `history.replaceState` before anything
 else) — call it unconditionally on every Nexus load. It also resolves `"none"` if no valid offer
 arrives within the 20 s offer ceiling; there is no time limit on `handler` itself, since the player
 may be sitting at the replace prompt. `handler` receives the validated offer and must resolve
-`"accepted"` or `"declined"`; `kit.carry.askReplace()` shows the spec §6.2 replace prompt ("Replace
-the progress on this site with your progress from the old site?") through the same prompt queue as
-the saves conflict/ownership dialogs, so only one dialog is ever on screen. The old origin's save
-is never modified or deleted by a hand-off, whatever the player answers.
+exactly `"accepted"` or `"declined"`, and must never throw or hang: any other answer (including
+`undefined` from a handler that forgot to `return`) resolves `"rejected"` on both sides, a throw
+does the same (detail `"handler failed"`), and a handler that never settles leaves both `receive`
+and the old tab waiting. Call `receive` once, before the first `reconcile`; a later call (React
+StrictMode, HMR) returns the first call's promise and ignores its handler. `kit.carry.askReplace()`
+shows the spec §6.2 replace prompt ("Replace the progress on this site with your progress from the
+old site?") through the same prompt queue as the saves conflict/ownership dialogs, so only one
+dialog is ever on screen. That prompt host is shared with `kit.saves`, so `kit.saves.dispose()`
+also closes an open replace prompt; `askReplace()` then answers `false` and the handler declines.
+The old origin's save is never modified or deleted by a hand-off, whatever the player answers.
 
-**COOP.** The old hostname and Nexus each open a `window.open` tab to the other and rely on
-`window.opener` / `event.source` to authenticate the reply; a `Cross-Origin-Opener-Policy:
-same-origin` response header on either origin severs that reference and the hand-off times out
-silently. Both origins must serve pages that participate in the hand-off without a same-origin (or
-same-origin-allow-popups-restricting) COOP header.
+**COOP.** Only the old hostname opens a tab: it `window.open`s Nexus, and both sides rely on that
+opener relationship (`window.opener` on Nexus, `event.source` on the old hostname) to authenticate
+each message. A `Cross-Origin-Opener-Policy` header that severs it makes the hand-off end in
+`"closed"` or `"timeout"` (a severed tab usually reads as closed to the opener). On the old
+hostname, the opener, `same-origin` severs it (`same-origin-allow-popups` does not). On the Nexus
+pages that receive the hand-off, the opened tab, any COOP value other than `unsafe-none` severs it,
+so serve them with no COOP header.
 
 **iOS Home Screen.** A game launched from an iOS Home Screen icon (standalone display mode) opens
 `window.open` in a way that does not preserve the opener relationship Safari itself uses, so a
-hand-off started from a Home Screen launch always ends in `"timeout"`. Tell the player to open the
-page in Safari (not the Home Screen icon) and try again.
+hand-off started from a Home Screen launch ends in `"closed"` or `"timeout"` (a severed opener
+usually reads as a closed tab). Tell the player to open the page in Safari (not the Home Screen
+icon) and try again.
 
 ### Runtime requirements
 
