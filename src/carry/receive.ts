@@ -6,6 +6,9 @@ import { CARRY_HASH, OFFER_TIMEOUT_MS, checkOffer, readCarryMessage, type CarryS
 
 export type ReceiveResult = "none" | CarryStatus;
 export interface CarryOffer { slots: Record<string, SavePayload>; exportedAt: string; from: string }
+/** Applies (or declines) a validated offer. It must always settle with "accepted" or "declined":
+ *  any other answer is treated as "rejected", a throw or rejection as "rejected" ("handler
+ *  failed"), and a handler that never settles leaves receive() pending and the sender waiting. */
 export type CarryHandler = (offer: CarryOffer) => Promise<"accepted" | "declined">;
 export interface OpenerWindow { postMessage(message: unknown, targetOrigin: string): void }
 export interface ReceiverWindow {
