@@ -17,7 +17,7 @@ function harness() {
   const win: SenderWindow & ReceiverWindow = {
     location: { origin: OLD, hash: "", href: `${OLD}/play/match/` },
     opener: null,
-    history: { replaceState() {} },
+    history: { state: null, replaceState() {} },
     open(url: string, target: string) { calls.push(`${url} ${target}`); return opened; },
     addEventListener(_type, listener) { listeners.add(listener); },
     removeEventListener(_type, listener) { listeners.delete(listener); },

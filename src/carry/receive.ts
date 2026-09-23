@@ -11,7 +11,7 @@ export interface OpenerWindow { postMessage(message: unknown, targetOrigin: stri
 export interface ReceiverWindow {
   readonly location: { readonly hash: string; readonly href: string };
   readonly opener: OpenerWindow | null;
-  readonly history: { replaceState(data: unknown, unused: string, url?: string): void };
+  readonly history: { readonly state: unknown; replaceState(data: unknown, unused: string, url?: string): void };
   addEventListener(type: "message", listener: (event: MessageEvent) => void): void;
   removeEventListener(type: "message", listener: (event: MessageEvent) => void): void;
 }
@@ -21,7 +21,8 @@ export function receiveCarry(deps: ReceiverDeps, handler: CarryHandler): Promise
   const { win, game } = deps;
   if (win.location.hash !== CARRY_HASH) return Promise.resolve("none");
   const href = win.location.href;
-  win.history.replaceState(null, "", href.slice(0, href.length - CARRY_HASH.length));
+  // Keep the page's own history.state (a router's, say); only the URL loses the hash.
+  win.history.replaceState(win.history.state, "", href.slice(0, href.length - CARRY_HASH.length));
   const allowed = game.carryFrom ?? [];
   const opener = win.opener;
   if (!opener || allowed.length === 0) return Promise.resolve("none");
@@ -38,26 +39,44 @@ export function receiveCarry(deps: ReceiverDeps, handler: CarryHandler): Promise
       taken = true;
       stop();
       const from = event.origin;
-      const reply = (status: CarryStatus, detail?: string) =>
-        opener!.postMessage({ gw: "carry", v: 1, type: "result", id, status, ...(detail ? { detail } : {}) }, from);
-      const checked = checkOffer(message, game);
-      if (!checked.ok) {
-        console.warn(`[account-kit] carry offer rejected: ${checked.detail}`);
-        reply("rejected", checked.detail);
-        resolve("rejected");
-        return;
+      // Resolve first, then post: a throwing postMessage (a severed or navigated opener) must never
+      // leave the receive promise pending, nor escape as an unhandled rejection.
+      const settle = (status: CarryStatus, detail?: string) => {
+        resolve(status);
+        try {
+          opener!.postMessage({ gw: "carry", v: 1, type: "result", id, status, ...(detail ? { detail } : {}) }, from);
+        } catch (error) {
+          console.warn(`[account-kit] carry result could not be posted: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      };
+      let handedOff = false;
+      try {
+        const checked = checkOffer(message, game);
+        if (!checked.ok) {
+          console.warn(`[account-kit] carry offer rejected: ${checked.detail}`);
+          settle("rejected", checked.detail);
+          return;
+        }
+        const slots = JSON.parse(JSON.stringify(checked.slots)) as Record<string, SavePayload>;
+        handedOff = true;
+        Promise.resolve()
+          .then(() => handler({ slots, exportedAt: message.exportedAt, from }))
+          .then(
+            // Anything but exactly "accepted"/"declined" (e.g. undefined from a JS handler that forgot
+            // to return) is "rejected": never an out-of-type result, never a status the sender drops.
+            (status: unknown) => settle(status === "accepted" || status === "declined" ? status : "rejected"),
+            (error: unknown) => {
+              console.warn(`[account-kit] carry handler failed: ${error instanceof Error ? error.message : String(error)}`);
+              settle("rejected", "handler failed");
+            },
+          );
+      } catch (error) {
+        console.warn(`[account-kit] carry offer failed: ${error instanceof Error ? error.message : String(error)}`);
+        settle("rejected", "offer failed");
+      } finally {
+        // Every path above settles; this is the backstop so the promise can never stay pending.
+        if (!handedOff) resolve("rejected");
       }
-      const slots = JSON.parse(JSON.stringify(checked.slots)) as Record<string, SavePayload>;
-      Promise.resolve()
-        .then(() => handler({ slots, exportedAt: message.exportedAt, from }))
-        .then(
-          (status) => { reply(status); resolve(status); },
-          (error: unknown) => {
-            console.warn(`[account-kit] carry handler failed: ${error instanceof Error ? error.message : String(error)}`);
-            reply("rejected", "handler failed");
-            resolve("rejected");
-          },
-        );
     }
     win.addEventListener("message", onMessage);
     timer = setTimeout(() => { if (!taken) { stop(); resolve("none"); } }, OFFER_TIMEOUT_MS);
