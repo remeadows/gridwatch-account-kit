@@ -6,10 +6,13 @@ const NEXUS = "https://nexus.warsignallabs.net";
 const OLD = "https://gridwatchmatchweb.warsignallabs.net";
 const SETTINGS = { musicEnabled: true, sfxEnabled: false, voiceEnabled: true, reducedMotion: false };
 
-function harness(options: { blocked?: boolean; origin?: string } = {}) {
+function harness(options: { blocked?: boolean; origin?: string; throwOnPost?: boolean } = {}) {
   const listeners = new Set<(event: MessageEvent) => void>();
   const opened = { closed: false, posted: [] as Array<{ message: any; targetOrigin: string }>,
-    postMessage(message: unknown, targetOrigin: string) { this.posted.push({ message, targetOrigin }); } };
+    postMessage(message: unknown, targetOrigin: string) {
+      if (options.throwOnPost) throw new Error("tab gone");
+      this.posted.push({ message, targetOrigin });
+    } };
   const calls: string[] = [];
   const win: SenderWindow = {
     location: { origin: options.origin ?? OLD },
@@ -86,5 +89,39 @@ describe("sendCarry", () => {
     expect(() => sendCarry(harness().deps, {})).toThrow(RangeError);
     expect(() => sendCarry(harness().deps, { secrets: {} } as never)).toThrow(RangeError);
     expect(() => sendCarry(harness().deps, { settings: { musicEnabled: "yes" } } as never)).toThrow(TypeError);
+  });
+  // Final review item 9.
+  it("is still pending at 19 999 ms without a ready, and times out at 20 s with listener and timers cleaned up", async () => {
+    const h = harness();
+    let result: unknown = "pending";
+    void sendCarry(h.deps, { settings: SETTINGS }).then((r) => { result = r; });
+    vi.advanceTimersByTime(19_999);
+    await Promise.resolve();
+    expect(result).toBe("pending");
+    vi.advanceTimersByTime(1);
+    await Promise.resolve();
+    expect(result).toBe("timeout");
+    expect(h.listeners.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("resolves closed when the tab goes away before ready, with listener and timers cleaned up", async () => {
+    const h = harness();
+    const pending = sendCarry(h.deps, { settings: SETTINGS });
+    h.opened.closed = true;
+    vi.advanceTimersByTime(1_000);
+    await expect(pending).resolves.toBe("closed");
+    expect(h.listeners.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("still times out when posting the offer throws (the ready timer is cleared only after the post)", async () => {
+    const h = harness({ throwOnPost: true });
+    const pending = sendCarry(h.deps, { settings: SETTINGS });
+    expect(() => h.deliver({ gw: "carry", v: 1, type: "ready", id: "n1" })).toThrow(/tab gone/);
+    vi.advanceTimersByTime(20_000);
+    await expect(pending).resolves.toBe("timeout");
+    expect(h.listeners.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

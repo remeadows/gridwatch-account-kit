@@ -48,11 +48,13 @@ export function sendCarry(deps: SenderDeps, slots: Record<string, SavePayload>):
       if (!message) return;
       if (message.type === "ready" && id === null) {
         id = message.id;
-        clearTimeout(readyTimer);
         opened!.postMessage({
           gw: "carry", v: 1, type: "offer", id, gameSlug: game.gameSlug, schemaVersion: game.schemaVersion,
           slots: copy, exportedAt: (deps.now?.() ?? new Date()).toISOString(),
         }, nexusOrigin);
+        // Only once the offer is really out: a throwing post leaves the ready timer running, so the
+        // hand-off still ends in "timeout" instead of waiting on a result that can never come.
+        clearTimeout(readyTimer);
       } else if (message.type === "result" && id !== null && message.id === id) {
         finish(message.status);
       }
