@@ -1,6 +1,11 @@
 import type { SavePayload } from "../saves-schema/wire.js";
 
-export interface SaveGameConfig { gameSlug: string; routeAlias: string; slots: readonly string[]; schemaVersion: number }
+export interface SaveGameConfig {
+  gameSlug: string; routeAlias: string; slots: readonly string[]; schemaVersion: number;
+  /** Spec §6: exact https origins (or a loopback http origin, for local e2e only) allowed to hand
+   *  this game's local save to Nexus. Checked by createAccountKit. */
+  carryFrom?: readonly string[];
+}
 export interface CloudSave { revision: number; schemaVersion: number; payload: SavePayload; updatedAt: string }
 export interface SaveError { code: "network" | "http" | "invalid_payload" | "upstream"; status?: number; message: string }
 

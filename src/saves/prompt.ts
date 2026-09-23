@@ -16,6 +16,12 @@ export const OWNERSHIP_COPY: PromptCopy = Object.freeze({
   secondary: "Start fresh",
 });
 
+export const REPLACE_COPY: PromptCopy = Object.freeze({
+  text: "Replace the progress on this site with your progress from the old site?",
+  primary: "Replace",
+  secondary: "Keep this site's",
+});
+
 function button(doc: Document, className: string, label: string): HTMLButtonElement {
   const node = doc.createElement("button");
   node.type = "button";

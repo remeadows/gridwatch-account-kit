@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { CONFLICT_COPY, OWNERSHIP_COPY, createDomPromptHost } from "../src/saves/prompt";
+import { CONFLICT_COPY, OWNERSHIP_COPY, REPLACE_COPY, createDomPromptHost } from "../src/saves/prompt";
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 afterEach(() => { document.body.innerHTML = ""; });
@@ -9,6 +9,9 @@ describe("prompt copy", () => {
   it("is the spec copy verbatim", () => {
     expect(CONFLICT_COPY).toEqual({ text: "Newer save in the cloud from another device. Use cloud or keep this one?", primary: "Use cloud", secondary: "Keep this one" });
     expect(OWNERSHIP_COPY).toEqual({ text: "This device has progress from another account. Upload it to this account, or start fresh?", primary: "Upload", secondary: "Start fresh" });
+  });
+  it("has the carry replace copy verbatim (spec §6.2)", () => {
+    expect(REPLACE_COPY).toEqual({ text: "Replace the progress on this site with your progress from the old site?", primary: "Replace", secondary: "Keep this site's" });
   });
 });
 
