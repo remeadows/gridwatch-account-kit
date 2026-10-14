@@ -8,8 +8,13 @@ describe("validateReturnPath", () => {
     ["/", "/"],
     ["/play/match/", "/play/match/"],
     ["/play/match/level/3?x=1", "/play/match/level/3?x=1"],
+    ["/play/skyhook/", "/play/skyhook/"],
+    ["/play/skyhook/?course=daily", "/play/skyhook/?course=daily"],
     ["/oauth/consent?authorization_id=abc-123_XYZ", "/oauth/consent?authorization_id=abc-123_XYZ"],
   ])("accepts %s", (raw, expected) => expect(validateReturnPath(raw, N)).toBe(expected));
+
+  it.each(["/play/skyhookx/", "/play/skyhook", "/play/skyhook-other/", "/PLAY/SKYHOOK/"])(
+    "does not take %s for Skyhook's place", (raw) => expect(validateReturnPath(raw, N)).toBe("/"));
 
   it.each([
     "https://evil.example/",
