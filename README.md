@@ -9,7 +9,7 @@ Add to your `package.json`:
 ```json
 {
   "dependencies": {
-    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.3.1"
+    "@gridwatch/account-kit": "github:remeadows/gridwatch-account-kit#v0.3.2"
   }
 }
 ```
